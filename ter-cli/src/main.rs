@@ -10,6 +10,7 @@ mod exercises;
 mod hint;
 mod hw;
 mod install;
+mod llm;
 mod login;
 mod new;
 mod output;
@@ -88,6 +89,18 @@ enum Command {
     Hint {
         /// The exercise folder; the one you are in by default.
         dir: Option<PathBuf>,
+        /// Ask your own model instead (`ter llm setup` first), on your
+        /// account with its provider.
+        #[arg(long)]
+        llm: bool,
+        /// With --llm: print what would be sent to the model, send nothing.
+        #[arg(long, requires = "llm")]
+        dry_run: bool,
+    },
+    /// The model `ter hint --llm` asks, with your own key.
+    Llm {
+        #[command(subcommand)]
+        command: LlmCommand,
     },
     /// Where this machine can run exercises, and what each place can see.
     Venues,
@@ -204,6 +217,40 @@ enum Command {
     },
     /// Update ter to the latest version.
     SelfUpdate,
+}
+
+#[derive(Subcommand)]
+enum LlmCommand {
+    /// Choose the provider and model, and store your key on this machine.
+    Setup {
+        /// openai, anthropic, gemini, openrouter, ollama or
+        /// openai-compatible (with --base-url).
+        #[arg(long)]
+        provider: String,
+        /// The model (default: the provider's usual one, where ter has one).
+        #[arg(long)]
+        model: Option<String>,
+        /// The provider's API address, instead of its usual one.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Read the key from standard input instead of asking.
+        #[arg(long)]
+        key_stdin: bool,
+        /// Share hints from the model with TER Learn.
+        #[arg(long, conflicts_with = "no_share")]
+        share: bool,
+        /// Keep hints from the model on this machine.
+        #[arg(long)]
+        no_share: bool,
+    },
+    /// The provider, model and where the key is kept (never the key).
+    Status,
+    /// Remove your key from this machine.
+    Forget {
+        /// The provider's key to remove (default: the one set up).
+        #[arg(long)]
+        provider: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -326,7 +373,31 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
         }
         Command::Status { disk: true } => status::disk(json),
         Command::Status { disk: false } => status::status(json).await,
-        Command::Hint { dir } => hint::hint(dir, json).await,
+        Command::Hint {
+            dir, llm: false, ..
+        } => hint::hint(dir, json).await,
+        Command::Hint { dir, dry_run, .. } => llm::hint(dir, dry_run, json).await,
+        Command::Llm { command } => match command {
+            LlmCommand::Setup {
+                provider,
+                model,
+                base_url,
+                key_stdin,
+                share,
+                no_share,
+            } => llm::setup(
+                llm::Setup {
+                    provider,
+                    model,
+                    base_url,
+                    key_stdin,
+                    share: (share || no_share).then_some(share),
+                },
+                json,
+            ),
+            LlmCommand::Status => llm::status(json),
+            LlmCommand::Forget { provider } => llm::forget(provider, json),
+        },
         Command::Venues => venues::run(json),
         Command::Serve {
             port,

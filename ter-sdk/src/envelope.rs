@@ -16,6 +16,9 @@ use crate::Error;
 /// A 429 is `rate_limited` whatever its body: the site's host puts its own
 /// HTML page in place of the site's envelope on every 429, so the learner
 /// sees one "try again" however the refusal arrived.
+///
+/// A function the site does not have yet (Frappe's "Failed to get method")
+/// is `not_on_site`, so a caller can tell a newer ter from a broken site.
 pub fn parse_response(http_status: u16, body: &[u8]) -> Result<Value, Error> {
     let server = |exc_type: Option<String>| Error::Server {
         http_status,
@@ -55,11 +58,22 @@ pub fn parse_response(http_status: u16, body: &[u8]) -> Result<Value, Error> {
         .map(str::to_string);
     let success = (200..300).contains(&http_status);
     if !success || exc_type.is_some() || json.get("exc").is_some() {
+        let message = server_message(&json);
         match http_status {
-            401 => return Err(token_rejected(server_message(&json))),
+            401 => return Err(token_rejected(message)),
             429 => return Err(rate_limited()),
-            _ => return Err(server(exc_type)),
+            _ => {}
         }
+        if let Some(message) = message
+            && message.starts_with("Failed to get method")
+        {
+            return Err(Error::Site {
+                code: "not_on_site".into(),
+                message: "TER Learn does not take this request yet.".into(),
+                http_status,
+            });
+        }
+        return Err(server(exc_type));
     }
 
     match json {
@@ -248,6 +262,16 @@ mod tests {
             assert_eq!(code, "token_invalid");
             assert_eq!(m, "The site did not accept this device token.");
         }
+    }
+
+    #[test]
+    fn a_function_the_site_lacks_is_not_on_site() {
+        // As the live site answered on 2026-09-27 for a function it lacks.
+        let item = json!({"message": "Failed to get method for command ter_courses.api.x with module 'ter_courses.api' has no attribute 'x'", "indicator": "red"}).to_string();
+        let list = serde_json::to_string(&vec![item]).unwrap();
+        let body = json!({"exc_type": "ValidationError", "_server_messages": list});
+        let (code, _, status) = site_error(417, body);
+        assert_eq!((code.as_str(), status), ("not_on_site", 417));
     }
 
     #[test]

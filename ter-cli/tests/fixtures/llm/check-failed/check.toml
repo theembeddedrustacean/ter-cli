@@ -1,0 +1,20 @@
+venue = "wokwi"
+instruments = []
+target = "xiao-esp32c3-nostd"
+cli_version = "0.1.0"
+elf_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+check_sha256 = "148181391edbc8014b571d30767e0e2b059c621693a0775d7b091d1847c01be5"
+started_at = "2026-09-27T12:00:00Z"
+ended_at = "2026-09-27T12:00:40Z"
+
+[[verdict]]
+id = "heartbeat-rate"
+status = "pass"
+expected = "3.6 to 4.4 toggles per second between 900 and 4900 ms"
+observed = "4 toggles per second (16 level changes)"
+
+[[verdict]]
+id = "flash-width"
+status = "fail"
+expected = "every high pulse 80 to 120 ms wide between 900 and 4900 ms"
+observed = "a 250 ms pulse at 1000 ms"

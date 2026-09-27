@@ -83,7 +83,7 @@ pub async fn hint(dir: Option<PathBuf>, json: bool) -> Result<(), CliError> {
 }
 
 /// The learner's `Cargo.toml` and everything under `src/`, as text.
-fn source_files(dir: &Path) -> Vec<HintFile> {
+pub(crate) fn source_files(dir: &Path) -> Vec<HintFile> {
     let mut paths = vec![PathBuf::from("Cargo.toml")];
     collect(dir, Path::new("src"), &mut paths);
     paths.sort();

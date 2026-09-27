@@ -67,7 +67,15 @@ impl TokenStore {
         Self::open_account(WOKWI_ACCOUNT, "wokwi-token")
     }
 
-    fn open_account(account: &'static str, file: &str) -> Result<Self, CliError> {
+    /// The learner's key for a hint model provider: `llm-key-<provider>`
+    /// in the keychain, else the `llm-key-<provider>` file.
+    pub fn open_llm(provider: &str) -> Result<Self, CliError> {
+        let name = format!("llm-key-{provider}");
+        Self::open_account(name.clone(), &name)
+    }
+
+    fn open_account(account: impl Into<String>, file: &str) -> Result<Self, CliError> {
+        let account = account.into();
         let keychain_off = std::env::var("TER_KEYCHAIN").is_ok_and(|v| v == "off");
         let keychain: Option<Box<dyn Keychain>> = if keychain_off {
             None
@@ -181,14 +189,14 @@ pub(crate) fn write_private(path: &Path, token: &str) -> Result<(), CliError> {
 /// The platform's keychain, through `keyring-core`: one entry of the
 /// `ter` service.
 pub struct SystemKeychain {
-    account: &'static str,
+    account: String,
 }
 
 impl SystemKeychain {
     fn entry(&self) -> Result<keyring_core::Entry, String> {
         static STORE: OnceLock<Result<(), String>> = OnceLock::new();
         STORE.get_or_init(set_default_store).clone()?;
-        keyring_core::Entry::new(SERVICE, self.account).map_err(|e| e.to_string())
+        keyring_core::Entry::new(SERVICE, &self.account).map_err(|e| e.to_string())
     }
 }
 

@@ -74,6 +74,23 @@ pub struct HintFile {
     pub content: String,
 }
 
+/// One exchange with the learner's own hint model, as `hint_exchange`
+/// takes it: what was sent and what came back. Never the provider key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HintExchange {
+    /// The run the hint was for.
+    pub run: String,
+    pub exercise_id: String,
+    /// The provider and model the learner configured.
+    pub provider: String,
+    pub model: String,
+    pub system: String,
+    pub prompt: String,
+    pub answer: String,
+    pub asked_at: String,
+    pub cli_version: String,
+}
+
 /// The site's answer to `hint`. `number` 0 means there is no hint: the run
 /// passed, or the site has no hint source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

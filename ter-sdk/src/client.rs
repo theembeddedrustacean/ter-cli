@@ -7,7 +7,7 @@ use tokio::sync::OnceCell;
 use crate::bench::{Connected, Done, Heartbeat, Mine, Registered, Shared, Unshared};
 use crate::exercise::{Exercise, ExerciseRef};
 use crate::pairing::{PairStart, PollStatus};
-use crate::run::{HintAnswer, HintFile, RunAnswer, RunRecord};
+use crate::run::{HintAnswer, HintExchange, HintFile, RunAnswer, RunRecord};
 use crate::{Error, envelope::parse_response, version::check_supported};
 
 /// The site's answer to `ping`: who the token belongs to and which CLI
@@ -147,6 +147,14 @@ impl Client {
     /// The next hint for a run this account posted.
     pub async fn hint(&self, run: &str, files: &[HintFile]) -> Result<HintAnswer, Error> {
         self.post("hint", &serde_json::json!({ "run": run, "files": files }))
+            .await
+    }
+
+    /// Share one exchange with a hint model (the learner's own provider)
+    /// against a run, with the learner's consent. `not_on_site` until the
+    /// site takes them.
+    pub async fn hint_exchange(&self, exchange: &HintExchange) -> Result<Value, Error> {
+        self.post("hint_exchange", &serde_json::json!({ "payload": exchange }))
             .await
     }
 

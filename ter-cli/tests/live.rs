@@ -1479,3 +1479,120 @@ fn bench_a_run_on_a_shared_bench_passes_its_serial_check() {
         v["name"], v["site"]["attempt"], v["verdicts"]
     );
 }
+
+/// Layer 3 hints from real providers, on keys held only on this machine:
+/// `TER_LIVE_LLM=openai,anthropic,gemini` with each provider's key in its
+/// usual variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`).
+/// Posts one failed build of the stub, then asks each provider about it.
+#[test]
+#[ignore = "live site"]
+fn live_llm_hint_from_the_learners_own_provider() {
+    let Ok(list) = std::env::var("TER_LIVE_LLM") else {
+        eprintln!("skipped: set TER_LIVE_LLM=openai,anthropic,gemini and the providers' keys");
+        return;
+    };
+    let m = LiveMachine::new();
+    let (ok, v) = m.json(&["ex", "fetch", LIVE_OPEN], m.courses.path());
+    assert!(ok, "{v}");
+    let dir = std::path::PathBuf::from(v["path"].as_str().unwrap());
+    let turn = take_turn();
+    let (_, run) = m.json(&["run", "--no-check"], &dir);
+    drop(turn);
+    assert_eq!(run["build_status"], "failed", "{run}");
+
+    for (i, provider) in list.split(',').map(str::trim).enumerate() {
+        let var = format!("{}_API_KEY", provider.to_uppercase());
+        let key = std::env::var(&var).unwrap_or_else(|_| panic!("{var} must be set"));
+        let ter = |args: &[&str], stdin: Option<&str>| {
+            use std::io::Write;
+            let mut child = Command::new(env!("CARGO_BIN_EXE_ter"))
+                .args(args)
+                .arg("--json")
+                .current_dir(&dir)
+                .env("TER_CONFIG_DIR", m.config.path())
+                .env("TER_TOKEN", &m.token)
+                .env("TER_KEYCHAIN", "off")
+                .env_remove("TER_SITE_URL")
+                .env_remove("TER_LLM_KEY")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            if let Some(s) = stdin {
+                input.write_all(s.as_bytes()).unwrap();
+            }
+            drop(input);
+            let o = child.wait_with_output().unwrap();
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            for part in [&key[..], &key[..12], &key[key.len() - 8..]] {
+                assert!(!all.contains(part), "{provider}: the key was printed");
+            }
+            let v: Value = serde_json::from_slice(&o.stdout)
+                .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&o.stdout)));
+            (o.status.success(), v)
+        };
+        // The first provider shares its exchange: the site does not take
+        // them yet, and says so without failing the hint.
+        let share = if i == 0 { "--share" } else { "--no-share" };
+        let (ok, v) = ter(
+            &["llm", "setup", "--provider", provider, "--key-stdin", share],
+            Some(&format!("{key}\n")),
+        );
+        assert!(ok, "{v}");
+        let (ok, v) = ter(&["hint", "--llm"], None);
+        assert!(ok, "{provider}: {v}");
+        let text = v["text"].as_str().unwrap();
+        assert!(text.len() > 20, "{provider}: {text}");
+        assert_eq!(v["run"], run["name"]);
+        let expected = if i == 0 {
+            ["not_on_site", "posted"]
+        } else {
+            ["declined"; 2]
+        };
+        assert!(expected.contains(&v["shared"].as_str().unwrap()), "{v}");
+        eprintln!("{provider} ({}): {text}\n", v["model"]);
+
+        let mut written = String::new();
+        for root in [m.config.path(), dir.as_path()] {
+            for entry in walk_files(root) {
+                if entry
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("llm-key-"))
+                {
+                    continue;
+                }
+                written.push_str(&String::from_utf8_lossy(
+                    &std::fs::read(&entry).unwrap_or_default(),
+                ));
+            }
+        }
+        assert!(
+            !written.contains(&key[..12]),
+            "{provider}: the key is in a file"
+        );
+    }
+}
+
+fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.file_name()
+            .is_some_and(|n| n == "target" || n == ".target")
+        {
+            continue;
+        }
+        if p.is_dir() {
+            out.extend(walk_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}

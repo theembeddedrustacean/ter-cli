@@ -11,8 +11,8 @@ This is an early version: pairing (`ter login`, `ter logout`,
 (`ter run --hw`) and in the Wokwi simulator (`ter run --sim`), build-only
 runs (`ter run --no-check`), `ter serve` for the lesson page's editor,
 shared benches (`ter serve --share`, `ter bench`, `ter connect`),
-`ter venues`, `ter status`, `ter hint`,
-`ter telemetry check` and `ter self-update` work today.
+`ter venues`, `ter status`, `ter hint` (and `ter hint --llm` with your
+own model), `ter telemetry check` and `ter self-update` work today.
 
 ## Install
 
@@ -48,6 +48,8 @@ ter install <tool>... install what the exercises need: targets, xiao-generate,
                       espflash, probe-rs, wokwi-cli (with your Wokwi token)
 ter status            your exercises and their last runs (--disk: disk use)
 ter hint              the next hint for the last run
+ter hint --llm        a hint from your own model, with your own key
+ter llm setup         choose that model and store your key (status, forget)
 ter self-update       how to update ter
 ```
 
@@ -160,6 +162,39 @@ it practises moved; elsewhere it lists every exercise in your courses.
 the site. What `ter` remembers about the last run is in `.ter/` in the
 exercise; `ter ex clean` keeps it.
 
+### Hints from your own model
+
+`ter hint --llm` asks a language model of your choice for a hint on the
+last run, on your own account with its provider: TER Learn never holds a
+key or pays for one. Set it up once:
+
+```
+ter llm setup --provider openai           asks for your key
+ter llm setup --provider gemini --key-stdin < key.txt
+ter llm setup --provider ollama --model llama3.2   a local model, no key
+```
+
+Providers: `openai`, `anthropic`, `gemini`, `openrouter`, `ollama`, and
+`openai-compatible` with `--base-url` for any other service that speaks
+the chat completions format. `--model` picks the model (each named
+provider has a default). The key goes to the system keychain, or where
+there is none to `~/.config/ter/llm-key-<provider>` readable only by you;
+`TER_LLM_KEY` takes its place for one command. It is sent to the provider
+and nowhere else, and never printed. `ter llm status` shows the setup
+(never the key); `ter llm forget` removes the key.
+
+The model gets the lesson text, the run (compiler output, check results,
+what the program printed, the course's last hint) and your `Cargo.toml`
+and `src/`, and is told to give one hint, not the answer. `ter hint --llm
+--dry-run` prints exactly what would be sent and sends nothing. Each
+exchange is kept in `.ter/llm/` in the exercise.
+
+The first time, `ter` asks whether you want to share such exchanges with
+TER Learn to improve the course's own hints (never with your key);
+`ter llm setup --share` or `--no-share` changes the answer. Running out of
+credit with the provider is not a failed hint on your record: nothing is
+posted.
+
 ### The lesson page's editor
 
 `ter serve` lets the Run button in a lesson's editor run the exercise on
@@ -223,6 +258,10 @@ elsewhere); every key is optional:
 site_url = "https://learn.theembeddedrustacean.com"
 courses_root = "/home/you/ter-courses"
 serve_port = 7357
+llm_provider = "gemini"      # ter llm setup writes these four
+llm_model = "gemini-flash-latest"
+# llm_base_url = "https://..."
+llm_share = false
 ```
 
 `TER_CONFIG_DIR` and `TER_SITE_URL` override the directory and the site.

@@ -15,8 +15,15 @@ pub struct Config {
     pub courses_root: PathBuf,
     /// Keep this many builds per exercise after a passed run; off when unset.
     pub keep: Option<u32>,
+    /// The provider `ter hint --llm` asks, with the learner's own key.
     pub llm_provider: Option<String>,
+    /// The model; the provider's default when unset.
     pub llm_model: Option<String>,
+    /// The provider's API address, instead of its usual one.
+    pub llm_base_url: Option<String>,
+    /// Whether hints from the model may be shared with TER Learn; asked
+    /// once when unset.
+    pub llm_share: Option<bool>,
     pub serve_port: u16,
 }
 
@@ -31,6 +38,8 @@ impl Default for Config {
             keep: None,
             llm_provider: None,
             llm_model: None,
+            llm_base_url: None,
+            llm_share: None,
             serve_port: 7357,
         }
     }
@@ -57,6 +66,38 @@ impl Config {
             config.site_url = url;
         }
         Ok(config)
+    }
+
+    /// Set or remove (`None`) keys in `config.toml`, leaving the others as
+    /// they are. The file is checked before it is written.
+    pub fn update(changes: &[(&str, Option<toml::Value>)]) -> Result<(), CliError> {
+        let path = config_dir()?.join("config.toml");
+        Self::update_at(&path, changes)
+    }
+
+    fn update_at(path: &Path, changes: &[(&str, Option<toml::Value>)]) -> Result<(), CliError> {
+        let fail = |e: String| CliError::new("config_error", e);
+        let mut table: toml::Table = match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text)
+                .map_err(|e| fail(format!("{} is not valid: {}", path.display(), e.message())))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => return Err(fail(format!("Could not read {}: {e}", path.display()))),
+        };
+        for (key, value) in changes {
+            match value {
+                Some(v) => table.insert(key.to_string(), v.clone()),
+                None => table.remove(*key),
+            };
+        }
+        let text = toml::to_string(&table).map_err(|e| fail(e.to_string()))?;
+        toml::from_str::<Self>(&text)
+            .map_err(|e| fail(format!("config.toml would not be valid: {}", e.message())))?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| fail(format!("Could not create {}: {e}", dir.display())))?;
+        }
+        std::fs::write(path, text)
+            .map_err(|e| fail(format!("Could not write {}: {e}", path.display())))
     }
 
     fn load_from(path: &Path) -> Result<Self, CliError> {
@@ -109,6 +150,34 @@ mod tests {
         };
         let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn update_sets_and_removes_keys_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ter").join("config.toml");
+        Config::update_at(&path, &[("keep", Some(3.into()))]).unwrap();
+        Config::update_at(
+            &path,
+            &[
+                ("llm_provider", Some("openai".into())),
+                ("llm_share", Some(false.into())),
+            ],
+        )
+        .unwrap();
+        let c = Config::load_from(&path).unwrap();
+        assert_eq!(c.keep, Some(3));
+        assert_eq!(c.llm_provider.as_deref(), Some("openai"));
+        assert_eq!(c.llm_share, Some(false));
+        Config::update_at(&path, &[("llm_provider", None)]).unwrap();
+        assert_eq!(Config::load_from(&path).unwrap().llm_provider, None);
+        let err = Config::update_at(&path, &[("keep", Some("x".into()))]).unwrap_err();
+        assert_eq!(err.code, "config_error");
+        assert_eq!(
+            Config::load_from(&path).unwrap().keep,
+            Some(3),
+            "left as it was"
+        );
     }
 
     #[test]

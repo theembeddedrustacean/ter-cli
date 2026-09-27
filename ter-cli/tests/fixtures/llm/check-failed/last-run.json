@@ -1,0 +1,35 @@
+{
+  "user": "learner@example.com",
+  "site": "https://learn.example.com",
+  "posted_at": "2026-09-27T12:00:00Z",
+  "hints": {
+    "used": 1,
+    "exhausted": false
+  },
+  "record": {
+    "exercise_id": "gpio-blinky--xiao-esp32c3-nostd",
+    "target": "xiao-esp32c3-nostd",
+    "mode": "simulation",
+    "venue": "wokwi",
+    "build_status": "passed",
+    "check_status": "failed",
+    "first_failure": "{\"id\": \"flash-width\", \"expected\": \"every high pulse 80 to 120 ms wide between 900 and 4900 ms\", \"observed\": \"a 250 ms pulse at 1000 ms\"}",
+    "elf_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "duration_ms": 38000,
+    "hints_used": 1,
+    "checks_seen": 2,
+    "checks_total": 2,
+    "cli_version": "0.1.0"
+  },
+  "answer": {
+    "name": "r7cf0000bb",
+    "attempt": 7,
+    "concept_deltas": []
+  },
+  "recording": ".runs/7",
+  "last_hint": {
+    "number": 1,
+    "text": "flash-width: expected every high pulse 80 to 120 ms wide between 900 and 4900 ms, observed a 250 ms pulse at 1000 ms. A pulse is how long user_led stays high before it goes low again. Which wait in your program sets that time?",
+    "exhausted": false
+  }
+}
