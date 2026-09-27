@@ -187,6 +187,46 @@ impl Machine {
     }
 
     fn ter_in(&self, site: &str, args: &[&str], cwd: &Path) -> Output {
+        let mut cmd = self.command(site, args, cwd);
+        let child = {
+            let _spawning = SPAWN.read().unwrap();
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        child.wait_with_output().unwrap()
+    }
+
+    /// `ter serve` on a free port, until the returned value is dropped.
+    fn serve(&self, site: &str) -> Served {
+        use std::io::BufRead;
+        let mut cmd = self.command(site, &["serve", "--port", "0"], self.courses.path());
+        let mut child = {
+            let _spawning = SPAWN.read().unwrap();
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .unwrap()
+        };
+        let mut line = String::new();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        stdout.read_line(&mut line).unwrap();
+        let url = line
+            .strip_prefix("ter serve on ")
+            .and_then(|l| l.split(',').next())
+            .unwrap_or_else(|| panic!("{line}"))
+            .to_string();
+        Served {
+            child,
+            url,
+            _stdout: stdout,
+        }
+    }
+
+    fn command(&self, site: &str, args: &[&str], cwd: &Path) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ter"));
         cmd.args(args)
             .current_dir(cwd)
@@ -212,15 +252,7 @@ impl Machine {
             cmd.env("PATH", std::env::join_paths(dirs).unwrap())
                 .env("WOKWI_CLI_TOKEN", "fake-wokwi");
         }
-        let child = {
-            let _spawning = SPAWN.read().unwrap();
-            cmd.stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap()
-        };
-        child.wait_with_output().unwrap()
+        cmd
     }
 
     /// Make the exercise a simulated one: `check` as its check.yaml, the
@@ -303,6 +335,39 @@ impl Machine {
         (o.status.success(), v)
     }
 }
+
+/// A running `ter serve`, stopped when dropped.
+struct Served {
+    child: std::process::Child,
+    url: String,
+    /// Kept open for as long as the service runs.
+    _stdout: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Served {
+    /// POST `body` to /run as the lesson page on the site would.
+    async fn run(&self, body: Value) -> (u16, reqwest::header::HeaderMap, Value) {
+        let r = reqwest::Client::new()
+            .post(format!("{}/run", self.url))
+            .header("origin", PAGE)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        let headers = r.headers().clone();
+        (status, headers, r.json().await.unwrap())
+    }
+}
+
+const PAGE: &str = "https://learn.theembeddedrustacean.com";
 
 fn ok(v: Value) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({ "message": v }))
@@ -1054,5 +1119,150 @@ async fn a_press_is_scheduled_on_the_button_wired_to_the_pin() {
             .iter()
             .any(|p| p["type"] == "wokwi-logic-analyzer"),
         "no pin checks, no analyzer"
+    );
+}
+
+/// The files the page's editor sends: the whole scaffold, with the
+/// learner's `main.rs`.
+fn page_files(m: &Machine, main_rs: &str) -> Value {
+    let dir = m.exercise();
+    let read = |p: &str| std::fs::read_to_string(dir.join(p)).unwrap();
+    json!([
+        {"path": "Cargo.toml", "content": read("Cargo.toml")},
+        {"path": "check.yaml", "content": "timeout_ms: 100\nassert: []\n"},
+        {"path": "src/main.rs", "content": main_rs},
+    ])
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_runs_the_pages_files_and_answers_with_the_posted_run() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(BROKEN, &["hardware", "simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        42,
+    );
+    let check = std::fs::read_to_string(m.exercise().join("check.yaml")).unwrap();
+    let served = m.serve(&server.uri());
+
+    let health = reqwest::Client::new()
+        .get(format!("{}/health", served.url))
+        .header("origin", PAGE)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        health.headers()["access-control-allow-origin"],
+        PAGE,
+        "the page can read it"
+    );
+    let health: Value = health.json().await.unwrap();
+    assert_eq!(health["service"], "ter");
+    assert_eq!(health["posts_to_site"], true);
+
+    let (status, headers, v) = served
+        .run(json!({"exercise_id": EXERCISE, "files": page_files(&m, GOOD)}))
+        .await;
+
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(headers["access-control-allow-origin"], PAGE);
+    assert_eq!(v["name"], "r-0001");
+    assert_eq!(v["site"]["attempt"], 3);
+    assert_eq!(v["mode"], "simulation", "the editor is the simulation path");
+    assert_eq!(v["check_status"], "passed", "{v}");
+    assert_eq!(
+        v["not_written"],
+        json!(["check.yaml"]),
+        "the page cannot change the check"
+    );
+    assert_eq!(
+        std::fs::read_to_string(m.exercise().join("src/main.rs")).unwrap(),
+        GOOD
+    );
+    assert_eq!(
+        std::fs::read_to_string(m.exercise().join("check.yaml")).unwrap(),
+        check
+    );
+    let p = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(p["venue"], "wokwi");
+    assert_eq!(p["check_status"], "passed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_answers_a_failed_build_with_the_posted_run() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        42,
+    );
+    let served = m.serve(&server.uri());
+
+    let (status, _, v) = served
+        .run(json!({"exercise_id": EXERCISE, "files": page_files(&m, BROKEN)}))
+        .await;
+
+    assert_eq!(status, 200, "a failed build is still a posted run: {v}");
+    assert_eq!(v["build_status"], "failed");
+    assert!(v["compiler_tail"].as_str().unwrap().contains("led"), "{v}");
+    assert_eq!(v["error"]["code"], "build_failed");
+    assert_eq!(posted(&server, "run").await.len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_refuses_a_page_signed_in_as_someone_else() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]);
+    let served = m.serve(&server.uri());
+
+    let (status, headers, v) = served
+        .run(json!({
+            "exercise_id": EXERCISE,
+            "files": page_files(&m, BROKEN),
+            "user": "someone-else@example.com",
+        }))
+        .await;
+
+    assert_eq!(status, 403);
+    assert_eq!(v["error"]["code"], "wrong_account", "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains(USER));
+    assert_eq!(headers["access-control-allow-origin"], PAGE);
+    assert!(posted(&server, "run").await.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(m.exercise().join("src/main.rs")).unwrap(),
+        GOOD,
+        "nothing written"
+    );
+
+    // The same account is fine.
+    let (status, _, v) = served
+        .run(json!({"exercise_id": EXERCISE, "files": [], "user": USER}))
+        .await;
+    assert_eq!(status, 200, "{v}");
+}
+
+#[tokio::test]
+async fn serve_refuses_any_other_origin() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]);
+    let served = m.serve(&server.uri());
+
+    let r = reqwest::Client::new()
+        .post(format!("{}/run", served.url))
+        .header("origin", "https://evil.example")
+        .json(&json!({"exercise_id": EXERCISE, "files": page_files(&m, BROKEN)}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status().as_u16(), 403);
+    assert!(r.headers().get("access-control-allow-origin").is_none());
+    assert!(posted(&server, "run").await.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(m.exercise().join("src/main.rs")).unwrap(),
+        GOOD
     );
 }

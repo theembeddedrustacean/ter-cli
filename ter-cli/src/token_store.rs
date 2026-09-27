@@ -19,7 +19,7 @@ const ACCOUNT: &str = "device-token";
 const WOKWI_ACCOUNT: &str = "wokwi-token";
 
 /// A place a token can be kept, where the file is not.
-pub trait Keychain {
+pub trait Keychain: Send + Sync {
     /// `Err` when the keychain cannot be reached; the text says why.
     fn get(&self) -> Result<Option<String>, String>;
     fn set(&self, token: &str) -> Result<(), String>;
@@ -233,23 +233,22 @@ fn set_default_store() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     /// A keychain held in memory, shared with the test so it can look in.
     #[derive(Clone, Default)]
-    struct MemoryKeychain(Rc<RefCell<Option<String>>>);
+    struct MemoryKeychain(Arc<Mutex<Option<String>>>);
 
     impl Keychain for MemoryKeychain {
         fn get(&self) -> Result<Option<String>, String> {
-            Ok(self.0.borrow().clone())
+            Ok(self.0.lock().unwrap().clone())
         }
         fn set(&self, token: &str) -> Result<(), String> {
-            *self.0.borrow_mut() = Some(token.into());
+            *self.0.lock().unwrap() = Some(token.into());
             Ok(())
         }
         fn delete(&self) -> Result<bool, String> {
-            Ok(self.0.borrow_mut().take().is_some())
+            Ok(self.0.lock().unwrap().take().is_some())
         }
     }
 
@@ -324,7 +323,7 @@ mod tests {
         assert_eq!(saved.location, Location::Keychain);
         assert!(saved.keychain_error.is_none());
         assert!(!file_in(&dir).exists(), "the plain-text copy must go");
-        assert_eq!(keychain.0.borrow().as_deref(), Some("from-keychain"));
+        assert_eq!(keychain.0.lock().unwrap().as_deref(), Some("from-keychain"));
 
         let (token, from) = store.load().unwrap().unwrap();
         assert_eq!(
@@ -348,7 +347,7 @@ mod tests {
             removed,
             vec![Location::Keychain, Location::File(file_in(&dir))]
         );
-        assert!(keychain.0.borrow().is_none());
+        assert!(keychain.0.lock().unwrap().is_none());
         assert!(!file_in(&dir).exists());
         assert!(store.load().unwrap().is_none());
         assert!(

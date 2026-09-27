@@ -200,6 +200,25 @@ pub async fn fetch(
     Ok(())
 }
 
+/// Fetch `id` from the site into its course folder, as `ter ex fetch <id>`
+/// does, and return the folder.
+pub async fn fetch_into_courses(session: &Session, id: &str) -> Result<PathBuf, CliError> {
+    let (exercise, course, modes) = fetch_from_site(session, id).await?;
+    let scaffold = Scaffold::check(&exercise)?;
+    let dest = layout()?.exercise_dir(&course, &exercise.exercise_id);
+    Ok(scaffold.write(&dest, &course, modes)?.dir)
+}
+
+/// The folder `id` was fetched to, if it was.
+pub fn fetched_dir(id: &str) -> Result<Option<PathBuf>, CliError> {
+    Ok(layout()?
+        .exercises()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|f| f.ter.exercise == id)
+        .map(|f| f.dir))
+}
+
 async fn fetch_from_site(
     session: &Session,
     id: &str,

@@ -23,6 +23,7 @@ ter-check.workspace = true
 ter-sdk.workspace = true
 ter-telemetry.workspace = true
 ter-flash.workspace = true
+ter-remote = { path = "../ter-remote" }
 tokio.workspace = true
 toml.workspace = true
 webbrowser.workspace = true

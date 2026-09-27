@@ -14,6 +14,7 @@ mod output;
 mod record;
 mod run;
 mod self_update;
+mod serve;
 mod session;
 mod sim;
 mod status;
@@ -86,6 +87,14 @@ enum Command {
     },
     /// Where this machine can run exercises, and what each place can see.
     Venues,
+    /// The local service the lesson page's Run button calls: it builds,
+    /// runs, checks and posts from this machine.
+    Serve {
+        /// Listen on this port of 127.0.0.1 (default: `serve_port` in the
+        /// config, 7357).
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Recorded runs: judge one against a check.yaml, offline.
     Telemetry {
         #[command(subcommand)]
@@ -205,6 +214,7 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
         Command::Status { disk: false } => status::status(json).await,
         Command::Hint { dir } => hint::hint(dir, json).await,
         Command::Venues => venues::run(json),
+        Command::Serve { port } => serve::serve(port, json).await,
         Command::Telemetry {
             command: TelemetryCommand::Check { recording, check },
         } => telemetry::check(recording, check, json),

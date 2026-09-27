@@ -9,7 +9,8 @@ records the attempt on the site.
 This is an early version: pairing (`ter login`, `ter logout`,
 `ter whoami`), exercises (`ter ex`), checked runs on your own board
 (`ter run --hw`) and in the Wokwi simulator (`ter run --sim`), build-only
-runs (`ter run --no-check`), `ter venues`, `ter status`, `ter hint`,
+runs (`ter run --no-check`), `ter serve` for the lesson page's editor,
+`ter venues`, `ter status`, `ter hint`,
 `ter telemetry check` and `ter self-update` work today.
 
 ## Install
@@ -34,6 +35,7 @@ ter run --hw          build, flash your board, check, and record the run on the 
 ter run --sim         build, run in Wokwi, check, and record the run on the site
 ter run --no-check    build the exercise and record the attempt on the site
 ter venues            where this machine can run exercises, and what each sees
+ter serve             let the lesson page's Run button build and run here
 ter telemetry check   judge a recorded run against a check.yaml, offline
 ter install wokwi-cli install Wokwi's simulator and store your Wokwi token
 ter status            your exercises and their last runs (--disk: disk use)
@@ -133,6 +135,25 @@ it practises moved; elsewhere it lists every exercise in your courses.
 `ter status --disk` shows what each course takes on disk, without asking
 the site. What `ter` remembers about the last run is in `.ter/` in the
 exercise; `ter ex clean` keeps it.
+
+### The lesson page's editor
+
+`ter serve` lets the Run button in a lesson's editor run the exercise on
+this machine. It listens on `http://127.0.0.1:7357` (`--port`, or
+`serve_port` in the config) and only answers the TER Learn site (and
+`http://localhost:8080`, the site's development server); any other page
+is refused before anything runs. On Run, the page sends your files; `ter`
+fetches the exercise if this machine does not have it yet, writes the
+files under `src/` into the exercise folder, and does `ter run` there (in
+simulation, unless the page asks for hardware), posting the run with this
+machine's token. The page then shows the run it posted. Files outside
+`src/` (the manifest, build script, cargo config, `check.yaml`, the
+circuit) are never taken from the browser; the answer names any the page
+sent with different contents under `not_written`. When the page says who
+is signed in and it is not the account `ter` is paired with, the run is
+refused with `wrong_account`. Runs go one at a time; one that takes
+longer than the build allowance (10 minutes) plus the simulator's time
+answers `timeout`.
 
 For curriculum authors, `ter ex fetch <id> --dev <checkout>` builds the
 exercise from a local curriculum checkout (with its

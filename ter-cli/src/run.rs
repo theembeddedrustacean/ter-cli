@@ -35,6 +35,22 @@ pub struct RunArgs {
     pub no_check: bool,
 }
 
+/// A run that was posted, for printing or for `ter serve` to return.
+pub struct Done {
+    /// The run record as posted, the site's answer and the verdicts: what
+    /// `ter run --json` prints.
+    pub answer: Value,
+    /// Why the run did not pass, if it did not. Already in `answer`.
+    pub failure: Option<CliError>,
+    record: RunRecord,
+    site: RunAnswer,
+    outcome: Outcome,
+    built_in: Duration,
+    ran_in: Option<(Duration, &'static str)>,
+    local: bool,
+    sim_allowed: bool,
+}
+
 /// What the run does after the build, settled before it.
 enum Plan {
     /// `--no-check`.
@@ -71,6 +87,24 @@ fn venue_for(mode: &str, asked: Option<&str>) -> Result<&'static str, CliError> 
 }
 
 pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
+    let done = execute(args, json).await?;
+    if json {
+        print_json(&done.answer);
+    } else {
+        print_text(&done);
+    }
+    match done.failure {
+        Some(mut err) => {
+            err.in_json_answer = json;
+            Err(err)
+        }
+        None => Ok(()),
+    }
+}
+
+/// Build, run, judge and post; `quiet` prints nothing but errors.
+pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
+    let json = quiet;
     let dir = exercise_dir(args.dir)?;
     let ter = TerToml::load(&dir)?;
     let mode = args.mode.unwrap_or(&ter.mode).to_string();
@@ -170,9 +204,7 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
                 timeout_ms: file.timeout_ms,
                 capture: capture(&ter, client.cli_version(), &elf_sha256),
             };
-            // wokwi-cli paces the simulation step by step over the network;
-            // allow it far longer than the simulated time.
-            let budget = Duration::from_secs(120) + Duration::from_millis(file.timeout_ms * 20);
+            let budget = wokwi_budget(file.timeout_ms);
             let outcome = record_and_judge(&mut wokwi, file, text, elf, budget, &recording)?;
             ran_in = Some((t.elapsed(), "in Wokwi"));
             outcome
@@ -196,7 +228,7 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
                 file.timeout_ms,
             );
             local.capture = capture(&ter, client.cli_version(), &elf_sha256);
-            let budget = Duration::from_millis(file.timeout_ms) + Duration::from_secs(5);
+            let budget = board_budget(file.timeout_ms);
             let outcome = record_and_judge(&mut local, file, text, elf, budget, &recording)?;
             ran_in = Some((t.elapsed(), "on the board"));
             outcome
@@ -237,34 +269,29 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
     .save(&dir)?;
 
     let failure = failure(&outcome, &log_path, &recording);
-    if json {
-        print_json(&answer_json(
-            &record,
-            &answer,
-            &outcome,
-            &recording,
-            failure.as_ref(),
-        ));
-    } else {
-        let sim_allowed = ter.modes.iter().any(|m| m == "simulation");
-        let local = matches!(plan, Plan::Local(_));
-        print_text(
-            &record,
-            &answer,
-            &outcome,
-            build.duration,
-            ran_in,
-            local,
-            sim_allowed,
-        );
-    }
-    match failure {
-        Some(mut err) => {
-            err.in_json_answer = json;
-            Err(err)
-        }
-        None => Ok(()),
-    }
+    Ok(Done {
+        answer: answer_json(&record, &answer, &outcome, &recording, failure.as_ref()),
+        failure,
+        record,
+        site: answer,
+        outcome,
+        built_in: build.duration,
+        ran_in,
+        local: matches!(plan, Plan::Local(_)),
+        sim_allowed: ter.modes.iter().any(|m| m == "simulation"),
+    })
+}
+
+/// How long Wokwi may take for `timeout_ms` of simulated time: wokwi-cli
+/// paces the simulation step by step over the network, so far longer than
+/// the simulated time.
+pub fn wokwi_budget(timeout_ms: u64) -> Duration {
+    Duration::from_secs(120) + Duration::from_millis(timeout_ms * 20)
+}
+
+/// How long a capture on the board may take, once it is flashed.
+pub fn board_budget(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms) + Duration::from_secs(5)
 }
 
 /// What every capture header carries, whatever the venue.
@@ -433,18 +460,21 @@ fn serial_tail(transcript: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-fn print_text(
-    record: &RunRecord,
-    answer: &RunAnswer,
-    outcome: &Outcome,
-    built_in: Duration,
-    ran_in: Option<(Duration, &str)>,
-    local: bool,
-    sim_allowed: bool,
-) {
+fn print_text(done: &Done) {
+    let Done {
+        record,
+        site: answer,
+        outcome,
+        built_in,
+        ran_in,
+        local,
+        sim_allowed,
+        ..
+    } = done;
+    let (local, sim_allowed) = (*local, *sim_allowed);
     if record.build_status == "passed" {
         print!("Built in {:.1} s.", built_in.as_secs_f64());
-        if let Some((t, venue)) = ran_in {
+        if let Some((t, venue)) = *ran_in {
             print!(" Ran {venue} in {:.1} s.", t.as_secs_f64());
         }
         println!();

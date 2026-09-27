@@ -1016,3 +1016,98 @@ fn bench_unplugging_the_board_mid_capture_is_not_run() {
         v["name"], v["site"]["attempt"]
     );
 }
+
+/// `ter serve` on a machine that has never fetched the exercise: the page
+/// posts sandbox-serial-only's files (from the fork's dev server origin),
+/// ter fetches the scaffold, runs it in Wokwi and answers with the run it
+/// posted.
+#[test]
+#[ignore = "live site and Wokwi"]
+fn live_serve_fetches_runs_and_posts_for_the_page() {
+    if !std::env::var("WOKWI_CLI_TOKEN").is_ok_and(|t| !t.is_empty()) {
+        eprintln!("skipped: set WOKWI_CLI_TOKEN");
+        return;
+    }
+    use std::io::BufRead;
+    let m = LiveMachine::new();
+    // The page's files: the scaffold as the site serves it.
+    let page = tempfile::tempdir().unwrap();
+    let (ok, v) = m.json(
+        &[
+            "ex",
+            "fetch",
+            LIVE_SERIAL_ONLY,
+            page.path().join("x").to_str().unwrap(),
+        ],
+        page.path(),
+    );
+    assert!(ok, "{v}");
+    let scaffold = page.path().join("x");
+    let files: Vec<Value> = ["Cargo.toml", "src/bin/main.rs", "src/lib.rs", "check.yaml"]
+        .iter()
+        .map(|p| {
+            serde_json::json!({"path": p, "content": std::fs::read_to_string(scaffold.join(p)).unwrap()})
+        })
+        .collect();
+    std::fs::remove_dir_all(m.courses.path()).ok();
+    std::fs::create_dir_all(m.courses.path()).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["serve", "--port", "0"])
+        .env("TER_CONFIG_DIR", m.config.path())
+        .env("TER_TOKEN", &m.token)
+        .env("TER_KEYCHAIN", "off")
+        .env_remove("TER_SITE_URL")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    stdout.read_line(&mut line).unwrap();
+    assert!(!line.contains(&m.token));
+    let url = line
+        .strip_prefix("ter serve on ")
+        .and_then(|l| l.split(',').next())
+        .unwrap()
+        .to_string();
+
+    let v: Value = {
+        let _turn = take_turn();
+        block_on(async {
+            let r = reqwest::Client::new()
+                .post(format!("{url}/run"))
+                .header("origin", "http://localhost:8080")
+                .json(&serde_json::json!({"exercise_id": LIVE_SERIAL_ONLY, "files": files}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 200);
+            assert_eq!(
+                r.headers()["access-control-allow-origin"],
+                "http://localhost:8080"
+            );
+            r.json().await.unwrap()
+        })
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(v["venue"], "wokwi", "{v}");
+    assert_eq!(v["check_status"], "passed", "{v}");
+    assert!(v["name"].as_str().is_some_and(|n| !n.is_empty()), "{v}");
+    assert!(v["site"]["attempt"].as_u64().is_some(), "{v}");
+    assert!(
+        v.get("not_written").is_none(),
+        "the page sent the scaffold as is: {v}"
+    );
+    let fetched = std::path::Path::new(v["recording"].as_str().unwrap());
+    assert!(
+        fetched.starts_with(m.courses.path()),
+        "serve fetched it into the courses root: {}",
+        fetched.display()
+    );
+    eprintln!(
+        "serve posted run {} attempt {}",
+        v["name"], v["site"]["attempt"]
+    );
+}
