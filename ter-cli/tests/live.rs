@@ -808,7 +808,7 @@ fn bench_ready() -> bool {
 /// fetched scaffold is the reference program.
 const LIVE_BANNER: &str = "env-first-build--xiao-esp32c3-nostd";
 const LIVE_HW_ONLY_PINS: &str = "sandbox-hw-only--xiao-esp32c3-nostd";
-/// One banner check, hardware and simulation (Neo, 2026-09-27).
+/// One banner check, hardware and simulation.
 const LIVE_SERIAL_ONLY: &str = "sandbox-serial-only--xiao-esp32c3-nostd";
 
 fn fetched(m: &LiveMachine, id: &str) -> std::path::PathBuf {
