@@ -2397,6 +2397,7 @@ dependencies = [
  "tempfile",
  "ter-check",
  "ter-flash",
+ "ter-gen",
  "ter-remote",
  "ter-sdk",
  "ter-telemetry",
@@ -2418,6 +2419,10 @@ dependencies = [
 [[package]]
 name = "ter-gen"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "toml",
+]
 
 [[package]]
 name = "ter-remote"

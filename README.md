@@ -37,11 +37,19 @@ ter run --no-check    build the exercise and record the attempt on the site
 ter venues            where this machine can run exercises, and what each sees
 ter serve             let the lesson page's Run button build and run here
 ter telemetry check   judge a recorded run against a check.yaml, offline
-ter install wokwi-cli install Wokwi's simulator and store your Wokwi token
+ter install <tool>... install what the exercises need: targets, espflash,
+                      probe-rs, wokwi-cli (with your Wokwi token)
 ter status            your exercises and their last runs (--disk: disk use)
 ter hint              the next hint for the last run
 ter self-update       how to update ter
 ```
+
+`ter install` leaves what is already installed alone, so it is safe to
+run again. `targets` reads the project in the current folder (or
+`--dir`): it installs the toolchain its `rust-toolchain.toml` pins, the
+Rust target its `.cargo/config.toml` builds for (or `rust-src` when the
+project builds the standard library itself), Espressif's toolchain with
+espup for Xtensa chips, and `ldproxy` for the ESP-IDF std stack.
 
 Every command takes `--json`. On failure `ter` exits non-zero and prints a
 stable error code (`token_invalid`, `not_enrolled`, `outdated`, ...).
@@ -91,7 +99,8 @@ mode: "This exercise has no automatic check yet. Run it with cargo run."
 
 On hardware the program runs on your board, plugged in over USB. `ter`
 flashes it with the tool the exercise's `cargo run` uses (espflash or
-probe-rs; install it first, e.g. `cargo install espflash --locked`),
+probe-rs; install it first with `ter install espflash` or `ter install
+probe-rs`),
 then listens to the board's serial port for the check's time. On an ESP
 board `ter` resets the chip itself once the port is open, so it sees the
 program from its first line, and times in `check.yaml` count from that

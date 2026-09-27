@@ -59,7 +59,7 @@ pub fn ready(dir: &Path) -> Result<Ready, CliError> {
     let tool = tool(dir)?;
     let program = ter_flash::find_program(tool.program()).ok_or_else(|| {
         unavailable(format!(
-            "{0} is not installed, and this board is flashed with it. Install it with `cargo install {0} --locked`.",
+            "{0} is not installed, and this board is flashed with it. Install it with `ter install {0}`.",
             tool.program()
         ))
     })?;

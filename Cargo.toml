@@ -24,6 +24,7 @@ ter-sdk = { path = "ter-sdk" }
 ter-check = { path = "ter-check" }
 ter-telemetry = { path = "ter-telemetry" }
 ter-flash = { path = "ter-flash" }
+ter-gen = { path = "ter-gen" }
 base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
 directories = "6"

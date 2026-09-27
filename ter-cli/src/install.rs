@@ -1,19 +1,198 @@
-//! `ter install wokwi-cli`: Wokwi's command line simulator, and the
-//! learner's own Wokwi token.
+//! `ter install`: the tools ter and the exercises use.
+//!
+//! `targets` (the Rust target, toolchain and components of the project in
+//! the current folder), `espflash` and `probe-rs` are installed with rustup
+//! and cargo; `wokwi-cli` is Wokwi's command line simulator, downloaded,
+//! with the learner's own Wokwi token.
 //!
 //! TER holds no Wokwi account for anyone: each learner creates a CI token
 //! on their own Wokwi account, and ter keeps it like the TER token (the
-//! keychain, else a file only they can read). Running it twice is safe:
-//! what is already there is left alone.
+//! keychain, else a file only they can read). Running any of it twice is
+//! safe: what is already there is left alone.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde::Serialize;
+use ter_gen::install::{self as plan, Cmd, Item, State, Tool};
 
 use crate::output::{CliError, print_json};
 use crate::sim::{self, TOKEN_ENV, TOKEN_PAGE, WOKWI_CLI};
 use crate::token_store::TokenStore;
+
+/// What `ter install` takes, in the order it installs them.
+pub const TOOLS: [&str; 6] = [
+    "targets",
+    "espflash",
+    "probe-rs",
+    "wokwi-cli",
+    "sim86",
+    "telemetry-firmware",
+];
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Report {
+    Planned { tool: String, items: Vec<Done> },
+    Wokwi(Installed),
+}
+
+#[derive(Serialize)]
+struct Done {
+    what: String,
+    /// `present` (left alone) or `installed` (installed now).
+    state: &'static str,
+    /// What was found, or the commands that installed it.
+    detail: String,
+}
+
+pub async fn run(
+    tools: &[String],
+    dir: Option<PathBuf>,
+    token_stdin: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    for tool in tools {
+        if matches!(tool.as_str(), "sim86" | "telemetry-firmware") {
+            return Err(CliError::new(
+                "not_available",
+                format!("`{tool}` cannot be installed yet: it is not released."),
+            ));
+        }
+    }
+    let dir = match dir {
+        Some(d) => d,
+        None => std::env::current_dir()
+            .map_err(|e| CliError::new("io_error", format!("No current folder: {e}")))?,
+    };
+    // Read the project before installing anything, so a wrong folder fails
+    // with nothing done.
+    let project = if tools.iter().any(|t| t == "targets") {
+        Some(plan::read_project(&dir).map_err(|m| {
+            CliError::new(
+                "no_project",
+                format!(
+                    "{m} Run `ter install targets` in an exercise or project folder, or pass --dir."
+                ),
+            )
+        })?)
+    } else {
+        None
+    };
+
+    let mut reports = Vec::new();
+    let mut seen = Vec::new();
+    for name in TOOLS {
+        if !tools.iter().any(|t| t == name) || seen.contains(&name) {
+            continue;
+        }
+        seen.push(name);
+        let tool = match name {
+            "targets" => Tool::Targets,
+            "espflash" => Tool::Espflash,
+            "probe-rs" => Tool::ProbeRs,
+            _ => {
+                reports.push(Report::Wokwi(wokwi(token_stdin, json).await?));
+                continue;
+            }
+        };
+        let items = plan::plan(&plan::System, tool, project.as_ref());
+        let mut done = Vec::new();
+        for item in items {
+            done.push(apply(item, &dir, json)?);
+        }
+        reports.push(Report::Planned {
+            tool: name.to_string(),
+            items: done,
+        });
+    }
+    if json {
+        print_json(&serde_json::json!({ "tools": reports }));
+    }
+    Ok(())
+}
+
+/// Install one item, or say it is already there.
+fn apply(item: Item, dir: &Path, json: bool) -> Result<Done, CliError> {
+    match item.state {
+        State::Present(found) => {
+            if !json {
+                println!("{} is already installed ({found}).", item.what);
+            }
+            Ok(Done {
+                what: item.what,
+                state: "present",
+                detail: found,
+            })
+        }
+        State::Manual(what_to_do) => Err(CliError::new("install_failed", what_to_do)),
+        State::Install { why, run } => {
+            if !json {
+                println!("Installing {} ({why}).", item.what);
+            }
+            for cmd in &run {
+                execute(cmd, dir, json)?;
+            }
+            if !json {
+                println!("Installed {}.", item.what);
+            }
+            if let Some(program) = run
+                .iter()
+                .find(|c| c.program == "cargo")
+                .and_then(|c| c.args.get(1))
+                .map(|krate| {
+                    if krate == "probe-rs-tools" {
+                        "probe-rs"
+                    } else {
+                        krate
+                    }
+                })
+                && ter_flash::find_program(program).is_none()
+            {
+                eprintln!(
+                    "{program} is installed in cargo's bin folder, which is not on your PATH yet. Add it (usually ~/.cargo/bin) so ter can find it."
+                );
+            }
+            Ok(Done {
+                what: item.what,
+                state: "installed",
+                detail: run
+                    .iter()
+                    .map(Cmd::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" && "),
+            })
+        }
+    }
+}
+
+/// Run one install command in the project folder. With `--json` its
+/// output goes to stderr, so stdout stays one JSON document.
+fn execute(cmd: &Cmd, dir: &Path, json: bool) -> Result<(), CliError> {
+    let fail = |m: String| CliError::new("install_failed", m);
+    let program = plan::find_program(&cmd.program).ok_or_else(|| {
+        fail(format!(
+            "`{cmd}` needs {}, which is not installed.",
+            cmd.program
+        ))
+    })?;
+    let mut command = Command::new(program);
+    command
+        .args(&cmd.args)
+        .current_dir(dir)
+        .stdin(Stdio::null());
+    if json {
+        command.stdout(std::io::stderr());
+    }
+    let status = command
+        .status()
+        .map_err(|e| fail(format!("Could not run `{cmd}`: {e}")))?;
+    if !status.success() {
+        return Err(fail(format!("`{cmd}` failed ({status}).")));
+    }
+    Ok(())
+}
 
 const RELEASES: &str = "https://github.com/wokwi/wokwi-cli/releases/latest/download";
 
@@ -28,8 +207,7 @@ struct Installed {
     token_stored_now: bool,
 }
 
-pub async fn run(tool: &str, token_stdin: bool, json: bool) -> Result<(), CliError> {
-    debug_assert_eq!(tool, WOKWI_CLI);
+async fn wokwi(token_stdin: bool, json: bool) -> Result<Installed, CliError> {
     let (path, downloaded) = match sim::find_cli() {
         Some(p) => (p, false),
         None => (download().await?, true),
@@ -68,19 +246,19 @@ pub async fn run(tool: &str, token_stdin: bool, json: bool) -> Result<(), CliErr
     };
 
     if json {
-        print_json(&Installed {
-            tool: WOKWI_CLI,
-            path,
-            downloaded,
-            token: token_source,
-            token_stored_now: stored_now,
-        });
+        // The caller prints every tool's answer as one document.
     } else if stored_now {
         println!("Your Wokwi token is stored ({token_source}). `ter run --sim` is ready.");
     } else {
         println!("Using the Wokwi token from {token_source}. `ter run --sim` is ready.");
     }
-    Ok(())
+    Ok(Installed {
+        tool: WOKWI_CLI,
+        path,
+        downloaded,
+        token: token_source,
+        token_stored_now: stored_now,
+    })
 }
 
 fn read_line(input: impl BufRead) -> Result<String, CliError> {

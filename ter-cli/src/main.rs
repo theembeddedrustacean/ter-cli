@@ -100,11 +100,16 @@ enum Command {
         #[command(subcommand)]
         command: TelemetryCommand,
     },
-    /// Install a tool ter uses: `wokwi-cli`, with your Wokwi token.
+    /// Install the tools ter and the exercises use. What is already
+    /// installed is left alone.
     Install {
-        /// The tool.
-        #[arg(value_parser = ["wokwi-cli"])]
-        tool: String,
+        /// `targets` (the Rust target of the project in this folder),
+        /// `espflash`, `probe-rs`, `wokwi-cli` (with your Wokwi token).
+        #[arg(required = true, value_parser = install::TOOLS)]
+        tools: Vec<String>,
+        /// The project `targets` reads, instead of the current folder.
+        #[arg(long)]
+        dir: Option<PathBuf>,
         /// Read the Wokwi token from standard input instead of asking.
         #[arg(long)]
         token_stdin: bool,
@@ -218,7 +223,11 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
         Command::Telemetry {
             command: TelemetryCommand::Check { recording, check },
         } => telemetry::check(recording, check, json),
-        Command::Install { tool, token_stdin } => install::run(&tool, token_stdin, json).await,
+        Command::Install {
+            tools,
+            dir,
+            token_stdin,
+        } => install::run(&tools, dir, token_stdin, json).await,
         Command::Whoami => {
             let session = Session::open()?;
             let result = whoami::run(&session, json).await;
