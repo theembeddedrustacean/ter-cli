@@ -82,6 +82,15 @@ fn live_pair_start_gives_a_pending_code() {
 
 #[test]
 #[ignore = "live site"]
+fn live_used_code_is_consumed() {
+    // KFQY-5985 was approved and its token taken by `ter login` on
+    // 2026-09-27; the site keeps answering `consumed` for it.
+    let poll = pair_call("GET", "pair_poll", "?code=KFQY-5985");
+    assert_eq!(poll, serde_json::json!({"status": "consumed"}));
+}
+
+#[test]
+#[ignore = "live site"]
 fn live_unknown_code_is_expired() {
     let poll = pair_call("GET", "pair_poll", "?code=ZZZZ-0000");
     assert_eq!(poll, serde_json::json!({"status": "expired"}));

@@ -25,11 +25,13 @@ pub struct PairStart {
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum PollStatus {
     Pending,
-    /// The token is handed out once; the next poll says `expired`.
+    /// The token is handed out once; the next poll says `consumed`.
     Approved {
         token: String,
     },
-    /// Unknown, used or expired code.
+    /// The token for this code was already handed out, to another poll.
+    Consumed,
+    /// Unknown or expired code.
     Expired,
 }
 
@@ -76,6 +78,7 @@ impl Poller {
         let wait = match poll {
             Ok(PollStatus::Approved { token }) => return Next::Done(token),
             Ok(PollStatus::Expired) => return Next::Fail(Error::PairingExpired),
+            Ok(PollStatus::Consumed) => return Next::Fail(Error::PairingUsed),
             Ok(PollStatus::Pending) => {
                 self.failures = 0;
                 self.interval
@@ -142,6 +145,16 @@ mod tests {
             panic!("expected a failure");
         };
         assert_eq!(e.code(), "pairing_expired");
+        assert!(e.to_string().contains("ter login"), "{e}");
+    }
+
+    #[test]
+    fn a_code_used_elsewhere_stops_with_pairing_used() {
+        let mut p = Poller::new(TEN_MIN);
+        let Next::Fail(e) = p.next(Ok(PollStatus::Consumed)) else {
+            panic!("expected a failure");
+        };
+        assert_eq!(e.code(), "pairing_used");
         assert!(e.to_string().contains("ter login"), "{e}");
     }
 
@@ -216,6 +229,7 @@ mod tests {
         let parse = |s: &str| serde_json::from_str::<PollStatus>(s).unwrap();
         assert_eq!(parse(r#"{"status":"pending"}"#), PollStatus::Pending);
         assert_eq!(parse(r#"{"status":"expired"}"#), PollStatus::Expired);
+        assert_eq!(parse(r#"{"status":"consumed"}"#), PollStatus::Consumed);
         assert_eq!(
             parse(r#"{"status":"approved","token":"abc"}"#),
             PollStatus::Approved {

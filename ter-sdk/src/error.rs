@@ -38,6 +38,11 @@ pub enum Error {
     PairingExpired,
 
     #[error(
+        "This pairing code was already used to log in, perhaps by another ter. Run `ter login` again for a fresh one."
+    )]
+    PairingUsed,
+
+    #[error(
         "ter {current} is older than the oldest version the site accepts ({minimum}). Run `ter self-update`."
     )]
     Outdated { current: String, minimum: String },
@@ -51,6 +56,7 @@ impl Error {
             Error::Network(_) => "network_error",
             Error::NoToken => "no_token",
             Error::PairingExpired => "pairing_expired",
+            Error::PairingUsed => "pairing_used",
             Error::Outdated { .. } => "outdated",
         }
     }
