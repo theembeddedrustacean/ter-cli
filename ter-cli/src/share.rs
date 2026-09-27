@@ -4,9 +4,9 @@
 //! prints the code, then keeps the bench alive with a heartbeat. Runs
 //! arrive on the bench socket (`--bind`, `--bench-port`), which a tunnel
 //! or the LAN reaches at `--url`; they are flashed and captured on the
-//! board here and the recording goes back. Each heartbeat also re-reads
-//! whether sharing is on and under which code, so turning it off on the
-//! Devices page or with `ter bench unshare` shuts the bench within one
+//! board here and the recording goes back. Each heartbeat's answer also
+//! says whether sharing is on and under which code, so turning it off on
+//! the Devices page or with `ter bench unshare` shuts the bench within one
 //! interval.
 //!
 //! The kill switch is a line on standard input: `k` drops whoever is
@@ -288,17 +288,20 @@ pub async fn start(
 /// elsewhere.
 async fn heartbeat(client: Arc<Client>, bench: String, owner: SharedOwner, mut schedule: Schedule) {
     let mut wait = schedule.first();
+    let mut connected: Vec<String> = Vec::new();
     loop {
         tokio::time::sleep(wait).await;
         let busy = owner.lock().expect("owner lock").busy();
         let change = match client.bench_heartbeat(&bench, busy).await {
             Ok(hb) => {
-                let sharing = match (hb.sharing, hb.share_code) {
-                    (Some(on), code) => Some(code.filter(|_| on)),
-                    (None, _) => sharing_on_site(&client, &bench).await,
-                };
-                if let Some(code) = sharing {
-                    follow(&owner, code);
+                follow(&owner, hb.share_code.filter(|_| hb.sharing));
+                if hb.connected != connected {
+                    connected = hb.connected;
+                    if connected.is_empty() {
+                        eprintln!("Nobody is connected to the bench now.");
+                    } else {
+                        eprintln!("Connected to the bench now: {}.", connected.join(", "));
+                    }
                 }
                 let (next, change) = schedule.ok(Instant::now());
                 wait = next;
@@ -329,14 +332,6 @@ async fn heartbeat(client: Arc<Client>, bench: String, owner: SharedOwner, mut s
             None => {}
         }
     }
-}
-
-/// Whether the site has sharing on for `bench`, and the code: `None` when
-/// the site could not be asked.
-async fn sharing_on_site(client: &Client, bench: &str) -> Option<Option<String>> {
-    let mine = client.my_benches().await.ok()?;
-    let b = mine.into_iter().find(|b| b.name == bench)?;
-    Some(b.share_code.filter(|_| b.sharing))
 }
 
 fn follow(owner: &SharedOwner, code: Option<String>) {

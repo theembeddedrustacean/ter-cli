@@ -1117,6 +1117,8 @@ fn live_serve_fetches_runs_and_posts_for_the_page() {
 struct SharedBench {
     m: LiveMachine,
     child: Option<std::process::Child>,
+    /// What `ter serve` has printed to stderr so far.
+    said: std::sync::Arc<std::sync::Mutex<String>>,
     name: String,
     code: String,
 }
@@ -1143,9 +1145,25 @@ impl SharedBench {
             .env_remove("TER_PORT")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let stderr = child.stderr.take().unwrap();
+        std::thread::spawn({
+            let said = said.clone();
+            move || {
+                for line in std::io::BufReader::new(stderr)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    eprintln!("serve: {line}");
+                    let mut s = said.lock().unwrap();
+                    s.push_str(&line);
+                    s.push('\n');
+                }
+            }
+        });
         let mut line = String::new();
         std::io::BufReader::new(child.stdout.take().unwrap())
             .read_line(&mut line)
@@ -1162,7 +1180,20 @@ impl SharedBench {
                 .to_string(),
             m,
             child: Some(child),
+            said,
         }
+    }
+
+    /// Wait until `ter serve` has printed `text`.
+    fn wait_said(&self, text: &str, limit: std::time::Duration) -> std::time::Duration {
+        let took = wait_for(&format!("serve saying {text:?}"), limit, || {
+            self.said.lock().unwrap().contains(text)
+        });
+        assert!(
+            !self.said.lock().unwrap().contains(&self.m.token),
+            "the token must never be printed"
+        );
+        took
     }
 
     fn stop(&mut self) {
@@ -1294,6 +1325,12 @@ fn live_serve_share_registers_heartbeats_shares_and_goes_offline() {
     let (ok, v) = driver.json(&["bench", "list"], driver.courses.path());
     assert!(ok, "{v}");
     assert_eq!(v["connected"][0]["bench"], bench.name.as_str());
+    // ter serve hears who is connected from its heartbeat.
+    let took = bench.wait_said(
+        "Connected to the bench now: ",
+        std::time::Duration::from_secs(40),
+    );
+    eprintln!("serve saw the connection {} s after it", took.as_secs());
 
     // Heartbeats keep it up past the site's 60 s.
     std::thread::sleep(std::time::Duration::from_secs(70));
@@ -1315,6 +1352,23 @@ fn live_serve_share_registers_heartbeats_shares_and_goes_offline() {
         serde_json::json!([]),
         "unshare drops them: {listed}"
     );
+    // ter serve hears from its heartbeat that sharing is off, and closes
+    // the bench.
+    let took = bench.wait_said(
+        "Sharing was turned off on the site.",
+        std::time::Duration::from_secs(40),
+    );
+    eprintln!(
+        "serve closed the bench {} s after the unshare",
+        took.as_secs()
+    );
+    bench.wait_said(
+        "Nobody is connected to the bench now.",
+        std::time::Duration::from_secs(5),
+    );
+    let (ok, v) = driver.json(&["connect", &bench.code], driver.courses.path());
+    assert!(!ok, "the old code no longer connects: {v}");
+    assert_eq!(v["error"]["code"], "not_found", "{v}");
 
     bench.stop();
     assert_eq!(

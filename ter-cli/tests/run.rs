@@ -1325,14 +1325,7 @@ async fn bench_site(bench_port: u16, every: u64) -> MockServer {
         .await;
     Mock::given(method("POST"))
         .and(path(format!("{API}.bench_heartbeat")))
-        .respond_with(ok(
-            json!({"ok": true, "bench": BENCH, "status": "available", "connected": 1}),
-        ))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("{API}.devices")))
-        .respond_with(ok(devices(true)))
+        .respond_with(ok(heartbeat(true)))
         .mount(&server)
         .await;
     let connected = json!({"ok": true, "bench": BENCH, "label": "Desk", "board": "xiao-esp32c3",
@@ -1347,12 +1340,10 @@ async fn bench_site(bench_port: u16, every: u64) -> MockServer {
     server
 }
 
-fn devices(sharing: bool) -> Value {
-    json!({"enabled": true, "heartbeat_ttl": 60, "using": [], "tokens": [], "mine": [{
-        "name": BENCH, "label": "Desk", "board": "xiao-esp32c3", "url": null,
-        "status": "available", "last_seen": null, "sharing": sharing,
-        "share_code": if sharing { json!(CODE) } else { json!(null) }, "connected": []
-    }]})
+fn heartbeat(sharing: bool) -> Value {
+    json!({"ok": true, "bench": BENCH, "status": "available", "sharing": sharing,
+           "share_code": if sharing { json!(CODE) } else { json!(null) },
+           "connected": if sharing { json!(["Driver"]) } else { json!([]) }})
 }
 
 /// The owner's machine: a board on a pty, flashed by a fake espflash.
@@ -1529,10 +1520,10 @@ async fn sharing_turned_off_on_the_site_closes_the_bench_within_a_heartbeat() {
     let (connected, v) = driver.json_in(&server.uri(), &["connect", CODE], driver.courses.path());
     assert!(connected, "{v}");
 
-    // Unshared on the Devices page.
-    Mock::given(method("GET"))
-        .and(path(format!("{API}.devices")))
-        .respond_with(ok(devices(false)))
+    // Unshared on the Devices page: the next heartbeat says so.
+    Mock::given(method("POST"))
+        .and(path(format!("{API}.bench_heartbeat")))
+        .respond_with(ok(heartbeat(false)))
         .with_priority(1)
         .mount(&server)
         .await;
