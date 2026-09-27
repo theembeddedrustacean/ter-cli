@@ -30,14 +30,17 @@ pub const RUNS_DIR: &str = ".runs";
 pub const COURSE_TARGET_DIR: &str = ".target";
 /// Shared ESP-IDF tools, inside a course.
 pub const COURSE_EMBUILD_DIR: &str = ".embuild";
+/// What `ter` remembers about an exercise, such as its last posted run.
+/// Not build output: `ter ex clean` keeps it.
+pub const STATE_DIR: &str = ".ter";
 
 /// Build output inside an exercise: cargo's own `target/` when something
 /// builds it without `ter`, and the run recordings.
 const EXERCISE_BUILD_OUTPUT: [&str; 2] = ["target", RUNS_DIR];
 
-/// Top-level names left out of the edit check: ter's own file, build
+/// Top-level names left out of the edit check: ter's own files, build
 /// output, and the lock file cargo writes on the first build.
-const NOT_SOURCE: [&str; 4] = [TER_TOML, "target", RUNS_DIR, "Cargo.lock"];
+const NOT_SOURCE: [&str; 5] = [TER_TOML, STATE_DIR, "target", RUNS_DIR, "Cargo.lock"];
 
 /// A failure on the learner's disk, with the stable code `ter` exits on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,14 +50,14 @@ pub struct ProjectError {
 }
 
 impl ProjectError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
         }
     }
 
-    fn io(what: &str, path: &Path, e: std::io::Error) -> Self {
+    pub(crate) fn io(what: &str, path: &Path, e: std::io::Error) -> Self {
         Self::new(
             "io_error",
             format!("Could not {what} {}: {e}", path.display()),
@@ -440,6 +443,28 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> 
     Ok(())
 }
 
+/// A new, empty recording folder for a run: `.runs/<n>/` in the exercise,
+/// numbered on from the highest there. Returns the number and the folder.
+pub fn new_recording(exercise_dir: &Path) -> Result<(u32, PathBuf)> {
+    let runs = exercise_dir.join(RUNS_DIR);
+    std::fs::create_dir_all(&runs).map_err(|e| ProjectError::io("create", &runs, e))?;
+    let mut n = subdirs(&runs)?
+        .iter()
+        .filter_map(|d| d.file_name()?.to_str()?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    loop {
+        n += 1;
+        let dir = runs.join(n.to_string());
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok((n, dir)),
+            // Another run took this number first.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(ProjectError::io("create", &dir, e)),
+        }
+    }
+}
+
 /// What cleaning freed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Freed {
@@ -786,7 +811,7 @@ mod tests {
             let err = Scaffold::check(&ex).unwrap_err();
             assert_eq!(err.code, "bad_scaffold", "{bad}");
         }
-        for reserved in ["ter.toml", ".runs/1/x", "target/x"] {
+        for reserved in ["ter.toml", ".runs/1/x", "target/x", ".ter/last-run.json"] {
             let ex = exercise(vec![
                 file(".cargo/config.toml", CONFIG),
                 file(reserved, "x"),
@@ -961,5 +986,27 @@ mod tests {
             Some(f.dir.as_path())
         );
         assert_eq!(enclosing_exercise(root.path()), None);
+    }
+
+    #[test]
+    fn recordings_number_on_and_state_survives_clean_and_edit_check() {
+        let root = tempfile::tempdir().unwrap();
+        let f = fetch(&Layout::new(root.path()), &scaffold());
+        let (n1, d1) = new_recording(&f.dir).unwrap();
+        let (n2, d2) = new_recording(&f.dir).unwrap();
+        assert_eq!((n1, n2), (1, 2));
+        assert_eq!(d2, f.dir.join(".runs/2"));
+        assert!(d1.is_dir() && d2.is_dir());
+
+        std::fs::create_dir_all(f.dir.join(STATE_DIR)).unwrap();
+        std::fs::write(f.dir.join(STATE_DIR).join("last-run.json"), "{}").unwrap();
+        assert!(
+            !f.is_edited().unwrap(),
+            "state and recordings are not edits"
+        );
+        clean_exercise(&f.dir).unwrap();
+        assert!(!f.dir.join(RUNS_DIR).exists());
+        assert!(f.dir.join(STATE_DIR).join("last-run.json").is_file());
+        assert_eq!(new_recording(&f.dir).unwrap().0, 1);
     }
 }

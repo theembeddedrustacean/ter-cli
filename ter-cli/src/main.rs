@@ -3,12 +3,17 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod build;
 mod config;
 mod exercises;
+mod hint;
 mod login;
 mod output;
+mod record;
+mod run;
 mod self_update;
 mod session;
+mod status;
 mod token_store;
 mod whoami;
 
@@ -44,6 +49,31 @@ enum Command {
     Ex {
         #[command(subcommand)]
         command: ExCommand,
+    },
+    /// Build the exercise and post the run to TER Learn.
+    Run {
+        /// The exercise folder; the one you are in by default.
+        dir: Option<PathBuf>,
+        /// Run in simulation this time, whatever ter.toml's `mode` says.
+        #[arg(long, conflicts_with = "hw")]
+        sim: bool,
+        /// Run on hardware this time, whatever ter.toml's `mode` says.
+        #[arg(long)]
+        hw: bool,
+        /// Build only: post the attempt without running or checking it.
+        #[arg(long)]
+        no_check: bool,
+    },
+    /// Your exercises and their last runs; --disk for disk use per course.
+    Status {
+        /// How much disk each course and exercise takes. Needs no account.
+        #[arg(long)]
+        disk: bool,
+    },
+    /// The next hint for the last run of the exercise you are in.
+    Hint {
+        /// The exercise folder; the one you are in by default.
+        dir: Option<PathBuf>,
     },
     /// Update ter to the latest version.
     SelfUpdate,
@@ -111,6 +141,30 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
         }
         Command::Logout => login::logout(&Session::open()?, json),
         Command::Ex { command } => ex(command, json).await,
+        Command::Run {
+            dir,
+            sim,
+            hw,
+            no_check,
+        } => {
+            let mode = match (sim, hw) {
+                (true, _) => Some("simulation"),
+                (_, true) => Some("hardware"),
+                _ => None,
+            };
+            run::run(
+                run::RunArgs {
+                    dir,
+                    mode,
+                    no_check,
+                },
+                json,
+            )
+            .await
+        }
+        Command::Status { disk: true } => status::disk(json),
+        Command::Status { disk: false } => status::status(json).await,
+        Command::Hint { dir } => hint::hint(dir, json).await,
         Command::Whoami => {
             let session = Session::open()?;
             let result = whoami::run(&session, json).await;

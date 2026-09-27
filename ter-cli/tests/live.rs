@@ -394,3 +394,165 @@ fn live_dev_fetch_matches_the_site() {
         "the checkout differs from the site"
     );
 }
+
+/// The site allows one run per second per account, so tests that post runs
+/// take turns and leave a second between posts.
+static POSTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn take_turn() -> std::sync::MutexGuard<'static, ()> {
+    let guard = POSTING.lock().unwrap_or_else(|e| e.into_inner());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    guard
+}
+
+/// One machine for several `ter` commands: a config dir and a courses root.
+struct LiveMachine {
+    config: tempfile::TempDir,
+    courses: tempfile::TempDir,
+    token: String,
+}
+
+impl LiveMachine {
+    fn new() -> Self {
+        let config = tempfile::tempdir().unwrap();
+        let courses = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("config.toml"),
+            format!("courses_root = {:?}\n", courses.path()),
+        )
+        .unwrap();
+        Self {
+            config,
+            courses,
+            token: live_token(),
+        }
+    }
+
+    fn json(&self, args: &[&str], cwd: &std::path::Path) -> (bool, Value) {
+        let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+            .args(args)
+            .arg("--json")
+            .current_dir(cwd)
+            .env("TER_CONFIG_DIR", self.config.path())
+            .env("TER_TOKEN", &self.token)
+            .env("TER_KEYCHAIN", "off")
+            .env_remove("TER_SITE_URL")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            !stdout.contains(&self.token),
+            "the token must never be printed"
+        );
+        let v = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        (o.status.success(), v)
+    }
+}
+
+/// The fetched Heartbeat stub does not compile until the learner fills its
+/// gaps, so a build-only run of it is a failed build. It is posted with a
+/// compiler tail; the next run is the next attempt and reports the hints
+/// taken in between.
+#[test]
+#[ignore = "live site"]
+fn live_failed_build_is_posted_and_attempts_count() {
+    let m = LiveMachine::new();
+    let (ok, v) = m.json(&["ex", "fetch", LIVE_OPEN], m.courses.path());
+    assert!(ok, "{v}");
+    let dir = std::path::PathBuf::from(v["path"].as_str().unwrap());
+
+    let first = {
+        let _turn = take_turn();
+        let (ok, v) = m.json(&["run", "--no-check"], &dir);
+        assert!(!ok, "the stub does not build: {v}");
+        v
+    };
+    assert_eq!(first["error"]["code"], "build_failed", "{first}");
+    assert_eq!(first["build_status"], "failed");
+    assert_eq!(first["check_status"], "not_run");
+    assert_eq!(first["mode"], "hardware");
+    let tail = first["compiler_tail"].as_str().unwrap();
+    assert!(tail.contains("error"), "{tail}");
+    assert!(
+        first["name"].as_str().is_some_and(|n| !n.is_empty()),
+        "{first}"
+    );
+    let attempt = first["site"]["attempt"].as_u64().expect("an attempt");
+    assert!(attempt >= 1);
+
+    // The site's rung for this run, or number 0 when it has none.
+    let (ok, hint) = m.json(&["hint"], &dir);
+    assert!(ok, "{hint}");
+    assert_eq!(hint["run"], first["name"]);
+    let number = hint["number"].as_u64().unwrap();
+    assert!(!hint["text"].as_str().unwrap().is_empty(), "{hint}");
+    assert_eq!(hint["hints_used"], number);
+
+    let second = {
+        let _turn = take_turn();
+        m.json(&["run", "--no-check"], &dir).1
+    };
+    assert_eq!(second["build_status"], "failed", "{second}");
+    assert_eq!(second["site"]["attempt"], attempt + 1, "{second}");
+    assert_eq!(second["hints_used"], number, "{second}");
+    assert_ne!(second["name"], first["name"]);
+
+    let (ok, status) = m.json(&["status"], &dir);
+    assert!(ok, "{status}");
+    assert_eq!(status["last_run"]["attempt"], attempt + 1);
+    assert_eq!(status["state"], "open");
+}
+
+fn live_client() -> ter_sdk::Client {
+    ter_sdk::Client::new(SITE, Some(live_token()), env!("CARGO_PKG_VERSION")).unwrap()
+}
+
+/// A run that built and did not run: no evidence for mastery.
+fn not_run_record(exercise: &str, mode: &str) -> ter_sdk::run::RunRecord {
+    ter_sdk::run::RunRecord {
+        exercise_id: exercise.into(),
+        target: "xiao-esp32c3-nostd".into(),
+        mode: mode.into(),
+        build_status: "passed".into(),
+        check_status: "not_run".into(),
+        cli_version: env!("CARGO_PKG_VERSION").into(),
+        ..Default::default()
+    }
+}
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Runtime::new().unwrap().block_on(f)
+}
+
+#[test]
+#[ignore = "live site"]
+fn live_second_run_within_a_second_is_rate_limited() {
+    let client = live_client();
+    let record = not_run_record(LIVE_OPEN, "hardware");
+    let _turn = take_turn();
+    let (first, second) = block_on(async {
+        let first = client.post_run(&record).await;
+        (first, client.post_run(&record).await)
+    });
+    assert!(first.expect("the first run posts").attempt >= 1);
+    // The site answers `rate_limited` with HTTP 429, and its host swaps the
+    // body of every 429 for an HTML page, so only the code is certain.
+    let err = second.unwrap_err();
+    assert_eq!(err.code(), "rate_limited", "{err}");
+}
+
+/// Needs a hardware-only exercise in the test account's course, named by
+/// `TER_LIVE_HW_ONLY`. None exists on the site yet (no exercise sets
+/// `modes:`), so this skips until one does.
+#[test]
+#[ignore = "live site"]
+fn live_simulation_run_of_a_hardware_only_exercise_is_refused() {
+    let Ok(exercise) = std::env::var("TER_LIVE_HW_ONLY") else {
+        eprintln!("skipped: set TER_LIVE_HW_ONLY to a hardware-only exercise id");
+        return;
+    };
+    let client = live_client();
+    let _turn = take_turn();
+    let err = block_on(client.post_run(&not_run_record(&exercise, "simulation"))).unwrap_err();
+    assert_eq!(err.code(), "mode_not_allowed", "{err}");
+}

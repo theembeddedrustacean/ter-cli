@@ -11,6 +11,7 @@ mod error;
 pub mod exercise;
 pub mod pairing;
 pub mod project;
+pub mod run;
 pub mod version;
 
 pub use client::{Client, Course, Enrollments, Lesson, Ping};

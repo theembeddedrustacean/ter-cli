@@ -6,6 +6,7 @@ use tokio::sync::OnceCell;
 
 use crate::exercise::{Exercise, ExerciseRef};
 use crate::pairing::{PairStart, PollStatus};
+use crate::run::{HintAnswer, HintFile, RunAnswer, RunRecord};
 use crate::{Error, envelope::parse_response, version::check_supported};
 
 /// The site's answer to `ping`: who the token belongs to and which CLI
@@ -133,6 +134,19 @@ impl Client {
     /// when this account may not have it.
     pub async fn exercise(&self, exercise_id: &str) -> Result<Exercise, Error> {
         self.get("exercise", &[("exercise_id", exercise_id)]).await
+    }
+
+    /// Post one run record. Refused before sending when this CLI is below
+    /// the site's minimum.
+    pub async fn post_run(&self, record: &RunRecord) -> Result<RunAnswer, Error> {
+        self.post("run", &serde_json::json!({ "payload": record }))
+            .await
+    }
+
+    /// The next hint for a run this account posted.
+    pub async fn hint(&self, run: &str, files: &[HintFile]) -> Result<HintAnswer, Error> {
+        self.post("hint", &serde_json::json!({ "run": run, "files": files }))
+            .await
     }
 
     /// Ask for a pairing code. Needs no token.

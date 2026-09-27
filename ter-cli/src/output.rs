@@ -8,6 +8,9 @@ use serde_json::json;
 pub struct CliError {
     pub code: String,
     pub message: String,
+    /// The command already printed its `--json` answer, with this error in
+    /// it; only the exit status is left to do.
+    pub in_json_answer: bool,
 }
 
 impl CliError {
@@ -15,6 +18,7 @@ impl CliError {
         Self {
             code: code.into(),
             message: message.into(),
+            in_json_answer: false,
         }
     }
 }
@@ -34,6 +38,9 @@ impl From<ter_sdk::project::ProjectError> for CliError {
 /// With `--json` the error goes to stdout as `{"error": {code, message}}`,
 /// the same envelope the site uses; otherwise to stderr.
 pub fn print_error(err: &CliError, json: bool) {
+    if json && err.in_json_answer {
+        return;
+    }
     if json {
         println!(
             "{}",

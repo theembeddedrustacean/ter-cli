@@ -7,7 +7,9 @@ them on your board or in a simulator, checks what the program did, and
 records the attempt on the site.
 
 This is an early version: pairing (`ter login`, `ter logout`,
-`ter whoami`), exercises (`ter ex`) and `ter self-update` work today.
+`ter whoami`), exercises (`ter ex`), build-only runs (`ter run --no-check`),
+`ter status`, `ter hint` and `ter self-update` work today. Running on a
+board or in a simulator comes next.
 
 ## Install
 
@@ -27,6 +29,9 @@ ter ex list           the exercises in your courses (--course C for one)
 ter ex fetch <id>     fetch an exercise as a Cargo project
 ter ex clean          delete build output, keep the source
 ter ex remove <id>    delete an exercise's folder
+ter run --no-check    build the exercise and record the attempt on the site
+ter status            your exercises and their last runs (--disk: disk use)
+ter hint              the next hint for the last run
 ter self-update       how to update ter
 ```
 
@@ -65,6 +70,22 @@ the HAL compiles once per course. `ter ex clean` in an exercise folder, or
 recordings; `--course C` also drops the course's cache, `--all` every
 course's. `ter ex remove <id>` deletes the folder; if you have changed the
 source since fetching, it refuses unless you add `--force`.
+
+### Runs and hints
+
+`ter run --no-check` in an exercise folder builds it (into the course's
+shared cache) and posts the attempt to TER Learn: a failed build with the
+end of the compiler output, a good build as built but not checked. `--sim`
+or `--hw` picks the mode for one run instead of `ter.toml`'s. Each run's
+build log is kept in `.runs/<n>/build.log` in the exercise.
+
+`ter hint` asks the site for the next hint on the last run posted from
+the folder; the next `ter run` reports how many you took. `ter status` in
+an exercise folder shows its last run, attempt number and how the concepts
+it practises moved; elsewhere it lists every exercise in your courses.
+`ter status --disk` shows what each course takes on disk, without asking
+the site. What `ter` remembers about the last run is in `.ter/` in the
+exercise; `ter ex clean` keeps it.
 
 For curriculum authors, `ter ex fetch <id> --dev <checkout>` builds the
 exercise from a local curriculum checkout (with its
