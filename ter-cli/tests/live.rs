@@ -316,6 +316,18 @@ fn live_fetched_c3_scaffold_has_its_runner_and_builds() {
         eprintln!("solution build skipped: set TER_CURRICULUM to a curriculum checkout");
         return;
     };
+    lay_solution_over(&curriculum, &dir);
+    let build = cargo_build();
+    assert!(
+        build.status.success(),
+        "the solution does not build on the fetched scaffold: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+/// The reference solution's `src/`, emitted from a curriculum checkout,
+/// over a fetched Heartbeat scaffold.
+fn lay_solution_over(curriculum: &str, dir: &std::path::Path) {
     let emitted = tempfile::tempdir().unwrap();
     let emit = Command::new("python3")
         .args([
@@ -326,7 +338,7 @@ fn live_fetched_c3_scaffold_has_its_runner_and_builds() {
         ])
         .arg(emitted.path())
         .arg("--solution")
-        .current_dir(&curriculum)
+        .current_dir(curriculum)
         .output()
         .unwrap();
     assert!(
@@ -334,13 +346,9 @@ fn live_fetched_c3_scaffold_has_its_runner_and_builds() {
         "{}",
         String::from_utf8_lossy(&emit.stderr)
     );
-    let solution = emitted.path().join(LIVE_OPEN).join("src");
-    copy_tree(&solution, &dir.join("src"));
-    let build = cargo_build();
-    assert!(
-        build.status.success(),
-        "the solution does not build on the fetched scaffold: {}",
-        String::from_utf8_lossy(&build.stderr)
+    copy_tree(
+        &emitted.path().join(LIVE_OPEN).join("src"),
+        &dir.join("src"),
     );
 }
 
@@ -555,4 +563,63 @@ fn live_simulation_run_of_a_hardware_only_exercise_is_refused() {
     let _turn = take_turn();
     let err = block_on(client.post_run(&not_run_record(&exercise, "simulation"))).unwrap_err();
     assert_eq!(err.code(), "mode_not_allowed", "{err}");
+}
+
+/// A good build is posted as built, not checked, with the program's hash
+/// and the build time. Needs `TER_CURRICULUM` for the solution.
+#[test]
+#[ignore = "live site"]
+fn live_good_build_is_posted_with_its_hash() {
+    let Ok(curriculum) = std::env::var("TER_CURRICULUM") else {
+        eprintln!("skipped: set TER_CURRICULUM to a curriculum checkout");
+        return;
+    };
+    let m = LiveMachine::new();
+    let (ok, v) = m.json(&["ex", "fetch", LIVE_OPEN], m.courses.path());
+    assert!(ok, "{v}");
+    let dir = std::path::PathBuf::from(v["path"].as_str().unwrap());
+    lay_solution_over(&curriculum, &dir);
+
+    let v = {
+        let _turn = take_turn();
+        let (ok, v) = m.json(&["run", "--no-check"], &dir);
+        assert!(ok, "the solution builds and posts: {v}");
+        v
+    };
+    assert_eq!(v["build_status"], "passed", "{v}");
+    assert_eq!(v["check_status"], "not_run");
+    assert!(v.get("compiler_tail").is_none(), "{v}");
+    assert!(v.get("venue").is_none(), "nothing ran: {v}");
+    assert!(v["duration_ms"].as_u64().is_some_and(|d| d > 0), "{v}");
+    let sha = v["elf_sha256"].as_str().expect("the program's hash");
+    let course = ter_sdk::project::TerToml::load(&dir).unwrap().course;
+    let elf = m
+        .courses
+        .path()
+        .join(course)
+        .join(".target/riscv32imc-unknown-none-elf/debug");
+    let built: Vec<_> = std::fs::read_dir(&elf)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| {
+            use sha2::Digest;
+            let bytes = std::fs::read(e.path()).unwrap();
+            let hex: String = sha2::Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            hex == sha
+        })
+        .collect();
+    assert_eq!(
+        built.len(),
+        1,
+        "the hash is of a program in {}",
+        elf.display()
+    );
+    eprintln!(
+        "posted run {} attempt {}: elf_sha256 {sha}, duration_ms {}",
+        v["name"], v["site"]["attempt"], v["duration_ms"]
+    );
 }
