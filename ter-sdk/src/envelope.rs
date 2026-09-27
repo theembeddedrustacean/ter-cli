@@ -8,8 +8,10 @@ use crate::Error;
 /// reports failures as `{"error": {"code", "message"}}`, which Frappe in
 /// turn wraps in `message`; both forms are accepted. Anything else that is
 /// not a success (a body with `exc` or `exc_type`, an HTML error page) is a
-/// server error, except Frappe's own 401 for a token it cannot parse, which
-/// means the same to the learner as `token_invalid`.
+/// server error, except Frappe's own 401 `AuthenticationError`, which
+/// means the same to the learner as `token_invalid`. That is how the site
+/// reports a token it cannot parse, and also a revoked or expired one, with
+/// the text (`Token revoked.`) in `_server_messages`.
 pub fn parse_response(http_status: u16, body: &[u8]) -> Result<Value, Error> {
     let server = |exc_type: Option<String>| Error::Server {
         http_status,
@@ -18,7 +20,7 @@ pub fn parse_response(http_status: u16, body: &[u8]) -> Result<Value, Error> {
 
     let Ok(json) = serde_json::from_slice::<Value>(body) else {
         return Err(match http_status {
-            401 => token_rejected(),
+            401 => token_rejected(None),
             _ => server(None),
         });
     };
@@ -49,7 +51,7 @@ pub fn parse_response(http_status: u16, body: &[u8]) -> Result<Value, Error> {
     let success = (200..300).contains(&http_status);
     if !success || exc_type.is_some() || json.get("exc").is_some() {
         if http_status == 401 {
-            return Err(token_rejected());
+            return Err(token_rejected(server_message(&json)));
         }
         return Err(server(exc_type));
     }
@@ -60,12 +62,24 @@ pub fn parse_response(http_status: u16, body: &[u8]) -> Result<Value, Error> {
     }
 }
 
-fn token_rejected() -> Error {
+fn token_rejected(message: Option<String>) -> Error {
     Error::Site {
         code: "token_invalid".into(),
-        message: "The site did not accept this device token.".into(),
+        message: message.unwrap_or_else(|| "The site did not accept this device token.".into()),
         http_status: 401,
     }
+}
+
+/// The first message Frappe attached to an exception. `_server_messages` is
+/// a JSON string holding a list of JSON strings, each an object with a
+/// `message`.
+fn server_message(json: &Value) -> Option<String> {
+    let list: Vec<String> = serde_json::from_str(json.get("_server_messages")?.as_str()?).ok()?;
+    list.iter().find_map(|item| {
+        let item: Value = serde_json::from_str(item).ok()?;
+        let text = item.get("message")?.as_str()?.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -162,6 +176,44 @@ mod tests {
         let body = json!({"exc_type": "AuthenticationError"});
         let (code, _, status) = site_error(401, body);
         assert_eq!((code.as_str(), status), ("token_invalid", 401));
+    }
+
+    /// As the live site sent it for a device revoked on the Devices page.
+    fn frappe_auth_error(message: &str) -> Value {
+        let inner = json!({
+            "message": message,
+            "as_table": false,
+            "title": "Message",
+            "indicator": "red",
+            "raise_exception": 1,
+            "__frappe_exc_id": "a41eb984"
+        });
+        let list = serde_json::to_string(&vec![inner.to_string()]).unwrap();
+        json!({"exc_type": "AuthenticationError", "_server_messages": list})
+    }
+
+    #[test]
+    fn revoked_and_expired_tokens_keep_the_site_text() {
+        for message in ["Token revoked.", "Token expired."] {
+            let (code, m, status) = site_error(401, frappe_auth_error(message));
+            assert_eq!(
+                (code.as_str(), m.as_str(), status),
+                ("token_invalid", message, 401)
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_server_messages_fall_back_to_the_generic_text() {
+        for body in [
+            json!({"exc_type": "AuthenticationError", "_server_messages": "not json"}),
+            json!({"exc_type": "AuthenticationError", "_server_messages": "[\"{}\"]"}),
+            frappe_auth_error("  "),
+        ] {
+            let (code, m, _) = site_error(401, body);
+            assert_eq!(code, "token_invalid");
+            assert_eq!(m, "The site did not accept this device token.");
+        }
     }
 
     #[test]

@@ -214,14 +214,30 @@ async fn logout_removes_the_token() {
 }
 
 async fn site_rejecting(token: &str, message: &str) -> MockServer {
+    site_answering_401(
+        token,
+        json!({"message": {"error": {"code": "token_invalid", "message": message}}}),
+    )
+    .await
+}
+
+/// A revoked or expired token, the way the live site reports it: Frappe's
+/// own `AuthenticationError`, with the text in `_server_messages`.
+async fn site_raising(token: &str, message: &str) -> MockServer {
+    let inner = json!({"message": message, "indicator": "red", "raise_exception": 1});
+    let list = serde_json::to_string(&vec![inner.to_string()]).unwrap();
+    site_answering_401(
+        token,
+        json!({"exc_type": "AuthenticationError", "_server_messages": list}),
+    )
+    .await
+}
+
+async fn site_answering_401(token: &str, body: Value) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(header("authorization", format!("Bearer {token}").as_str()))
-        .respond_with(
-            ResponseTemplate::new(401).set_body_json(json!({"message": {"error": {
-                "code": "token_invalid", "message": message
-            }}})),
-        )
+        .respond_with(ResponseTemplate::new(401).set_body_json(body))
         .mount(&server)
         .await;
     server
@@ -233,8 +249,16 @@ fn store_token(config: &Path, token: &str) {
 
 #[tokio::test]
 async fn a_revoked_token_is_removed_and_the_learner_told() {
-    for message in ["Token revoked.", "Token expired."] {
-        let site = site_rejecting("dead-token", message).await;
+    for (message, raised) in [
+        ("Token revoked.", true),
+        ("Token expired.", true),
+        ("Token revoked.", false),
+    ] {
+        let site = if raised {
+            site_raising("dead-token", message).await
+        } else {
+            site_rejecting("dead-token", message).await
+        };
         let config = tempfile::tempdir().unwrap();
         store_token(config.path(), "dead-token");
 
