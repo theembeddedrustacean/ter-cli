@@ -347,6 +347,7 @@ async fn json_output_carries_the_hint_and_where_it_went() {
     assert_eq!(v["provider"], "openai");
     assert_eq!(v["attempt"], 4);
     assert_eq!(v["shared"], "posted");
+    assert_eq!(v["exchange"], "hx0001");
     assert_eq!(v["saved"], ".ter/llm/r4bf0000aa-1.json");
 
     let prompt = body(&requests(&provider).await[0])["messages"][1]["content"]

@@ -332,6 +332,9 @@ struct HintOut<'a> {
     saved: &'a Path,
     /// `posted`, `not_on_site`, `declined`, `not_asked` or `failed`.
     shared: &'a str,
+    /// The exchange's name on the site, when it was posted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exchange: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     share_error: Option<&'a str>,
 }
@@ -452,13 +455,17 @@ pub async fn hint(dir: Option<PathBuf>, dry_run: bool, json: bool) -> Result<(),
         }
         None => None,
     };
-    let (shared, share_error) = match share {
-        None => ("not_asked", None),
-        Some(false) => ("declined", None),
+    let (shared, name, share_error) = match share {
+        None => ("not_asked", None, None),
+        Some(false) => ("declined", None, None),
         Some(true) => match client.hint_exchange(&exchange).await {
-            Ok(_) => ("posted", None),
-            Err(e) if e.code() == "not_on_site" => ("not_on_site", None),
-            Err(e) => ("failed", Some(session.forget_dead_token(e.into()).message)),
+            Ok(answer) => ("posted", answer["name"].as_str().map(str::to_string), None),
+            Err(e) if e.code() == "not_on_site" => ("not_on_site", None, None),
+            Err(e) => (
+                "failed",
+                None,
+                Some(session.forget_dead_token(e.into()).message),
+            ),
         },
     };
     let rel = saved.strip_prefix(&dir).unwrap_or(&saved);
@@ -472,6 +479,7 @@ pub async fn hint(dir: Option<PathBuf>, dry_run: bool, json: bool) -> Result<(),
             text: &exchange.answer,
             saved: rel,
             shared,
+            exchange: name.as_deref(),
             share_error: share_error.as_deref(),
         });
     } else {

@@ -1537,8 +1537,8 @@ fn live_llm_hint_from_the_learners_own_provider() {
                 .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&o.stdout)));
             (o.status.success(), v)
         };
-        // The first provider shares its exchange: the site does not take
-        // them yet, and says so without failing the hint.
+        // The first provider shares its exchange with the site; the rest
+        // keep theirs on this machine.
         let share = if i == 0 { "--share" } else { "--no-share" };
         let (ok, v) = ter(
             &["llm", "setup", "--provider", provider, "--key-stdin", share],
@@ -1550,13 +1550,34 @@ fn live_llm_hint_from_the_learners_own_provider() {
         let text = v["text"].as_str().unwrap();
         assert!(text.len() > 20, "{provider}: {text}");
         assert_eq!(v["run"], run["name"]);
-        let expected = if i == 0 {
-            ["not_on_site", "posted"]
-        } else {
-            ["declined"; 2]
-        };
-        assert!(expected.contains(&v["shared"].as_str().unwrap()), "{v}");
+        let expected = if i == 0 { "posted" } else { "declined" };
+        assert_eq!(v["shared"], expected, "{v}");
         eprintln!("{provider} ({}): {text}\n", v["model"]);
+
+        // The saved exchange is the payload that was posted, field for
+        // field: the run, the text sent and the answer, and no key.
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(dir.join(v["saved"].as_str().unwrap())).unwrap())
+                .unwrap();
+        assert_eq!(saved["run"], run["name"]);
+        assert_eq!(saved["answer"], v["text"]);
+        assert_eq!(saved["provider"], provider);
+        let posted = saved.to_string();
+        for part in [&key[..], &key[..12], &key[key.len() - 8..]] {
+            assert!(
+                !posted.contains(part),
+                "{provider}: the key is in the exchange"
+            );
+        }
+        if i == 0 {
+            assert!(v["exchange"].as_str().is_some_and(|n| !n.is_empty()), "{v}");
+            eprintln!(
+                "{provider}: posted exchange {} of run {} ({} bytes), key absent",
+                v["exchange"],
+                saved["run"],
+                posted.len()
+            );
+        }
 
         let mut written = String::new();
         for root in [m.config.path(), dir.as_path()] {

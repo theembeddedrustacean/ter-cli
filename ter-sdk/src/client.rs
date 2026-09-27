@@ -151,8 +151,8 @@ impl Client {
     }
 
     /// Share one exchange with a hint model (the learner's own provider)
-    /// against a run, with the learner's consent. `not_on_site` until the
-    /// site takes them.
+    /// against a run, with the learner's consent. Answers `{ok, name}`;
+    /// `not_on_site` from a site that does not take them.
     pub async fn hint_exchange(&self, exchange: &HintExchange) -> Result<Value, Error> {
         self.post("hint_exchange", &serde_json::json!({ "payload": exchange }))
             .await
