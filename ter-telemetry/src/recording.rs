@@ -103,15 +103,18 @@ impl Recording {
         Self::from_jsonl(&text).map_err(|e| format!("{}: {e}", file.display()))
     }
 
-    /// Everything the module printed, in order.
+    /// Everything the module printed, in order, as a terminal shows it:
+    /// without colour codes.
     pub fn serial_text(&self) -> String {
-        self.events
+        let raw: String = self
+            .events
             .iter()
             .filter_map(|e| match &e.kind {
                 crate::event::EventKind::Serial { text, .. } => Some(text.as_str()),
                 _ => None,
             })
-            .collect()
+            .collect();
+        crate::strip_ansi(&raw)
     }
 }
 
@@ -143,7 +146,7 @@ mod tests {
             events: vec![
                 Event::reset(0),
                 Event::pin(0, "user_led", Level::Low),
-                Event::serial(12, "boot\n"),
+                Event::serial(12, "\u{1b}[32mboot\u{1b}[0m\n"),
             ],
         };
         let text = rec.to_jsonl();

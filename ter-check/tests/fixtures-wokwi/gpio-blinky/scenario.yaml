@@ -1,0 +1,224 @@
+name: ter-clock
+version: 1
+author: ter
+steps:
+  - name: "@0"
+    delay: 50ms
+  - name: "@50"
+    delay: 50ms
+  - name: "@100"
+    delay: 50ms
+  - name: "@150"
+    delay: 50ms
+  - name: "@200"
+    delay: 50ms
+  - name: "@250"
+    delay: 50ms
+  - name: "@300"
+    delay: 50ms
+  - name: "@350"
+    delay: 50ms
+  - name: "@400"
+    delay: 50ms
+  - name: "@450"
+    delay: 50ms
+  - name: "@500"
+    delay: 50ms
+  - name: "@550"
+    delay: 50ms
+  - name: "@600"
+    delay: 50ms
+  - name: "@650"
+    delay: 50ms
+  - name: "@700"
+    delay: 50ms
+  - name: "@750"
+    delay: 50ms
+  - name: "@800"
+    delay: 50ms
+  - name: "@850"
+    delay: 50ms
+  - name: "@900"
+    delay: 50ms
+  - name: "@950"
+    delay: 50ms
+  - name: "@1000"
+    delay: 50ms
+  - name: "@1050"
+    delay: 50ms
+  - name: "@1100"
+    delay: 50ms
+  - name: "@1150"
+    delay: 50ms
+  - name: "@1200"
+    delay: 50ms
+  - name: "@1250"
+    delay: 50ms
+  - name: "@1300"
+    delay: 50ms
+  - name: "@1350"
+    delay: 50ms
+  - name: "@1400"
+    delay: 50ms
+  - name: "@1450"
+    delay: 50ms
+  - name: "@1500"
+    delay: 50ms
+  - name: "@1550"
+    delay: 50ms
+  - name: "@1600"
+    delay: 50ms
+  - name: "@1650"
+    delay: 50ms
+  - name: "@1700"
+    delay: 50ms
+  - name: "@1750"
+    delay: 50ms
+  - name: "@1800"
+    delay: 50ms
+  - name: "@1850"
+    delay: 50ms
+  - name: "@1900"
+    delay: 50ms
+  - name: "@1950"
+    delay: 50ms
+  - name: "@2000"
+    delay: 50ms
+  - name: "@2050"
+    delay: 50ms
+  - name: "@2100"
+    delay: 50ms
+  - name: "@2150"
+    delay: 50ms
+  - name: "@2200"
+    delay: 50ms
+  - name: "@2250"
+    delay: 50ms
+  - name: "@2300"
+    delay: 50ms
+  - name: "@2350"
+    delay: 50ms
+  - name: "@2400"
+    delay: 50ms
+  - name: "@2450"
+    delay: 50ms
+  - name: "@2500"
+    delay: 50ms
+  - name: "@2550"
+    delay: 50ms
+  - name: "@2600"
+    delay: 50ms
+  - name: "@2650"
+    delay: 50ms
+  - name: "@2700"
+    delay: 50ms
+  - name: "@2750"
+    delay: 50ms
+  - name: "@2800"
+    delay: 50ms
+  - name: "@2850"
+    delay: 50ms
+  - name: "@2900"
+    delay: 50ms
+  - name: "@2950"
+    delay: 50ms
+  - name: "@3000"
+    delay: 50ms
+  - name: "@3050"
+    delay: 50ms
+  - name: "@3100"
+    delay: 50ms
+  - name: "@3150"
+    delay: 50ms
+  - name: "@3200"
+    delay: 50ms
+  - name: "@3250"
+    delay: 50ms
+  - name: "@3300"
+    delay: 50ms
+  - name: "@3350"
+    delay: 50ms
+  - name: "@3400"
+    delay: 50ms
+  - name: "@3450"
+    delay: 50ms
+  - name: "@3500"
+    delay: 50ms
+  - name: "@3550"
+    delay: 50ms
+  - name: "@3600"
+    delay: 50ms
+  - name: "@3650"
+    delay: 50ms
+  - name: "@3700"
+    delay: 50ms
+  - name: "@3750"
+    delay: 50ms
+  - name: "@3800"
+    delay: 50ms
+  - name: "@3850"
+    delay: 50ms
+  - name: "@3900"
+    delay: 50ms
+  - name: "@3950"
+    delay: 50ms
+  - name: "@4000"
+    delay: 50ms
+  - name: "@4050"
+    delay: 50ms
+  - name: "@4100"
+    delay: 50ms
+  - name: "@4150"
+    delay: 50ms
+  - name: "@4200"
+    delay: 50ms
+  - name: "@4250"
+    delay: 50ms
+  - name: "@4300"
+    delay: 50ms
+  - name: "@4350"
+    delay: 50ms
+  - name: "@4400"
+    delay: 50ms
+  - name: "@4450"
+    delay: 50ms
+  - name: "@4500"
+    delay: 50ms
+  - name: "@4550"
+    delay: 50ms
+  - name: "@4600"
+    delay: 50ms
+  - name: "@4650"
+    delay: 50ms
+  - name: "@4700"
+    delay: 50ms
+  - name: "@4750"
+    delay: 50ms
+  - name: "@4800"
+    delay: 50ms
+  - name: "@4850"
+    delay: 50ms
+  - name: "@4900"
+    delay: 50ms
+  - name: "@4950"
+    delay: 50ms
+  - name: "@5000"
+    delay: 50ms
+  - name: "@5050"
+    delay: 50ms
+  - name: "@5100"
+    delay: 50ms
+  - name: "@5150"
+    delay: 50ms
+  - name: "@5200"
+    delay: 50ms
+  - name: "@5250"
+    delay: 50ms
+  - name: "@5300"
+    delay: 50ms
+  - name: "@5350"
+    delay: 50ms
+  - name: "@5400"
+    delay: 50ms
+  - name: "@5450"
+    delay: 1050ms

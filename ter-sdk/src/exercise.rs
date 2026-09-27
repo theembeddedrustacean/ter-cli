@@ -50,14 +50,24 @@ pub struct Exercise {
     pub pins: BTreeMap<String, String>,
 }
 
-/// The string-valued entries of a `pins:` map.
+/// The string-valued entries of a `pins:` map, sent as a map or, the way
+/// the site stores JSON fields, as a string holding one.
 pub fn pin_map<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, String>, D::Error> {
-    let raw: Option<BTreeMap<String, Value>> = Option::deserialize(d)?;
-    Ok(raw
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
-        .collect())
+    let raw = match Option::<Value>::deserialize(d)? {
+        Some(Value::String(text)) if text.trim().is_empty() => Value::Null,
+        Some(Value::String(text)) => {
+            serde_json::from_str(&text).map_err(serde::de::Error::custom)?
+        }
+        Some(v) => v,
+        None => Value::Null,
+    };
+    Ok(match raw {
+        Value::Object(map) => map
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+            .collect(),
+        _ => BTreeMap::new(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -99,5 +109,12 @@ mod tests {
         }))
         .unwrap();
         assert!(none.pins.is_empty());
+        let text: Exercise = serde_json::from_value(serde_json::json!({
+            "exercise_id": "a--t", "target": "t", "files": [],
+            "pins": "{\"user_button\": \"GPIO5\", \"user_led\": \"GPIO3\"}"
+        }))
+        .unwrap();
+        assert_eq!(text.pins.len(), 2, "a JSON string, as the site stores it");
+        assert_eq!(text.pins["user_button"], "GPIO5");
     }
 }

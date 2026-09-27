@@ -1,0 +1,144 @@
+{
+  "_comment": "µFerris baseboard on the XIAO ESP32-C3. Wired as the µFerris baseboard: LED D1/GPIO3, button D3/GPIO5, buzzer D2/GPIO4, light sensor D0/GPIO2, I2C D4/D5 (GPIO6/GPIO7).",
+  "author": "The Embedded Rustacean",
+  "connections": [
+    [
+      "xiao:D1",
+      "r1:1",
+      "green",
+      [
+        "h20"
+      ]
+    ],
+    [
+      "r1:2",
+      "led1:A",
+      "green",
+      []
+    ],
+    [
+      "led1:C",
+      "xiao:GND",
+      "black",
+      []
+    ],
+    [
+      "btn1:1.l",
+      "xiao:D3",
+      "orange",
+      []
+    ],
+    [
+      "btn1:2.l",
+      "xiao:GND",
+      "black",
+      []
+    ],
+    [
+      "bz1:2",
+      "xiao:D2",
+      "magenta",
+      []
+    ],
+    [
+      "bz1:1",
+      "xiao:GND",
+      "black",
+      []
+    ],
+    [
+      "ldr1:VCC",
+      "xiao:3V3",
+      "red",
+      []
+    ],
+    [
+      "ldr1:GND",
+      "xiao:GND",
+      "black",
+      []
+    ],
+    [
+      "ldr1:AO",
+      "xiao:D0",
+      "blue",
+      []
+    ],
+    [
+      "xiao:D1",
+      "ter_logic:D0",
+      "violet",
+      []
+    ],
+    [
+      "xiao:GND",
+      "ter_logic:GND",
+      "black",
+      []
+    ]
+  ],
+  "dependencies": {},
+  "editor": "wokwi",
+  "parts": [
+    {
+      "attrs": {},
+      "id": "xiao",
+      "left": 0,
+      "top": 60,
+      "type": "board-xiao-esp32-c3"
+    },
+    {
+      "attrs": {
+        "color": "red"
+      },
+      "id": "led1",
+      "left": 140,
+      "top": -30,
+      "type": "wokwi-led"
+    },
+    {
+      "attrs": {
+        "value": "220"
+      },
+      "id": "r1",
+      "left": 150,
+      "rotate": 90,
+      "top": 30,
+      "type": "wokwi-resistor"
+    },
+    {
+      "attrs": {
+        "bounce": "0",
+        "color": "green"
+      },
+      "id": "btn1",
+      "left": 150,
+      "top": 120,
+      "type": "wokwi-pushbutton"
+    },
+    {
+      "attrs": {
+        "volume": "0.1"
+      },
+      "id": "bz1",
+      "left": 260,
+      "top": -30,
+      "type": "wokwi-buzzer"
+    },
+    {
+      "attrs": {},
+      "id": "ldr1",
+      "left": 260,
+      "top": 150,
+      "type": "wokwi-photoresistor-sensor"
+    },
+    {
+      "attrs": {},
+      "id": "ter_logic",
+      "left": 0,
+      "top": -150,
+      "type": "wokwi-logic-analyzer"
+    }
+  ],
+  "version": 1
+}

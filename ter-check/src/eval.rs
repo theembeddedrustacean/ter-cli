@@ -324,6 +324,8 @@ impl Serial {
         };
         for e in &rec.events {
             if let EventKind::Serial { text, span_us } = &e.kind {
+                // Judged as a terminal shows it: colour codes are not text.
+                let text = ter_telemetry::strip_ansi(text);
                 s.bytes.extend_from_slice(text.as_bytes());
                 s.times
                     .extend(std::iter::repeat_n((e.t_us, e.t_us + span_us), text.len()));
@@ -710,6 +712,14 @@ mod tests {
         let between =
             check("  - id: a\n    serial_contains: \"ng: 6\"\n    between_ms: [3000, 3200]\n");
         assert_eq!(one(&between, &r).status, Pass);
+        let coloured = serial_rec(&[(400, "\u{1b}[32mINFO - Hello world!\u{1b}[0m\n", 50)]);
+        let line =
+            check("  - id: a\n    serial_contains: \"Hello world!\\n\"\n    within_ms: 500\n");
+        assert_eq!(
+            one(&line, &coloured).status,
+            Pass,
+            "colour codes are not text"
+        );
         let never = check("  - id: a\n    serial_contains: \"panic\"\n    within_ms: 5000\n");
         assert_eq!(one(&never, &r).observed, "not printed");
         assert_eq!(one(&never, &serial_rec(&[])).observed, "nothing on serial");

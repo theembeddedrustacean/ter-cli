@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use ter_telemetry::strip_ansi;
+
 use crate::output::CliError;
 
 /// One `cargo build` of an exercise.
@@ -102,56 +104,9 @@ fn find_executable(stdout: impl BufRead) -> Option<PathBuf> {
     found
 }
 
-/// `text` without terminal escape sequences (colour, hyperlinks).
-pub fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            // CSI: parameters, then one final byte in @..~.
-            Some('[') => {
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            // OSC: up to BEL or ESC \.
-            Some(']') => {
-                while let Some(c) = chars.next() {
-                    if c == '\u{7}' {
-                        break;
-                    }
-                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn colour_and_links_are_stripped() {
-        let coloured = "\u{1b}[0m\u{1b}[1m\u{1b}[38;5;9merror[E0425]\u{1b}[0m: cannot find value";
-        assert_eq!(strip_ansi(coloured), "error[E0425]: cannot find value");
-        let link = "see \u{1b}]8;;https://doc.rust-lang.org\u{1b}\\docs\u{1b}]8;;\u{1b}\\ now";
-        assert_eq!(strip_ansi(link), "see docs now");
-        let bel = "\u{1b}]8;;x\u{7}a\u{1b}]8;;\u{7}";
-        assert_eq!(strip_ansi(bel), "a");
-        assert_eq!(strip_ansi("plain\n"), "plain\n");
-    }
 
     #[test]
     fn the_first_binary_is_the_program() {

@@ -1,0 +1,304 @@
+
+[ter-clock] Executing step: @0
+[ter-clock] delay 50ms
+ESP-ROM:esp32c3-api1-20210207
+Build:Feb  7 2021
+rst:0x1 (POWERON),boot:0xc (SPI_FAST_FLASH_BOOT)
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fcd6100,len:0x420
+load:0x403ce000,len:0x90c
+load:0x403d0000,len:0x2370
+entry 0x403ce000
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @50
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @100
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @150
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @200
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @250
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @300
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @350
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @400
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @450
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @500
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @550
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @600
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @650
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @700
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @750
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @800
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @850
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @900
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @950
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1000
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @1050
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1100
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1150
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1200
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1250
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1300
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1350
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1400
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1450
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1500
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @1550
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1600
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1650
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1700
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1750
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1800
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1850
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1900
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @1950
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2000
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @2050
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2100
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2150
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2200
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2250
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2300
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2350
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2400
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2450
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2500
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @2550
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2600
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2650
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2700
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2750
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2800
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2850
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2900
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @2950
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3000
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @3050
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3100
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3150
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3200
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3250
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3300
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3350
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3400
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3450
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3500
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @3550
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3600
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3650
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3700
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3750
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3800
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3850
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3900
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @3950
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4000
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @4050
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4100
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4150
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4200
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4250
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4300
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4350
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4400
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4450
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4500
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @4550
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4600
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4650
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4700
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4750
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4800
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4850
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4900
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @4950
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5000
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @5050
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5100
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5150
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5200
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5250
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5300
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5350
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5400
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5450
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5500
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @5550
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5600
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5650
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5700
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5750
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5800
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5850
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5900
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @5950
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6000
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @6050
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6100
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6150
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6200
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6250
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6300
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6350
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6400
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6450
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6500
+[ter-clock] delay 50ms
+[32mINFO - Hello world![0m
+[ter-clock] Executing step: @6550
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6600
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6650
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6700
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6750
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6800
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6850
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6900
+[ter-clock] delay 50ms
+[ter-clock] Executing step: @6950
+[ter-clock] delay 1050ms

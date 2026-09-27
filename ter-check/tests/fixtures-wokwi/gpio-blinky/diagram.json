@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "author": "The Embedded Rustacean",
+  "editor": "wokwi",
+  "_comment": "µFerris baseboard on the XIAO ESP32-C3. Wired as the µFerris baseboard: LED D1/GPIO3, button D3/GPIO5, buzzer D2/GPIO4, light sensor D0/GPIO2, I2C D4/D5 (GPIO6/GPIO7).",
+  "parts": [
+    {
+      "type": "board-xiao-esp32-c3",
+      "id": "xiao",
+      "top": 60,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led1",
+      "top": -30,
+      "left": 140,
+      "attrs": {
+        "color": "red"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 30,
+      "left": 150,
+      "attrs": {
+        "value": "220"
+      },
+      "rotate": 90
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn1",
+      "top": 120,
+      "left": 150,
+      "attrs": {
+        "color": "green",
+        "bounce": "0"
+      }
+    },
+    {
+      "type": "wokwi-buzzer",
+      "id": "bz1",
+      "top": -30,
+      "left": 260,
+      "attrs": {
+        "volume": "0.1"
+      }
+    },
+    {
+      "type": "wokwi-photoresistor-sensor",
+      "id": "ldr1",
+      "top": 150,
+      "left": 260,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [
+      "xiao:D1",
+      "r1:1",
+      "green",
+      [
+        "h20"
+      ]
+    ],
+    [
+      "r1:2",
+      "led1:A",
+      "green",
+      []
+    ],
+    [
+      "led1:C",
+      "xiao:GND",
+      "black",
+      []
+    ],
+    [
+      "btn1:1.l",
+      "xiao:D3",
+      "orange",
+      []
+    ],
+    [
+      "btn1:2.l",
+      "xiao:GND",
+      "black",
+      []
+    ],
+    [
+      "bz1:2",
+      "xiao:D2",
+      "magenta",
+      []
+    ],
+    [
+      "bz1:1",
+      "xiao:GND",
+      "black",
+      []
+    ],
+    [
+      "ldr1:VCC",
+      "xiao:3V3",
+      "red",
+      []
+    ],
+    [
+      "ldr1:GND",
+      "xiao:GND",
+      "black",
+      []
+    ],
+    [
+      "ldr1:AO",
+      "xiao:D0",
+      "blue",
+      []
+    ]
+  ],
+  "dependencies": {}
+}

@@ -45,7 +45,9 @@ pub const RUN_DIAGRAM: &str = "diagram.json";
 pub const SCENARIO_FILE: &str = "scenario.yaml";
 pub const VCD_FILE: &str = "wokwi.vcd";
 pub const SERIAL_LOG: &str = "serial.log";
+/// What `wokwi-cli` printed: stdout (serial and step markers), stderr.
 pub const OUTPUT_LOG: &str = "wokwi.log";
+pub const ERROR_LOG: &str = "wokwi.err";
 pub const FIRMWARE: &str = "firmware.elf";
 
 /// A Wokwi board part: which of its pins is which GPIO, and its ground.
@@ -412,33 +414,31 @@ pub fn serial_events(stdout: &[u8], serial_log: &[u8], end_ms: u64) -> Vec<Event
     }
     segments.push((now_ms, &stdout[seg_start..]));
 
-    // Merge segments of the same step, then close each at the next step.
+    // Match each segment against the log, which holds the program's bytes
+    // exactly: a segment may end in a line break wokwi-cli added before
+    // its marker. Then join the segments of one step.
+    let mut pos = 0;
     let mut steps: Vec<(u64, Vec<u8>)> = Vec::new();
     for (t, bytes) in segments {
+        let rest = &serial_log[pos.min(serial_log.len())..];
+        let text: &[u8] = match bytes.strip_suffix(b"\n") {
+            _ if rest.starts_with(bytes) => bytes,
+            Some(trimmed) if rest.starts_with(trimmed) => trimmed,
+            // Not what the log says; keep the bytes as printed.
+            _ => bytes,
+        };
+        if rest.starts_with(text) {
+            pos += text.len();
+        }
         match steps.last_mut() {
-            Some((last, buf)) if *last == t => buf.extend_from_slice(bytes),
-            _ => steps.push((t, bytes.to_vec())),
+            Some((last, buf)) if *last == t => buf.extend_from_slice(text),
+            _ => steps.push((t, text.to_vec())),
         }
     }
 
-    let mut pos = 0;
+    // Each step's bytes were sent between its start and the next step's.
     let mut events = Vec::new();
-    for (k, (t, bytes)) in steps.iter().enumerate() {
-        let rest = &serial_log[pos.min(serial_log.len())..];
-        let take = if rest.starts_with(bytes) {
-            bytes.len()
-        } else if bytes.ends_with(b"\n") && rest.starts_with(&bytes[..bytes.len() - 1]) {
-            bytes.len() - 1
-        } else {
-            // Not what the log says; keep the bytes as printed.
-            bytes.len()
-        };
-        let text = if rest.len() >= take && rest.starts_with(&bytes[..take]) {
-            &rest[..take]
-        } else {
-            &bytes[..take]
-        };
-        pos += take;
+    for (k, (t, text)) in steps.iter().enumerate() {
         if text.is_empty() {
             continue;
         }
@@ -501,8 +501,8 @@ impl Wokwi {
     pub const PROVIDES: [Kind; 4] = [Kind::Serial, Kind::Pins, Kind::Reset, Kind::Stimulus];
 
     fn failure(&self, message: String) -> VenueError {
-        let output = std::fs::read_to_string(self.run_dir.join(OUTPUT_LOG)).unwrap_or_default();
-        VenueError::unavailable(message, output)
+        let read = |f| std::fs::read_to_string(self.run_dir.join(f)).unwrap_or_default();
+        VenueError::unavailable(message, format!("{}{}", read(ERROR_LOG), read(OUTPUT_LOG)))
     }
 }
 
@@ -562,9 +562,11 @@ impl Venue for Wokwi {
         .map_err(|e| {
             VenueError::unavailable(format!("Could not run {}: {e}", self.cli.display()), "")
         })?;
-        let mut log = output.stdout.clone();
-        log.extend_from_slice(&output.stderr);
-        let _ = std::fs::write(dir.join(OUTPUT_LOG), &log);
+        let _ = std::fs::write(dir.join(OUTPUT_LOG), &output.stdout);
+        let _ = std::fs::write(dir.join(ERROR_LOG), &output.stderr);
+        // The program is in the build cache and its hash in the capture; a
+        // copy per run would only fill the disk.
+        let _ = std::fs::remove_file(dir.join(FIRMWARE));
 
         match output.status {
             Ended::Exited(0 | TIMEOUT_EXIT) => {}

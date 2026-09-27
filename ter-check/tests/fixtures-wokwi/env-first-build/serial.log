@@ -1,0 +1,23 @@
+ESP-ROM:esp32c3-api1-20210207
+Build:Feb  7 2021
+rst:0x1 (POWERON),boot:0xc (SPI_FAST_FLASH_BOOT)
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fcd6100,len:0x420
+load:0x403ce000,len:0x90c
+load:0x403d0000,len:0x2370
+entry 0x403ce000
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m
+[32mINFO - Hello world![0m

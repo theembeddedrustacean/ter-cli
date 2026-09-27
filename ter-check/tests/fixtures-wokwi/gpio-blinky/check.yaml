@@ -1,0 +1,16 @@
+# Checks the heartbeat on the user LED: four toggles per 1 s cycle (the lesson's
+# even blink gives two), and each flash 100 ms wide. The 700 ms pause is what is
+# left of the cycle once the rate and the flash width hold.
+# Nothing is unobservable: no input, one LED, no serial output.
+timeout_ms: 5500
+assert:
+  - id: heartbeat-rate
+    pin: user_led
+    # Windows start at 900 ms, inside the pause, so no flash is cut by a window edge.
+    toggles_per_s: { min: 3.6, max: 4.4 }
+    window_ms: [900, 4900]
+  - id: flash-width
+    pin: user_led
+    # The high pulses, the two flashes of each beat.
+    pulse_width_ms: { min: 80, max: 120 }
+    window_ms: [900, 4900]
