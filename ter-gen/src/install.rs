@@ -20,6 +20,8 @@ pub enum Tool {
     Targets,
     Espflash,
     ProbeRs,
+    /// The project generator `ter new` runs.
+    XiaoGenerate,
 }
 
 /// A cargo-installed tool: its program, its crate and the oldest major
@@ -41,6 +43,12 @@ const ESPFLASH: CargoTool = CargoTool {
 const PROBE_RS: CargoTool = CargoTool {
     program: "probe-rs",
     krate: "probe-rs-tools",
+    min_major: 0,
+};
+
+const XIAO_GENERATE: CargoTool = CargoTool {
+    program: "xiao-generate",
+    krate: "xiao-generate",
     min_major: 0,
 };
 
@@ -227,6 +235,7 @@ pub fn plan(probe: &impl Probe, tool: Tool, project: Option<&ProjectTarget>) -> 
     match tool {
         Tool::Espflash => vec![cargo_tool(probe, &ESPFLASH)],
         Tool::ProbeRs => vec![cargo_tool(probe, &PROBE_RS)],
+        Tool::XiaoGenerate => vec![cargo_tool(probe, &XIAO_GENERATE)],
         Tool::Targets => project.map(|p| targets(probe, p)).unwrap_or_default(),
     }
 }
@@ -508,6 +517,10 @@ mod tests {
         assert_eq!(
             commands(&plan(&none, Tool::ProbeRs, None)),
             ["cargo install probe-rs-tools --locked"]
+        );
+        assert_eq!(
+            commands(&plan(&none, Tool::XiaoGenerate, None)),
+            ["cargo install xiao-generate --locked"]
         );
 
         let there = Fake::default()

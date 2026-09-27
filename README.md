@@ -37,12 +37,21 @@ ter run --no-check    build the exercise and record the attempt on the site
 ter venues            where this machine can run exercises, and what each sees
 ter serve             let the lesson page's Run button build and run here
 ter telemetry check   judge a recorded run against a check.yaml, offline
-ter install <tool>... install what the exercises need: targets, espflash,
-                      probe-rs, wokwi-cli (with your Wokwi token)
+ter new               a new project for a board (--board B --name N)
+ter install <tool>... install what the exercises need: targets, xiao-generate,
+                      espflash, probe-rs, wokwi-cli (with your Wokwi token)
 ter status            your exercises and their last runs (--disk: disk use)
 ter hint              the next hint for the last run
 ter self-update       how to update ter
 ```
+
+`ter new --board xiao-esp32c3 --name blinky` generates a project with
+[xiao-generate](https://crates.io/crates/xiao-generate), which it runs
+for you (`ter install xiao-generate` installs it), so it supports the
+boards xiao-generate does: `ter new --list-boards`, `--list-hals --board
+B`, `--list-templates --board B`. `--hal` picks the HAL, `--async` the
+embassy framework, and `--template`, `--logging`, `--flashing` and `--out`
+are passed on; anything after `--` goes to xiao-generate as is.
 
 `ter install` leaves what is already installed alone, so it is safe to
 run again. `targets` reads the project in the current folder (or
@@ -193,7 +202,7 @@ The workspace is split by what each crate may reach:
 | `ter-check` | `check.yaml` evaluator | never |
 | `ter-telemetry` | venues, instruments, event stream | never |
 | `ter-flash` | flashing and reset | never |
-| `ter-gen` | board catalog, templates, installer | |
+| `ter-gen` | `ter new`'s mapping onto xiao-generate, installer | |
 
 `ter-check`, `ter-telemetry` and `ter-flash` must not depend on anything
 that reaches the network; `scripts/check-deps.sh` enforces it.
@@ -205,6 +214,9 @@ scripts/check.sh --live          plus tests against the live site (needs TER_TOK
                                  solution build checks; WOKWI_CLI_TOKEN with
                                  TER_CURRICULUM adds the Wokwi runs)
 scripts/check.sh --install-hook  pre-commit hook running the fast part
+scripts/new-matrix.sh            build a `ter new` project for every board
+                                 (slow; --all-hals, --include-std,
+                                 --include-xtensa widen it)
 ```
 
 ## Licence

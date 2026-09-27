@@ -1,9 +1,10 @@
 //! `ter install`: the tools ter and the exercises use.
 //!
 //! `targets` (the Rust target, toolchain and components of the project in
-//! the current folder), `espflash` and `probe-rs` are installed with rustup
-//! and cargo; `wokwi-cli` is Wokwi's command line simulator, downloaded,
-//! with the learner's own Wokwi token.
+//! the current folder), `xiao-generate` (which `ter new` runs), `espflash`
+//! and `probe-rs` are installed with rustup and cargo; `wokwi-cli` is
+//! Wokwi's command line simulator, downloaded, with the learner's own Wokwi
+//! token.
 //!
 //! TER holds no Wokwi account for anyone: each learner creates a CI token
 //! on their own Wokwi account, and ter keeps it like the TER token (the
@@ -22,8 +23,9 @@ use crate::sim::{self, TOKEN_ENV, TOKEN_PAGE, WOKWI_CLI};
 use crate::token_store::TokenStore;
 
 /// What `ter install` takes, in the order it installs them.
-pub const TOOLS: [&str; 6] = [
+pub const TOOLS: [&str; 7] = [
     "targets",
+    "xiao-generate",
     "espflash",
     "probe-rs",
     "wokwi-cli",
@@ -92,6 +94,7 @@ pub async fn run(
             "targets" => Tool::Targets,
             "espflash" => Tool::Espflash,
             "probe-rs" => Tool::ProbeRs,
+            "xiao-generate" => Tool::XiaoGenerate,
             _ => {
                 reports.push(Report::Wokwi(wokwi(token_stdin, json).await?));
                 continue;
