@@ -304,6 +304,12 @@ impl Scaffold {
     /// exist yet (or be an empty folder). All or nothing: it is written
     /// next to `dest` and moved into place at the end.
     pub fn write(&self, dest: &Path, course: &str, modes: Vec<String>) -> Result<Fetched> {
+        if modes.is_empty() {
+            return Err(ProjectError::authoring(
+                &self.exercise_id,
+                "it allows neither hardware nor simulation",
+            ));
+        }
         if let Ok(ter) = TerToml::load(dest) {
             return Err(ProjectError::new(
                 "already_fetched",
@@ -354,11 +360,6 @@ impl Scaffold {
             }
             std::fs::write(&path, bytes).map_err(|e| ProjectError::io("write", &path, e))?;
         }
-        let modes = if modes.is_empty() {
-            crate::exercise::default_modes()
-        } else {
-            modes
-        };
         let ter = TerToml {
             exercise: self.exercise_id.clone(),
             course: course.to_string(),
@@ -560,7 +561,7 @@ fn top_level(rel: &Path) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exercise::ExerciseFile;
+    use crate::exercise::{ExerciseFile, default_modes};
 
     const CONFIG: &str = "[target.riscv32imc-unknown-none-elf]\nrunner = \"espflash flash --monitor --chip esp32c3\"\n";
 
@@ -601,7 +602,7 @@ mod tests {
         let dest = layout.exercise_dir("esp-gpio", &ex.exercise_id);
         Scaffold::check(ex)
             .unwrap()
-            .write(&dest, "esp-gpio", vec![])
+            .write(&dest, "esp-gpio", default_modes())
             .unwrap()
     }
 
@@ -641,6 +642,18 @@ mod tests {
             .unwrap();
         assert_eq!(f.ter.modes, ["simulation"]);
         assert_eq!(f.ter.mode, "simulation");
+    }
+
+    #[test]
+    fn an_exercise_that_allows_no_mode_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("ex");
+        let err = Scaffold::check(&scaffold())
+            .unwrap()
+            .write(&dest, "c", vec![])
+            .unwrap_err();
+        assert_eq!(err.code, "bad_scaffold");
+        assert!(!dest.exists());
     }
 
     #[test]
@@ -805,7 +818,9 @@ mod tests {
         let f = fetch(&layout, &scaffold());
         let s = Scaffold::check(&scaffold()).unwrap();
         assert_eq!(
-            s.write(&f.dir, "esp-gpio", vec![]).unwrap_err().code,
+            s.write(&f.dir, "esp-gpio", default_modes())
+                .unwrap_err()
+                .code,
             "already_fetched"
         );
 
@@ -813,7 +828,7 @@ mod tests {
         std::fs::create_dir(&other).unwrap();
         std::fs::write(other.join("notes.txt"), "keep me").unwrap();
         assert_eq!(
-            s.write(&other, "c", vec![]).unwrap_err().code,
+            s.write(&other, "c", default_modes()).unwrap_err().code,
             "dir_not_empty"
         );
         assert_eq!(
@@ -823,7 +838,7 @@ mod tests {
 
         let empty = root.path().join("empty");
         std::fs::create_dir(&empty).unwrap();
-        s.write(&empty, "c", vec![]).unwrap();
+        s.write(&empty, "c", default_modes()).unwrap();
         assert!(empty.join(TER_TOML).is_file());
     }
 

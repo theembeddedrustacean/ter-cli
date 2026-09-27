@@ -231,7 +231,8 @@ fn live_fetch_refusals_come_from_the_site() {
 }
 
 /// Fetches Heartbeat for the XIAO ESP32-C3 and builds it the way `ter`
-/// does, into the course's shared target dir. Needs the toolchain the
+/// does, into the course's shared target dir, against the lock file the
+/// scaffold ships. Needs the toolchain the
 /// scaffold's rust-toolchain.toml names (rustup installs it on first use).
 ///
 /// The scaffold is the learner's starting point, with gaps (`todo!()`) the
@@ -260,11 +261,20 @@ fn live_fetched_c3_scaffold_has_its_runner_and_builds() {
         "{config}"
     );
 
+    assert!(
+        dir.join("Cargo.lock").is_file(),
+        "the scaffold ships its lock"
+    );
+
     let layout = ter_sdk::project::Layout::new(courses.path());
     let ter = ter_sdk::project::TerToml::load(&dir).unwrap();
+    // The site's own modes, not the fallback for a site that sends none.
+    assert_eq!(v["modes"], serde_json::json!(ter.modes));
+    assert_eq!(ter.modes, ["hardware", "simulation"]);
+    assert_eq!(ter.mode, "hardware");
     let cargo_build = || {
         Command::new("cargo")
-            .args(["build", "--message-format=short"])
+            .args(["build", "--locked", "--message-format=short"])
             .current_dir(&dir)
             .envs(layout.cargo_env(&ter, &dir))
             .env_remove("RUSTUP_TOOLCHAIN")
@@ -362,6 +372,17 @@ fn live_dev_fetch_matches_the_site() {
     let (ok, dev, _b) = ter_ex("unused", &["ex", "fetch", LIVE_OPEN, "--dev", &curriculum]);
     assert!(ok, "{dev}");
     assert_eq!(dev["course"], site["course"]);
+    assert_eq!(dev["modes"], site["modes"]);
+    // The lock is left out of the source hash, so compare it byte for byte.
+    let lock = |v: &Value| {
+        std::fs::read(std::path::Path::new(v["path"].as_str().unwrap()).join("Cargo.lock"))
+            .expect("a Cargo.lock")
+    };
+    assert_eq!(
+        lock(&dev),
+        lock(&site),
+        "the checkout's lock differs from the site's"
+    );
     let hash = |v: &Value| {
         ter_sdk::project::TerToml::load(std::path::Path::new(v["path"].as_str().unwrap()))
             .unwrap()

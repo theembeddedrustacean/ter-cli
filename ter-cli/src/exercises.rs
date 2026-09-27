@@ -212,8 +212,8 @@ async fn fetch_from_site(
         .course_of(&exercise.exercise_id)
         .map(|c| c.course_id.clone())
         .unwrap_or_else(|| UNLISTED_COURSE.into());
-    // Until the site says which modes an exercise allows, allow both and
-    // let the site's `mode_not_allowed` on `run` be the check.
+    // A site that does not say which modes an exercise allows: allow both
+    // and let the site's `mode_not_allowed` on `run` be the check.
     let modes = exercise.modes.clone().unwrap_or_else(default_modes);
     Ok((exercise, course, modes))
 }
