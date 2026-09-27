@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "ter-cli",
+    "ter-sdk",
+    "ter-telemetry",
+    "ter-check",
+    "ter-flash",
+    "ter-gen",
+    "ter-remote",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+authors = ["The Embedded Rustacean"]
+
+[workspace.dependencies]
+ter-sdk = { path = "ter-sdk" }
+ter-check = { path = "ter-check" }
+clap = { version = "4.6", features = ["derive"] }
+directories = "6"
+reqwest = { version = "0.13", features = ["json", "query"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+toml = "1"
+wiremock = "0.6"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
