@@ -469,12 +469,11 @@ fn live_failed_build_is_posted_and_attempts_count() {
     assert!(ok, "{v}");
     let dir = std::path::PathBuf::from(v["path"].as_str().unwrap());
 
-    let first = {
-        let _turn = take_turn();
-        let (ok, v) = m.json(&["run", "--no-check"], &dir);
-        assert!(!ok, "the stub does not build: {v}");
-        v
-    };
+    // Other tests post runs of the same exercise, so hold the turn through
+    // both runs: the attempt between them must be this test's alone.
+    let turn = take_turn();
+    let (ok, first) = m.json(&["run", "--no-check"], &dir);
+    assert!(!ok, "the stub does not build: {first}");
     assert_eq!(first["error"]["code"], "build_failed", "{first}");
     assert_eq!(first["build_status"], "failed");
     assert_eq!(first["check_status"], "not_run");
@@ -496,10 +495,9 @@ fn live_failed_build_is_posted_and_attempts_count() {
     assert!(!hint["text"].as_str().unwrap().is_empty(), "{hint}");
     assert_eq!(hint["hints_used"], number);
 
-    let second = {
-        let _turn = take_turn();
-        m.json(&["run", "--no-check"], &dir).1
-    };
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let second = m.json(&["run", "--no-check"], &dir).1;
+    drop(turn);
     assert_eq!(second["build_status"], "failed", "{second}");
     assert_eq!(second["site"]["attempt"], attempt + 1, "{second}");
     assert_eq!(second["hints_used"], number, "{second}");
@@ -549,9 +547,10 @@ fn live_second_run_within_a_second_is_rate_limited() {
     assert_eq!(err.code(), "rate_limited", "{err}");
 }
 
-/// Needs a hardware-only exercise in the test account's course, named by
-/// `TER_LIVE_HW_ONLY`. None exists on the site yet (no exercise sets
-/// `modes:`), so this skips until one does.
+/// Needs a hardware-only exercise in a course the test account is enrolled
+/// in, named by `TER_LIVE_HW_ONLY`: on the live site,
+/// `sandbox-hw-only--xiao-esp32c3-nostd` (Sandbox · Embed Test). Skips
+/// when it is not set.
 #[test]
 #[ignore = "live site"]
 fn live_simulation_run_of_a_hardware_only_exercise_is_refused() {
