@@ -12,6 +12,10 @@ use crate::Error;
 /// means the same to the learner as `token_invalid`. That is how the site
 /// reports a token it cannot parse, and also a revoked or expired one, with
 /// the text (`Token revoked.`) in `_server_messages`.
+///
+/// A 429 is `rate_limited` whatever its body: the site's host puts its own
+/// HTML page in place of the site's envelope on every 429, so the learner
+/// sees one "try again" however the refusal arrived.
 pub fn parse_response(http_status: u16, body: &[u8]) -> Result<Value, Error> {
     let server = |exc_type: Option<String>| Error::Server {
         http_status,
@@ -21,6 +25,7 @@ pub fn parse_response(http_status: u16, body: &[u8]) -> Result<Value, Error> {
     let Ok(json) = serde_json::from_slice::<Value>(body) else {
         return Err(match http_status {
             401 => token_rejected(None),
+            429 => rate_limited(),
             _ => server(None),
         });
     };
@@ -50,15 +55,26 @@ pub fn parse_response(http_status: u16, body: &[u8]) -> Result<Value, Error> {
         .map(str::to_string);
     let success = (200..300).contains(&http_status);
     if !success || exc_type.is_some() || json.get("exc").is_some() {
-        if http_status == 401 {
-            return Err(token_rejected(server_message(&json)));
+        match http_status {
+            401 => return Err(token_rejected(server_message(&json))),
+            429 => return Err(rate_limited()),
+            _ => return Err(server(exc_type)),
         }
-        return Err(server(exc_type));
     }
 
     match json {
         Value::Object(mut map) => Ok(map.remove("message").unwrap_or(Value::Null)),
         _ => Err(server(None)),
+    }
+}
+
+fn rate_limited() -> Error {
+    Error::Site {
+        code: "rate_limited".into(),
+        message:
+            "The site is taking no more requests for now (HTTP 429). Wait a moment and try again."
+                .into(),
+        http_status: 429,
     }
 }
 
@@ -107,6 +123,24 @@ mod tests {
         ("rate_limited", 429),
         ("server_error", 500),
     ];
+
+    #[test]
+    fn a_429_from_the_host_is_rate_limited() {
+        // What the site's host sends in place of the site's own 429.
+        let page = b"<!doctype html><title>Daily Usage Limit Reached</title>";
+        match parse_response(429, page) {
+            Err(e @ Error::Site { .. }) => {
+                assert_eq!(e.code(), "rate_limited");
+                assert!(e.to_string().contains("try again"), "{e}");
+            }
+            other => panic!("expected rate_limited, got {other:?}"),
+        }
+        let frappe = json!({"exc_type": "TooManyRequestsError"}).to_string();
+        assert_eq!(
+            parse_response(429, frappe.as_bytes()).unwrap_err().code(),
+            "rate_limited"
+        );
+    }
 
     #[test]
     fn every_site_code_wrapped_in_message() {
