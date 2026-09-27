@@ -808,6 +808,8 @@ fn bench_ready() -> bool {
 /// fetched scaffold is the reference program.
 const LIVE_BANNER: &str = "env-first-build--xiao-esp32c3-nostd";
 const LIVE_HW_ONLY_PINS: &str = "sandbox-hw-only--xiao-esp32c3-nostd";
+/// One banner check, hardware and simulation (Neo, 2026-09-27).
+const LIVE_SERIAL_ONLY: &str = "sandbox-serial-only--xiao-esp32c3-nostd";
 
 fn fetched(m: &LiveMachine, id: &str) -> std::path::PathBuf {
     let (ok, v) = m.json(&["ex", "fetch", id], m.courses.path());
@@ -825,8 +827,8 @@ fn events(v: &Value) -> Vec<Value> {
 }
 
 /// A serial check passes on the board and in Wokwi with the same
-/// check.yaml. With `TER_LIVE_SERIAL_ONLY=<id>` it is that exercise's own;
-/// otherwise env-first-build's, cut to its banner check.
+/// check.yaml: sandbox-serial-only's banner, which a bare board sees in
+/// full.
 #[test]
 #[ignore = "live site and board"]
 fn bench_a_serial_check_passes_on_the_board_and_in_wokwi() {
@@ -834,23 +836,9 @@ fn bench_a_serial_check_passes_on_the_board_and_in_wokwi() {
         return;
     }
     let m = LiveMachine::new();
-    let dir = match std::env::var("TER_LIVE_SERIAL_ONLY") {
-        Ok(id) => fetched(&m, &id),
-        Err(_) => {
-            let dir = fetched(&m, LIVE_BANNER);
-            let check = std::fs::read_to_string(dir.join("check.yaml")).unwrap();
-            assert!(
-                check.contains("serial_contains: \"Hello world!\""),
-                "{check}"
-            );
-            std::fs::write(
-                dir.join("check.yaml"),
-                "timeout_ms: 3000\nassert:\n  - id: banner\n    serial_contains: \"Hello world!\"\n    within_ms: 2000\n",
-            )
-            .unwrap();
-            dir
-        }
-    };
+    let dir = fetched(&m, LIVE_SERIAL_ONLY);
+    let check = std::fs::read_to_string(dir.join("check.yaml")).unwrap();
+    assert!(!check.contains("pin:"), "serial checks only: {check}");
 
     let v = {
         let _turn = take_turn();
@@ -862,7 +850,11 @@ fn bench_a_serial_check_passes_on_the_board_and_in_wokwi() {
         (&"hardware".into(), &"local".into())
     );
     assert_eq!(v["check_status"], "passed", "{v}");
-    assert_eq!(v["checks_seen"], v["checks_total"], "{v}");
+    assert_eq!(
+        (&v["checks_seen"], &v["checks_total"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "a full pass on a bare board"
+    );
     let ev = events(&v);
     assert!(
         ev[0]["capture"]["provides"]
