@@ -88,6 +88,12 @@ impl Client {
         self.ping.get_or_try_init(|| self.get("ping", &[])).await
     }
 
+    /// The `ping` answer if this client has already fetched it; never
+    /// sends a request.
+    pub fn cached_ping(&self) -> Option<&Ping> {
+        self.ping.get()
+    }
+
     /// Fail with `outdated` when this CLI is below the site's minimum.
     pub async fn ensure_supported(&self) -> Result<(), Error> {
         let ping = self.ping().await?;

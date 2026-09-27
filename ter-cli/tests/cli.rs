@@ -29,11 +29,13 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 async fn mock_site(min_version: &str) -> MockServer {
-    mock_site_with(min_version, json!(true)).await
+    mock_site_with(min_version, VERSION, json!(true)).await
 }
 
-async fn mock_site_with(min_version: &str, premium: Value) -> MockServer {
+async fn mock_site_with(min_version: &str, latest_version: &str, premium: Value) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(format!("{API}.ping")))
@@ -43,10 +45,11 @@ async fn mock_site_with(min_version: &str, premium: Value) -> MockServer {
             "user": "learner@example.com",
             "server_time": "2026-09-27T12:00:00",
             "min_supported_version": min_version,
-            "latest_version": "9.9.9",
+            "latest_version": latest_version,
             "download_url": null,
             "premium": premium
         }})))
+        .expect(0..=1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -117,6 +120,7 @@ async fn whoami_below_minimum_warns_and_names_self_update() {
     assert!(o.status.success());
     assert!(stderr(&o).contains("ter self-update"), "{}", stderr(&o));
 
+    let site = mock_site("99.0.0").await;
     let o = ter(&site.uri(), Some("good-token"), &["whoami", "--json"]);
     let v: Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["supported"], false);
@@ -190,7 +194,7 @@ fn self_update_prints_a_reinstall_command() {
 
 #[tokio::test]
 async fn whoami_shows_when_the_account_is_not_premium() {
-    let site = mock_site_with("0.1.0", json!(false)).await;
+    let site = mock_site_with("0.1.0", VERSION, json!(false)).await;
     let o = ter(&site.uri(), Some("good-token"), &["whoami"]);
     assert!(o.status.success());
     assert!(stdout(&o).contains("premium  no"), "{}", stdout(&o));
@@ -198,9 +202,63 @@ async fn whoami_shows_when_the_account_is_not_premium() {
 
 #[tokio::test]
 async fn whoami_from_a_site_without_premium_says_unknown() {
-    let site = mock_site_with("0.1.0", Value::Null).await;
+    let site = mock_site_with("0.1.0", VERSION, Value::Null).await;
     let o = ter(&site.uri(), Some("good-token"), &["whoami", "--json"]);
     assert!(o.status.success());
     let v: Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["premium"], Value::Null);
+}
+
+#[tokio::test]
+async fn newer_latest_version_prints_one_notice_line() {
+    // The ping mock allows at most one request: the notice reuses it.
+    let site = mock_site_with("0.1.0", "99.1.2", json!(true)).await;
+    let o = ter(&site.uri(), Some("good-token"), &["whoami"]);
+    assert!(o.status.success());
+    assert_eq!(
+        stderr(&o),
+        "ter 99.1.2 is available, run ter self-update.\n"
+    );
+}
+
+#[tokio::test]
+async fn newer_version_notice_is_not_printed_with_json() {
+    let site = mock_site_with("0.1.0", "99.1.2", json!(true)).await;
+    let o = ter(&site.uri(), Some("good-token"), &["whoami", "--json"]);
+    assert!(o.status.success());
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+    let v: Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["latest_version"], "99.1.2");
+}
+
+#[tokio::test]
+async fn no_notice_when_latest_is_not_newer() {
+    for latest in [VERSION, "0.0.1", "not-a-version"] {
+        let site = mock_site_with("0.0.1", latest, json!(true)).await;
+        let o = ter(&site.uri(), Some("good-token"), &["whoami"]);
+        assert!(o.status.success());
+        assert!(stderr(&o).is_empty(), "latest {latest}: {}", stderr(&o));
+    }
+}
+
+#[tokio::test]
+async fn below_minimum_gets_the_outdated_warning_not_the_notice() {
+    let site = mock_site_with("99.0.0", "99.1.2", json!(true)).await;
+    let o = ter(&site.uri(), Some("good-token"), &["whoami"]);
+    let err = stderr(&o);
+    assert!(err.contains("ter self-update"), "{err}");
+    assert!(!err.contains("is available"), "{err}");
+    assert_eq!(err.lines().count(), 1, "{err}");
+}
+
+#[test]
+fn commands_without_ping_print_no_notice() {
+    let cargo_home = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .arg("self-update")
+        .env("CARGO_HOME", cargo_home.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
 }

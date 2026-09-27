@@ -21,9 +21,36 @@ pub fn check_supported(current: &str, minimum: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// `latest` when it is newer than `current`; `None` when it is not, or when
+/// either is not a version.
+pub fn newer_available(current: &str, latest: &str) -> Option<String> {
+    let cur = Version::parse(current).ok()?;
+    let new = Version::parse(latest.trim()).ok()?;
+    (new > cur).then(|| new.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newer_latest_is_offered() {
+        assert_eq!(newer_available("0.1.0", "0.1.1"), Some("0.1.1".into()));
+        assert_eq!(newer_available("0.1.9", "0.1.10"), Some("0.1.10".into()));
+        assert_eq!(newer_available("0.2.0-rc.1", "0.2.0"), Some("0.2.0".into()));
+    }
+
+    #[test]
+    fn same_or_older_latest_is_not_offered() {
+        assert_eq!(newer_available("0.1.0", "0.1.0"), None);
+        assert_eq!(newer_available("0.2.0", "0.1.10"), None);
+    }
+
+    #[test]
+    fn unparsable_latest_is_not_offered() {
+        assert_eq!(newer_available("0.1.0", ""), None);
+        assert_eq!(newer_available("0.1.0", "soon"), None);
+    }
 
     #[test]
     fn below_minimum_is_outdated() {

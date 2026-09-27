@@ -1,6 +1,7 @@
 //! The config, the device token and a site client, built once per command.
 
 use ter_sdk::Client;
+use ter_sdk::version::{check_supported, newer_available};
 
 use crate::config::Config;
 use crate::output::CliError;
@@ -23,5 +24,16 @@ impl Session {
             client,
             token_source,
         })
+    }
+
+    /// "ter X.Y.Z is available" when this command's `ping` said so. Nothing
+    /// when the command never pinged, and nothing when ter is below the
+    /// site's minimum: the `outdated` message already says to update.
+    pub fn newer_version_notice(&self) -> Option<String> {
+        let ping = self.client.cached_ping()?;
+        let current = self.client.cli_version();
+        check_supported(current, &ping.min_supported_version).ok()?;
+        let latest = newer_available(current, &ping.latest_version)?;
+        Some(format!("ter {latest} is available, run ter self-update."))
     }
 }
