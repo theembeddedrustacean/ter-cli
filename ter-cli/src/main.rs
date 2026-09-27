@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod bench;
 mod build;
 mod config;
 mod exercises;
@@ -13,10 +14,12 @@ mod login;
 mod new;
 mod output;
 mod record;
+mod remote;
 mod run;
 mod self_update;
 mod serve;
 mod session;
+mod share;
 mod sim;
 mod status;
 mod telemetry;
@@ -95,6 +98,38 @@ enum Command {
         /// config, 7357).
         #[arg(long)]
         port: Option<u16>,
+        /// Also share the board on this machine as a bench: register it on
+        /// TER Learn, share it under a code, and take runs from people who
+        /// connect with that code.
+        #[arg(long, requires = "board")]
+        share: bool,
+        /// The board you share, as a target id (`xiao-esp32c3`).
+        #[arg(long, requires = "share")]
+        board: Option<String>,
+        /// A name for the bench on the Devices page (default: the board).
+        #[arg(long, requires = "share")]
+        label: Option<String>,
+        /// Where others reach the bench: your tunnel's or LAN address
+        /// (default: the address it listens on).
+        #[arg(long, requires = "share")]
+        url: Option<String>,
+        /// The address the bench listens on (default 127.0.0.1, for a
+        /// tunnel; 0.0.0.0 for the LAN, with --url).
+        #[arg(long, requires = "share", default_value = "127.0.0.1")]
+        bind: std::net::IpAddr,
+        /// The bench's port (default: the page's port plus one).
+        #[arg(long, requires = "share")]
+        bench_port: Option<u16>,
+    },
+    /// Connect to a bench someone shares with you, by its code.
+    Connect {
+        /// The share code (`WXYZ-1234`).
+        code: String,
+    },
+    /// Benches: yours, and the ones you connected to.
+    Bench {
+        #[command(subcommand)]
+        command: BenchCommand,
     },
     /// Recorded runs: judge one against a check.yaml, offline.
     Telemetry {
@@ -169,6 +204,27 @@ enum Command {
     },
     /// Update ter to the latest version.
     SelfUpdate,
+}
+
+#[derive(Subcommand)]
+enum BenchCommand {
+    /// Your benches and the ones you connected to.
+    List,
+    /// Share one of your benches; prints the code to hand out.
+    Share {
+        /// Its name or label; the only one when you have one.
+        bench: Option<String>,
+    },
+    /// Stop sharing: the code stops working and everyone connected is
+    /// dropped.
+    Unshare { bench: Option<String> },
+    /// Delete one of your benches and every share of it.
+    Remove { bench: Option<String> },
+    /// End your session on a bench you connected to (the newest when not
+    /// named).
+    Disconnect { bench: Option<String> },
+    /// Take a bench you connected to off your list.
+    Forget { bench: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -272,7 +328,33 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
         Command::Status { disk: false } => status::status(json).await,
         Command::Hint { dir } => hint::hint(dir, json).await,
         Command::Venues => venues::run(json),
-        Command::Serve { port } => serve::serve(port, json).await,
+        Command::Serve {
+            port,
+            share,
+            board,
+            label,
+            url,
+            bind,
+            bench_port,
+        } => {
+            let share = share.then(|| serve::ShareFlags {
+                board: board.unwrap_or_default(),
+                label,
+                url,
+                bind,
+                bench_port,
+            });
+            serve::serve(port, share, json).await
+        }
+        Command::Connect { code } => bench::connect(&code, json).await,
+        Command::Bench { command } => match command {
+            BenchCommand::List => bench::list(json).await,
+            BenchCommand::Share { bench } => bench::share(bench, json).await,
+            BenchCommand::Unshare { bench } => bench::unshare(bench, json).await,
+            BenchCommand::Remove { bench } => bench::remove(bench, json).await,
+            BenchCommand::Disconnect { bench } => bench::disconnect(bench, false, json).await,
+            BenchCommand::Forget { bench } => bench::disconnect(bench, true, json).await,
+        },
         Command::Telemetry {
             command: TelemetryCommand::Check { recording, check },
         } => telemetry::check(recording, check, json),

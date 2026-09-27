@@ -201,11 +201,19 @@ impl Machine {
 
     /// `ter serve` on a free port, until the returned value is dropped.
     fn serve(&self, site: &str) -> Served {
+        self.serve_with(site, &[])
+    }
+
+    /// `ter serve --port 0 <extra>`, with its standard input kept open for
+    /// the kill switch and its banner read.
+    fn serve_with(&self, site: &str, extra: &[&str]) -> Served {
         use std::io::BufRead;
-        let mut cmd = self.command(site, &["serve", "--port", "0"], self.courses.path());
+        let mut args = vec!["serve", "--port", "0"];
+        args.extend_from_slice(extra);
+        let mut cmd = self.command(site, &args, self.courses.path());
         let mut child = {
             let _spawning = SPAWN.read().unwrap();
-            cmd.stdin(std::process::Stdio::null())
+            cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit())
                 .spawn()
@@ -219,9 +227,18 @@ impl Machine {
             .and_then(|l| l.split(',').next())
             .unwrap_or_else(|| panic!("{line}"))
             .to_string();
+        let mut banner = line.clone();
+        let lines = if extra.contains(&"--share") { 3 } else { 1 };
+        for _ in 0..lines {
+            let mut more = String::new();
+            stdout.read_line(&mut more).unwrap();
+            banner.push_str(&more);
+        }
         Served {
+            stdin: child.stdin.take(),
             child,
             url,
+            banner,
             _stdout: stdout,
         }
     }
@@ -340,6 +357,9 @@ impl Machine {
 struct Served {
     child: std::process::Child,
     url: String,
+    /// What it printed on start.
+    banner: String,
+    stdin: Option<std::process::ChildStdin>,
     /// Kept open for as long as the service runs.
     _stdout: std::io::BufReader<std::process::ChildStdout>,
 }
@@ -1264,5 +1284,317 @@ async fn serve_refuses_any_other_origin() {
     assert_eq!(
         std::fs::read_to_string(m.exercise().join("src/main.rs")).unwrap(),
         GOOD
+    );
+}
+
+/// A port nothing listens on yet.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+const BENCH: &str = "b-0001";
+const CODE: &str = "GZTS-2520";
+
+/// The site's bench registry, for a bench whose socket is on `bench_port`,
+/// heartbeating every `every` seconds.
+async fn bench_site(bench_port: u16, every: u64) -> MockServer {
+    let server = site("0.1.0", run_answer()).await;
+    let url = format!("http://127.0.0.1:{bench_port}");
+    Mock::given(method("POST"))
+        .and(path(format!("{API}.bench_register")))
+        .and(header("authorization", "Bearer good-token"))
+        .respond_with(ok(
+            json!({"ok": true, "bench": BENCH, "board": "xiao-esp32c3",
+            "label": "Desk", "heartbeat_every": every}),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{API}.bench_share")))
+        .respond_with(ok(json!({"ok": true, "bench": BENCH, "share_code": CODE})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{API}.bench_unshare")))
+        .respond_with(ok(json!({"ok": true, "bench": BENCH, "dropped": 1})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{API}.bench_heartbeat")))
+        .respond_with(ok(
+            json!({"ok": true, "bench": BENCH, "status": "available", "connected": 1}),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{API}.devices")))
+        .respond_with(ok(devices(true)))
+        .mount(&server)
+        .await;
+    let connected = json!({"ok": true, "bench": BENCH, "label": "Desk", "board": "xiao-esp32c3",
+        "owner_name": "Owner", "status": "available", "url": url});
+    for f in ["bench_connect", "bench_reconnect"] {
+        Mock::given(method("POST"))
+            .and(path(format!("{API}.{f}")))
+            .respond_with(ok(connected.clone()))
+            .mount(&server)
+            .await;
+    }
+    server
+}
+
+fn devices(sharing: bool) -> Value {
+    json!({"enabled": true, "heartbeat_ttl": 60, "using": [], "tokens": [], "mine": [{
+        "name": BENCH, "label": "Desk", "board": "xiao-esp32c3", "url": null,
+        "status": "available", "last_seen": null, "sharing": sharing,
+        "share_code": if sharing { json!(CODE) } else { json!(null) }, "connected": []
+    }]})
+}
+
+/// The owner's machine: a board on a pty, flashed by a fake espflash.
+#[cfg(unix)]
+fn owner_with_board(lines: &'static [&'static str]) -> (Machine, Board) {
+    let mut owner = Machine::with_exercise(GOOD, &["hardware"]).on_board(BANNER_AND_BLINK, 0, "");
+    let board = Board::start(flashed(&owner), lines, false);
+    owner.port = Some(board.port.clone());
+    (owner, board)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_on_a_shared_bench_is_flashed_there_and_posted_by_the_driver() {
+    let bench_port = free_port();
+    let server = bench_site(bench_port, 30).await;
+    let (owner, board) = owner_with_board(&["Hello world!\r\n"]);
+    let served = owner.serve_with(
+        &server.uri(),
+        &[
+            "--share",
+            "--board",
+            "xiao-esp32c3",
+            "--label",
+            "Desk",
+            "--bench-port",
+            &bench_port.to_string(),
+        ],
+    );
+    assert!(
+        served.banner.contains(&format!("is shared as {CODE}")),
+        "{}",
+        served.banner
+    );
+    let register = &posted(&server, "bench_register").await[0];
+    assert_eq!(register["board"], "xiao-esp32c3");
+    assert_eq!(register["label"], "Desk");
+    assert_eq!(register["url"], format!("http://127.0.0.1:{bench_port}"));
+    assert_eq!(posted(&server, "bench_share").await[0]["bench"], BENCH);
+
+    let driver = Machine::with_exercise(GOOD, &["hardware", "simulation"]).on_board(
+        BANNER_AND_BLINK,
+        0,
+        "/dev/ter-not-used",
+    );
+    let (ok, v) = driver.json_in(
+        &server.uri(),
+        &["connect", "gzts 2520"],
+        driver.courses.path(),
+    );
+    assert!(ok, "{v}");
+    assert_eq!(posted(&server, "bench_connect").await[0]["code"], CODE);
+
+    let (ok, v) = driver.json(&server.uri(), &["run", "--hw", "--venue", "bench"]);
+    board.thread.join().unwrap();
+    assert!(ok, "{v}");
+
+    let flashed_with = owner.espflash_saw();
+    assert!(
+        flashed_with.contains("--chip esp32c3")
+            && flashed_with.contains(&format!("--port {}", board.port)),
+        "the owner's espflash flashed the owner's board: {flashed_with}"
+    );
+    let run = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(run["mode"], "hardware");
+    assert_eq!(run["venue"], "bench");
+    assert_eq!(run["check_status"], "passed", "{run}");
+    assert_eq!(
+        (run["checks_seen"].as_u64(), run["checks_total"].as_u64()),
+        (Some(1), Some(2))
+    );
+    let rec = driver.exercise().join(".runs/1");
+    for f in [
+        "build.log",
+        "flash.log",
+        "serial.log",
+        "events.jsonl",
+        "check.toml",
+    ] {
+        assert!(rec.join(f).is_file(), "{f} is in the driver's recording");
+    }
+    let events = std::fs::read_to_string(rec.join("events.jsonl")).unwrap();
+    assert!(
+        events
+            .lines()
+            .next()
+            .unwrap()
+            .contains(r#""venue":"bench""#),
+        "{events}"
+    );
+    assert!(
+        !owner.exercise().join(".runs").exists(),
+        "nothing is recorded on the owner's side"
+    );
+    drop(served);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_kill_switch_stops_sharing_and_the_next_run_is_refused_before_building() {
+    use std::io::Write;
+    let bench_port = free_port();
+    let server = bench_site(bench_port, 30).await;
+    let (owner, _board) = owner_with_board(&[]);
+    let mut served = owner.serve_with(
+        &server.uri(),
+        &[
+            "--share",
+            "--board",
+            "xiao-esp32c3",
+            "--bench-port",
+            &bench_port.to_string(),
+        ],
+    );
+    let driver = Machine::with_exercise(GOOD, &["hardware"]).on_board(
+        BANNER_AND_BLINK,
+        0,
+        "/dev/ter-not-used",
+    );
+    let (ok, v) = driver.json_in(&server.uri(), &["connect", CODE], driver.courses.path());
+    assert!(ok, "{v}");
+
+    let stdin = served.stdin.as_mut().unwrap();
+    stdin.write_all(b"k\n").unwrap();
+    stdin.flush().unwrap();
+    let t = std::time::Instant::now();
+    while posted(&server, "bench_unshare").await.is_empty() {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(10),
+            "no unshare"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(posted(&server, "bench_unshare").await[0]["bench"], BENCH);
+
+    let (ok, v) = driver.json(&server.uri(), &["run", "--hw", "--venue", "bench"]);
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not sharing"),
+        "{v}"
+    );
+    assert!(posted(&server, "run").await.is_empty());
+    assert!(
+        !driver.exercise().join(".runs").exists(),
+        "stopped before the build"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sharing_turned_off_on_the_site_closes_the_bench_within_a_heartbeat() {
+    let bench_port = free_port();
+    let server = bench_site(bench_port, 1).await;
+    let (owner, _board) = owner_with_board(&[]);
+    let _served = owner.serve_with(
+        &server.uri(),
+        &[
+            "--share",
+            "--board",
+            "xiao-esp32c3",
+            "--bench-port",
+            &bench_port.to_string(),
+        ],
+    );
+    let driver = Machine::with_exercise(GOOD, &["hardware"]).on_board(
+        BANNER_AND_BLINK,
+        0,
+        "/dev/ter-not-used",
+    );
+    let (connected, v) = driver.json_in(&server.uri(), &["connect", CODE], driver.courses.path());
+    assert!(connected, "{v}");
+
+    // Unshared on the Devices page.
+    Mock::given(method("GET"))
+        .and(path(format!("{API}.devices")))
+        .respond_with(ok(devices(false)))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let heartbeats = posted(&server, "bench_heartbeat").await.len();
+    let t = std::time::Instant::now();
+    while posted(&server, "bench_heartbeat").await.len() < heartbeats + 2 {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(10),
+            "no heartbeat"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        posted(&server, "bench_heartbeat").await[0]["status"],
+        "available"
+    );
+
+    let (ok, v) = driver.json(&server.uri(), &["run", "--hw", "--venue", "bench"]);
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    assert!(posted(&server, "run").await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bench_that_does_not_answer_is_offline_and_nothing_is_posted() {
+    let bench_port = free_port();
+    let server = bench_site(bench_port, 30).await;
+    let driver = Machine::with_exercise(GOOD, &["hardware"]).on_board(
+        BANNER_AND_BLINK,
+        0,
+        "/dev/ter-not-used",
+    );
+    let (ok, v) = driver.json_in(&server.uri(), &["connect", CODE], driver.courses.path());
+    assert!(ok, "{v}");
+
+    let (ok, v) = driver.json(&server.uri(), &["run", "--hw", "--venue", "bench"]);
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "bench_offline", "{v}");
+    assert!(posted(&server, "run").await.is_empty());
+    assert!(!driver.exercise().join(".runs").exists());
+}
+
+#[tokio::test]
+async fn a_run_on_a_bench_needs_a_connection_first() {
+    let server = site("0.1.0", run_answer()).await;
+    let driver = Machine::with_exercise(GOOD, &["hardware"]);
+    std::fs::write(driver.exercise().join("check.yaml"), BANNER_AND_BLINK).unwrap();
+    std::fs::create_dir_all(driver.exercise().join(".cargo")).unwrap();
+    std::fs::write(
+        driver.exercise().join(".cargo/config.toml"),
+        "[target.riscv32imc-unknown-none-elf]\nrunner = \"espflash flash --monitor --chip esp32c3\"\n",
+    )
+    .unwrap();
+    let (ok, v) = driver.json(&server.uri(), &["run", "--hw", "--venue", "bench"]);
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ter connect"),
+        "{v}"
     );
 }

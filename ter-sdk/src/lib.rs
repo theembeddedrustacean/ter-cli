@@ -4,6 +4,7 @@
 //! header, the error envelope, the version gate. [`project`] is the
 //! learner's side: course folders, `ter.toml` and the scaffold on disk.
 
+pub mod bench;
 mod client;
 pub mod dev;
 mod envelope;

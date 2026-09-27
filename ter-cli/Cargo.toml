@@ -31,6 +31,7 @@ webbrowser.workspace = true
 keyring-core = "1"
 reqwest.workspace = true
 rpassword = "7"
+tempfile.workspace = true
 
 # The system keychain on each platform. Where none is reachable the token
 # goes to a mode 600 file instead.

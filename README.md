@@ -10,6 +10,7 @@ This is an early version: pairing (`ter login`, `ter logout`,
 `ter whoami`), exercises (`ter ex`), checked runs on your own board
 (`ter run --hw`) and in the Wokwi simulator (`ter run --sim`), build-only
 runs (`ter run --no-check`), `ter serve` for the lesson page's editor,
+shared benches (`ter serve --share`, `ter bench`, `ter connect`),
 `ter venues`, `ter status`, `ter hint`,
 `ter telemetry check` and `ter self-update` work today.
 
@@ -36,6 +37,11 @@ ter run --sim         build, run in Wokwi, check, and record the run on the site
 ter run --no-check    build the exercise and record the attempt on the site
 ter venues            where this machine can run exercises, and what each sees
 ter serve             let the lesson page's Run button build and run here
+ter serve --share     also share your board as a bench (--board B)
+ter bench list        your benches and the ones you connected to
+ter bench share       share a bench and print its code (unshare, remove too)
+ter connect <code>    use a bench someone shares with you
+ter run --hw --venue bench   run on the bench you connected to
 ter telemetry check   judge a recorded run against a check.yaml, offline
 ter new               a new project for a board (--board B --name N)
 ter install <tool>... install what the exercises need: targets, xiao-generate,
@@ -172,6 +178,37 @@ is signed in and it is not the account `ter` is paired with, the run is
 refused with `wrong_account`. Runs go one at a time; one that takes
 longer than the build allowance (10 minutes) plus the simulator's time
 answers `timeout`.
+
+### Shared benches
+
+`ter serve --share --board xiao-esp32c3` also shares the board plugged
+into this machine as a bench: `ter` registers it on TER Learn (it shows
+under Mine on the Devices page), turns sharing on and prints the code to
+hand out, and tells the site every 30 seconds that it is still there
+(stopped, it shows as offline a minute later). `--label` names it.
+
+Whoever has the code runs `ter connect WXYZ-1234`, then `ter run --hw
+--venue bench` in an exercise folder. Their `ter` builds the program,
+sends it to the bench, which flashes the board and captures its serial
+output, and judges the recording and posts the run under their own
+account: the bench's machine never builds anyone's code and never posts
+for them. The bench shows what a bare board shows, serial only, so pin
+checks are named as unseen, as on your own board.
+
+The bench takes runs on its own socket, not the lesson page's: by
+default `127.0.0.1` on the page's port plus one (`--bind`,
+`--bench-port`), for a tunnel you run yourself; give the address others
+reach it at with `--url` (for the LAN, `--bind 0.0.0.0 --url
+http://<your address>:7358`). Every request must carry the current
+share code, and web pages are refused. One person drives at a time, for
+at most 15 minutes in one go (2 minutes idle frees it); every run
+flashes and resets the board, so nothing carries over from the last
+driver. Type `k` and Enter in `ter serve` to drop whoever is driving and
+stop sharing; `ter bench unshare` or the Devices page do the same from
+elsewhere, and `ter serve` notices within a heartbeat.
+`ter bench disconnect` and `ter bench forget` end your own use of
+someone's bench. What `ter` needs to reach a bench again is in
+`benches.json` in the config directory (mode 600: it holds share codes).
 
 For curriculum authors, `ter ex fetch <id> --dev <checkout>` builds the
 exercise from a local curriculum checkout (with its

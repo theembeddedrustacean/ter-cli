@@ -24,6 +24,7 @@ use crate::exercises;
 use crate::output::CliError;
 use crate::run::{self, CHECK_YAML, RunArgs};
 use crate::session::Session;
+use crate::share;
 
 /// How long a build may take: the first build of a course compiles the HAL
 /// (and, for ESP-IDF, the IDF) from nothing.
@@ -207,7 +208,20 @@ fn limit(dir: &Path, mode: &str) -> Duration {
     BUILD_ALLOWANCE + run
 }
 
-pub async fn serve(port: Option<u16>, json: bool) -> Result<(), CliError> {
+/// `--share` and its settings, before the ports are settled.
+pub struct ShareFlags {
+    pub board: String,
+    pub label: Option<String>,
+    pub url: Option<String>,
+    pub bind: std::net::IpAddr,
+    pub bench_port: Option<u16>,
+}
+
+pub async fn serve(
+    port: Option<u16>,
+    share: Option<ShareFlags>,
+    json: bool,
+) -> Result<(), CliError> {
     let port = match port {
         Some(p) => p,
         None => Config::load()?.serve_port,
@@ -220,7 +234,7 @@ pub async fn serve(port: Option<u16>, json: bool) -> Result<(), CliError> {
                 format!("Could not listen on 127.0.0.1:{port}: {e}. Is another ter serve running?"),
             )
         })?;
-    let port = listener
+    let bound = listener
         .local_addr()
         .map_err(|e| CliError::new("io_error", e.to_string()))?
         .port();
@@ -231,13 +245,50 @@ pub async fn serve(port: Option<u16>, json: bool) -> Result<(), CliError> {
         },
         _ => "not paired: runs are refused until `ter login`".into(),
     };
-    let url = format!("http://127.0.0.1:{port}");
+    let turn = Arc::new(tokio::sync::Mutex::new(()));
+    let sharing = match share {
+        None => None,
+        Some(flags) => {
+            let session = Session::open()?;
+            let args = share::ShareArgs {
+                board: flags.board,
+                label: flags.label,
+                url: flags.url,
+                bind: flags.bind,
+                bench_port: flags
+                    .bench_port
+                    .unwrap_or_else(|| share::default_bench_port(port)),
+            };
+            Some(
+                share::start(session, args, turn.clone())
+                    .await
+                    .map_err(|e| {
+                        let mut e = e;
+                        e.message = format!("Could not share the bench: {}", e.message);
+                        e
+                    })?,
+            )
+        }
+    };
+
+    let url = format!("http://127.0.0.1:{bound}");
     let banner = if json {
-        format!("{}\n", json!({"url": url, "port": port}))
+        let bench = sharing.as_ref().map(|s| {
+            json!({"bench": s.bench, "label": s.label, "board": s.board,
+                   "share_code": s.code, "url": s.url, "listen": s.listen})
+        });
+        format!("{}\n", json!({"url": url, "port": bound, "bench": bench}))
     } else {
-        format!(
+        let mut b = format!(
             "ter serve on {url}, {who}\nThe lesson page's Run button builds here. Stop with Ctrl-C.\n"
-        )
+        );
+        if let Some(s) = &sharing {
+            b.push_str(&format!(
+                "Bench {} ({}, {}) is shared as {}: others run `ter connect {}`. Runs reach it at {} (listening on {}).\nType k and Enter to drop whoever is driving and stop sharing.\n",
+                s.label, s.board, s.bench, s.code, s.code, s.url, s.listen
+            ));
+        }
+        b
     };
     // One write, flushed so a caller reading the URL sees it now, and never
     // a panic if whoever started ter serve stopped reading its output.
@@ -247,9 +298,7 @@ pub async fn serve(port: Option<u16>, json: bool) -> Result<(), CliError> {
         let _ = out.write_all(banner.as_bytes()).and_then(|()| out.flush());
     }
 
-    let service = Arc::new(Serve(Arc::new(Inner {
-        turn: Arc::new(tokio::sync::Mutex::new(())),
-    })));
+    let service = Arc::new(Serve(Arc::new(Inner { turn })));
     ter_remote::serve::serve(listener, service)
         .await
         .map_err(|e| CliError::new("io_error", format!("ter serve stopped: {e}")))

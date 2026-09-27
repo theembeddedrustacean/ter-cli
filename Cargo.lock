@@ -2429,8 +2429,12 @@ name = "ter-remote"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
+ "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
+ "ter-telemetry",
  "tokio",
  "tower",
 ]

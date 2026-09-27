@@ -10,11 +10,15 @@ homepage.workspace = true
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+base64.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net"] }
+ter-telemetry.workspace = true
+tokio = { workspace = true, features = ["net", "time"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

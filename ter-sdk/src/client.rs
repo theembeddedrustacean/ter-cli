@@ -4,6 +4,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
+use crate::bench::{Connected, Done, Heartbeat, Mine, Registered, Shared, Unshared};
 use crate::exercise::{Exercise, ExerciseRef};
 use crate::pairing::{PairStart, PollStatus};
 use crate::run::{HintAnswer, HintFile, RunAnswer, RunRecord};
@@ -146,6 +147,87 @@ impl Client {
     /// The next hint for a run this account posted.
     pub async fn hint(&self, run: &str, files: &[HintFile]) -> Result<HintAnswer, Error> {
         self.post("hint", &serde_json::json!({ "run": run, "files": files }))
+            .await
+    }
+
+    /// Announce a bench this machine serves, or update `bench` (a board
+    /// swap, a new URL). The site matches an unnamed bench by its label.
+    pub async fn bench_register(
+        &self,
+        board: &str,
+        label: Option<&str>,
+        url: Option<&str>,
+        bench: Option<&str>,
+    ) -> Result<Registered, Error> {
+        self.post(
+            "bench_register",
+            &serde_json::json!({"board": board, "label": label, "url": url, "bench": bench}),
+        )
+        .await
+    }
+
+    /// Tell the site the bench is alive: `available`, or `busy` with a run.
+    pub async fn bench_heartbeat(&self, bench: &str, busy: bool) -> Result<Heartbeat, Error> {
+        let status = if busy { "busy" } else { "available" };
+        self.post(
+            "bench_heartbeat",
+            &serde_json::json!({"bench": bench, "status": status}),
+        )
+        .await
+    }
+
+    /// This account's own benches: whether each is sharing, under which
+    /// code, and who is connected. The site's Devices page reads the same.
+    pub async fn my_benches(&self) -> Result<Vec<Mine>, Error> {
+        #[derive(Deserialize)]
+        struct Devices {
+            #[serde(default)]
+            mine: Vec<Mine>,
+        }
+        let d: Devices = self.get("devices", &[]).await?;
+        Ok(d.mine)
+    }
+
+    /// Turn sharing on for an own bench; the same code while it stays on.
+    pub async fn bench_share(&self, bench: &str) -> Result<Shared, Error> {
+        self.post("bench_share", &serde_json::json!({ "bench": bench }))
+            .await
+    }
+
+    /// Sharing off: the code stops working and everyone connected is
+    /// dropped.
+    pub async fn bench_unshare(&self, bench: &str) -> Result<Unshared, Error> {
+        self.post("bench_unshare", &serde_json::json!({ "bench": bench }))
+            .await
+    }
+
+    /// Connect to the bench sharing under `code`.
+    pub async fn bench_connect(&self, code: &str) -> Result<Connected, Error> {
+        self.post("bench_connect", &serde_json::json!({ "code": code }))
+            .await
+    }
+
+    /// Connect again to a bench already in this account's list.
+    pub async fn bench_reconnect(&self, bench: &str) -> Result<Connected, Error> {
+        self.post("bench_reconnect", &serde_json::json!({ "bench": bench }))
+            .await
+    }
+
+    /// End this account's session on a bench; it stays in the list.
+    pub async fn bench_disconnect(&self, bench: &str) -> Result<Done, Error> {
+        self.post("bench_disconnect", &serde_json::json!({ "bench": bench }))
+            .await
+    }
+
+    /// Take a bench off this account's list.
+    pub async fn bench_forget(&self, bench: &str) -> Result<Done, Error> {
+        self.post("bench_forget", &serde_json::json!({ "bench": bench }))
+            .await
+    }
+
+    /// Delete an own bench and every share on it.
+    pub async fn bench_remove(&self, bench: &str) -> Result<Done, Error> {
+        self.post("bench_remove", &serde_json::json!({ "bench": bench }))
             .await
     }
 

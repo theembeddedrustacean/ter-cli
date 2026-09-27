@@ -155,7 +155,7 @@ fn remove_file(path: &Path) -> Result<bool, CliError> {
 /// Write `token` to `path` so that only the owner can read it: the
 /// directory mode 700 when ter creates it, the file mode 600 even when it
 /// already existed with a wider mode.
-fn write_private(path: &Path, token: &str) -> Result<(), CliError> {
+pub(crate) fn write_private(path: &Path, token: &str) -> Result<(), CliError> {
     let fail = |e: std::io::Error| store_error(format!("Could not write {}: {e}", path.display()));
     if let Some(dir) = path.parent() {
         let mut builder = std::fs::DirBuilder::new();

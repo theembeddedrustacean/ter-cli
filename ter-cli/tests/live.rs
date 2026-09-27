@@ -1111,3 +1111,317 @@ fn live_serve_fetches_runs_and_posts_for_the_page() {
         v["name"], v["site"]["attempt"]
     );
 }
+
+/// `ter serve --share` as TER Smoke Test, with a bench of its own that is
+/// removed from the site when this is dropped.
+struct SharedBench {
+    m: LiveMachine,
+    child: Option<std::process::Child>,
+    name: String,
+    code: String,
+}
+
+impl SharedBench {
+    fn start(label: &str) -> Self {
+        use std::io::BufRead;
+        let m = LiveMachine::new();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ter"))
+            .args(["serve", "--port", "0", "--json", "--share"])
+            .args([
+                "--board",
+                "xiao-esp32c3",
+                "--label",
+                label,
+                "--bench-port",
+                "0",
+            ])
+            .current_dir(m.courses.path())
+            .env("TER_CONFIG_DIR", m.config.path())
+            .env("TER_TOKEN", &m.token)
+            .env("TER_KEYCHAIN", "off")
+            .env_remove("TER_SITE_URL")
+            .env_remove("TER_PORT")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(!line.contains(&m.token), "the token must never be printed");
+        let banner: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        let bench = &banner["bench"];
+        eprintln!("shared: {bench}");
+        Self {
+            name: bench["bench"].as_str().expect("a bench name").to_string(),
+            code: bench["share_code"]
+                .as_str()
+                .expect("a share code")
+                .to_string(),
+            m,
+            child: Some(child),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    /// This bench as `ter bench list` shows it (the Devices page's view).
+    fn listed(&self) -> Value {
+        let (ok, v) = self.m.json(&["bench", "list"], self.m.courses.path());
+        assert!(ok, "{v}");
+        v["mine"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["bench"] == self.name.as_str())
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+}
+
+impl Drop for SharedBench {
+    fn drop(&mut self) {
+        self.stop();
+        let (ok, v) = self
+            .m
+            .json(&["bench", "remove", &self.name], self.m.courses.path());
+        if !ok {
+            eprintln!("could not remove live test bench {}: {v}", self.name);
+        }
+    }
+}
+
+fn wait_for(
+    what: &str,
+    limit: std::time::Duration,
+    mut done: impl FnMut() -> bool,
+) -> std::time::Duration {
+    let t = std::time::Instant::now();
+    while !done() {
+        assert!(
+            t.elapsed() < limit,
+            "{what}: not within {} s",
+            limit.as_secs()
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    t.elapsed()
+}
+
+fn live_label(what: &str) -> String {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    format!("ter-cli live {what} {t}")
+}
+
+/// The phase 8 flow against the site: the bench shows under Mine, stays up
+/// on heartbeats, is shared, a connection shows as Connected, unsharing
+/// drops it, and a stopped `ter serve` shows offline a minute later.
+/// About two and a half minutes.
+#[test]
+#[ignore = "live site"]
+fn live_serve_share_registers_heartbeats_shares_and_goes_offline() {
+    let mut bench = SharedBench::start(&live_label("share"));
+    let took = wait_for(
+        "bench under Mine",
+        std::time::Duration::from_secs(30),
+        || bench.listed()["status"] == "available",
+    );
+    let listed = bench.listed();
+    eprintln!("under Mine after {} s: {listed}", took.as_secs());
+    assert_eq!(listed["board"], "xiao-esp32c3");
+    assert_eq!(listed["sharing"], true);
+    assert_eq!(listed["share_code"], bench.code.as_str());
+    assert!(
+        listed["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:"),
+        "{listed}"
+    );
+
+    let (ok, v) = bench
+        .m
+        .json(&["bench", "share", &bench.name], bench.m.courses.path());
+    assert!(ok, "{v}");
+    assert_eq!(
+        v["share_code"],
+        bench.code.as_str(),
+        "sharing again keeps the code"
+    );
+
+    // Connect with the code from another machine: the test account itself,
+    // and a second account when TER_TOKEN_2 names one.
+    let driver = LiveMachine::new();
+    let (ok, v) = driver.json(
+        &["connect", &bench.code.to_lowercase()],
+        driver.courses.path(),
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["bench"], bench.name.as_str());
+    assert_eq!(v["status"], "available");
+    let mut expected = 1;
+    let second = std::env::var("TER_TOKEN_2")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(|token| {
+            let mut other = LiveMachine::new();
+            other.token = token;
+            let (ok, v) = other.json(&["connect", &bench.code], other.courses.path());
+            assert!(ok, "{v}");
+            other
+        });
+    if second.is_some() {
+        expected = 2;
+    } else {
+        eprintln!("second account skipped: set TER_TOKEN_2 to a second test account's token");
+    }
+    let listed = bench.listed();
+    assert_eq!(
+        listed["connected"].as_array().unwrap().len(),
+        expected,
+        "Connected on the owner's page: {listed}"
+    );
+    let (ok, v) = driver.json(&["bench", "list"], driver.courses.path());
+    assert!(ok, "{v}");
+    assert_eq!(v["connected"][0]["bench"], bench.name.as_str());
+
+    // Heartbeats keep it up past the site's 60 s.
+    std::thread::sleep(std::time::Duration::from_secs(70));
+    assert_eq!(
+        bench.listed()["status"],
+        "available",
+        "heartbeats keep it up"
+    );
+
+    let (ok, v) = bench
+        .m
+        .json(&["bench", "unshare", &bench.name], bench.m.courses.path());
+    assert!(ok, "{v}");
+    assert_eq!(v["dropped"], expected, "{v}");
+    let listed = bench.listed();
+    assert_eq!(listed["sharing"], false);
+    assert_eq!(
+        listed["connected"],
+        serde_json::json!([]),
+        "unshare drops them: {listed}"
+    );
+
+    bench.stop();
+    assert_eq!(
+        bench.listed()["status"],
+        "available",
+        "not offline the moment it stops"
+    );
+    let took = wait_for("offline", std::time::Duration::from_secs(75), || {
+        bench.listed()["status"] == "offline"
+    });
+    eprintln!("offline {} s after ter serve stopped", took.as_secs());
+    drop(second);
+}
+
+/// A connected bench whose owner's `ter serve` has no board refuses the
+/// run before the build, over the real registry and the real share code.
+#[test]
+#[ignore = "live site"]
+fn live_a_bench_without_a_board_refuses_before_the_build() {
+    if std::env::var("TER_BENCH").is_ok_and(|v| v == "1") {
+        eprintln!("skipped: a board is plugged in (TER_BENCH=1)");
+        return;
+    }
+    let bench = SharedBench::start(&live_label("no board"));
+    let driver = LiveMachine::new();
+    let (ok, v) = driver.json(&["connect", &bench.code], driver.courses.path());
+    assert!(ok, "{v}");
+    let dir = fetched(&driver, LIVE_SERIAL_ONLY);
+    let (ok, v) = driver.json(&["run", "--hw", "--venue", "bench"], &dir);
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no board plugged in"),
+        "the bench answered with the share code: {v}"
+    );
+    assert!(!dir.join(".runs").exists(), "nothing built, nothing posted");
+}
+
+/// The seeded bench (owner: the test account, code GZTS-2520) has never
+/// been served, so it connects but cannot take a run.
+#[test]
+#[ignore = "live site"]
+fn live_seeded_bench_connects_and_forgets() {
+    let m = LiveMachine::new();
+    let (ok, v) = m.json(&["connect", "GZTS-2520"], m.courses.path());
+    assert!(ok, "{v}");
+    assert_eq!(v["board"], "xiao-esp32c3");
+    assert_eq!(v["status"], "offline");
+    let dir = fetched(&m, LIVE_SERIAL_ONLY);
+    let (ok, v) = m.json(&["run", "--hw", "--venue", "bench"], &dir);
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no address"),
+        "{v}"
+    );
+    assert!(!dir.join(".runs").exists());
+    let (ok, v) = m.json(&["bench", "disconnect"], m.courses.path());
+    assert!(ok, "{v}");
+    let (ok, v) = m.json(&["bench", "forget"], m.courses.path());
+    assert!(ok, "{v}");
+    let (ok, v) = m.json(&["bench", "forget"], m.courses.path());
+    assert!(!ok, "gone from the list: {v}");
+}
+
+#[test]
+#[ignore = "live site"]
+fn live_bench_calls_with_a_bad_token_are_token_invalid() {
+    for args in [&["connect", "GZTS-2520"][..], &["bench", "share"][..]] {
+        let (ok, v) = ter_json("not-a-real-token", args);
+        assert!(!ok);
+        assert_eq!(v["error"]["code"], "token_invalid", "{args:?}: {v}");
+    }
+}
+
+/// With the XIAO on this machine: shared, connected to, and run on as a
+/// bench, the serial check passes as it does on the local board.
+#[test]
+#[ignore = "live site"]
+fn bench_a_run_on_a_shared_bench_passes_its_serial_check() {
+    if !bench_ready() {
+        return;
+    }
+    let bench = SharedBench::start(&live_label("board"));
+    let driver = LiveMachine::new();
+    let (ok, v) = driver.json(&["connect", &bench.code], driver.courses.path());
+    assert!(ok, "{v}");
+    let dir = fetched(&driver, LIVE_SERIAL_ONLY);
+    let v = {
+        let _turn = take_turn();
+        driver.json(&["run", "--hw", "--venue", "bench"], &dir).1
+    };
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(
+        (&v["mode"], &v["venue"]),
+        (&"hardware".into(), &"bench".into())
+    );
+    assert_eq!(v["check_status"], "passed", "{v}");
+    assert_eq!(events(&v)[0]["capture"]["venue"], "bench");
+    eprintln!(
+        "bench: run {} attempt {}: {}",
+        v["name"], v["site"]["attempt"], v["verdicts"]
+    );
+}

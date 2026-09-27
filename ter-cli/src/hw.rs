@@ -72,7 +72,7 @@ pub fn ready(dir: &Path) -> Result<Ready, CliError> {
 }
 
 /// `TER_PORT`, else the one board on USB this tool can flash.
-fn port(tool: &Tool) -> Result<Port, CliError> {
+pub fn port(tool: &Tool) -> Result<Port, CliError> {
     if let Ok(path) = std::env::var(PORT_ENV)
         && !path.trim().is_empty()
     {

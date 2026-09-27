@@ -21,7 +21,8 @@ use crate::output::{CliError, print_json};
 use crate::record::{Infra, Outcome, RunContext, assemble, file_sha256};
 use crate::session::Session;
 use crate::telemetry::{RUN_CHECK, bad_check, check_recording};
-use crate::{hw, sim};
+use crate::{hw, remote, sim};
+use ter_flash::Tool;
 
 pub const CHECK_YAML: &str = "check.yaml";
 pub const NO_CHECK_NOTE: &str = "This exercise has no automatic check yet. Run it with cargo run.";
@@ -59,6 +60,8 @@ enum Plan {
     NoCheck,
     Wokwi(Box<Checked<sim::Ready>>),
     Local(Box<Checked<hw::Ready>>),
+    /// Someone's shared bench; settled once the account is known.
+    Bench(Box<Checked<Tool>>),
 }
 
 /// A checked run: the check.yaml, and the venue ready to run it.
@@ -72,7 +75,7 @@ struct Checked<R> {
 fn venue_for(mode: &str, asked: Option<&str>) -> Result<&'static str, CliError> {
     let (default, known): (&str, &[&'static str]) = match mode {
         "simulation" => ("wokwi", &["wokwi"]),
-        _ => ("local", &["local"]),
+        _ => ("local", &["local", "bench"]),
     };
     let wanted = asked.unwrap_or(default);
     known.iter().copied().find(|v| *v == wanted).ok_or_else(|| {
@@ -133,7 +136,10 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
             )
         })?;
         let file = CheckFile::parse(&text).map_err(|e| bad_check(&check_path, e))?;
-        if venue == "local" {
+        if venue == "bench" {
+            let ready = hw::tool(&dir)?;
+            Plan::Bench(Box::new(Checked { file, text, ready }))
+        } else if venue == "local" {
             let ready = hw::ready(&dir)?;
             Plan::Local(Box::new(Checked { file, text, ready }))
         } else {
@@ -151,6 +157,10 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         .await
         .map_err(|e| session.forget_dead_token(e.into()))?;
     let user = client.ping().await.map_err(CliError::from)?.user.clone();
+    let bench = match &plan {
+        Plan::Bench(b) => Some(remote::ready(&session, &user, &ter, &b.ready).await?),
+        _ => None,
+    };
 
     let (number, recording) = new_recording(&dir)?;
     if !json {
@@ -159,10 +169,19 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
             Plan::NoCheck => "build only, no check.yaml".to_string(),
             Plan::Wokwi(_) => "then Wokwi".to_string(),
             Plan::Local(hw) => format!("then the board on {}", hw.ready.port.path),
+            Plan::Bench(_) => {
+                let b = bench.as_ref().expect("a bench plan has a bench");
+                format!("then {}'s bench {}", b.link.owner_name, b.link.label)
+            }
         };
         eprintln!("Building {} ({mode}, {how})", ter.exercise);
         if let Plan::Local(hw) = &plan
             && let Some(note) = hw::unseen_note(&hw.file, &hw.ready.provides())
+        {
+            eprintln!("{note}");
+        }
+        if let (Plan::Bench(b), Some(bench)) = (&plan, &bench)
+            && let Some(note) = remote::unseen_note(&b.file, &bench.info.provides)
         {
             eprintln!("{note}");
         }
@@ -183,7 +202,7 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         },
         (Plan::BuildOnly, _) => Outcome::Built,
         (Plan::NoCheck, _) => Outcome::NoCheck,
-        (Plan::Wokwi(_) | Plan::Local(_), None) => Outcome::Infra {
+        (Plan::Wokwi(_) | Plan::Local(_) | Plan::Bench(_), None) => Outcome::Infra {
             failure: Infra::VenueUnavailable,
             output: "cargo built no program to run".into(),
         },
@@ -233,12 +252,30 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
             ran_in = Some((t.elapsed(), "on the board"));
             outcome
         }
+        (Plan::Bench(b), Some(elf)) => {
+            let Checked { file, text, .. } = b.as_ref();
+            let bench = bench.expect("a bench plan has a bench");
+            if !json {
+                eprintln!(
+                    "Sending the program to {} at {}, then {} ms of serial",
+                    bench.link.label, bench.url, file.timeout_ms
+                );
+            }
+            let t = Instant::now();
+            let mut venue = bench.venue(&ter, file.timeout_ms, recording.to_path_buf());
+            venue.capture = capture(&ter, client.cli_version(), &elf_sha256);
+            let budget = board_budget(file.timeout_ms);
+            let outcome = record_and_judge(&mut venue, file, text, elf, budget, &recording)?;
+            ran_in = Some((t.elapsed(), "on the bench"));
+            outcome
+        }
     };
     let record = assemble(
         RunContext {
             ter: &ter,
             mode: &mode,
-            venue: matches!(plan, Plan::Wokwi(_) | Plan::Local(_)).then_some(venue),
+            venue: matches!(plan, Plan::Wokwi(_) | Plan::Local(_) | Plan::Bench(_))
+                .then_some(venue),
             elf_sha256,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             hints_used: previous.as_ref().map_or(0, |p| p.hints.used),
@@ -277,7 +314,7 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         outcome,
         built_in: build.duration,
         ran_in,
-        local: matches!(plan, Plan::Local(_)),
+        local: matches!(plan, Plan::Local(_) | Plan::Bench(_)),
         sim_allowed: ter.modes.iter().any(|m| m == "simulation"),
     })
 }
