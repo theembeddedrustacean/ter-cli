@@ -43,4 +43,5 @@ fn live_whoami_with_valid_token() {
     assert_eq!(v["cli_version"], env!("CARGO_PKG_VERSION"));
     assert!(v["min_supported_version"].is_string());
     assert_eq!(v["supported"], true);
+    assert!(v["premium"].is_boolean(), "{v}");
 }

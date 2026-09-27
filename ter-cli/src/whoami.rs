@@ -6,6 +6,7 @@ use crate::session::Session;
 #[derive(Serialize)]
 struct Whoami<'a> {
     user: &'a str,
+    premium: Option<bool>,
     site: &'a str,
     token_source: &'a str,
     courses: Vec<CourseRef<'a>>,
@@ -30,6 +31,7 @@ pub async fn run(session: &Session, json: bool) -> Result<(), CliError> {
     if json {
         print_json(&Whoami {
             user: &ping.user,
+            premium: ping.premium,
             site: client.site_url(),
             token_source: session.token_source,
             courses: enrollments
@@ -49,6 +51,12 @@ pub async fn run(session: &Session, json: bool) -> Result<(), CliError> {
     }
 
     println!("user     {}", ping.user);
+    let premium = match ping.premium {
+        Some(true) => "yes",
+        Some(false) => "no (exercises need TER Premium)",
+        None => "unknown",
+    };
+    println!("premium  {premium}");
     println!("site     {}", client.site_url());
     println!("token    {}", session.token_source);
     if enrollments.courses.is_empty() {

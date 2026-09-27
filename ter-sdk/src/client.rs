@@ -17,6 +17,10 @@ pub struct Ping {
     pub latest_version: String,
     #[serde(default)]
     pub download_url: Option<String>,
+    /// Whether the account holds the TER Premium role. `None` from a site
+    /// that does not report it.
+    #[serde(default)]
+    pub premium: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

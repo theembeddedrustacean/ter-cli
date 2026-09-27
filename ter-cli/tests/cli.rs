@@ -30,6 +30,10 @@ fn stderr(o: &Output) -> String {
 }
 
 async fn mock_site(min_version: &str) -> MockServer {
+    mock_site_with(min_version, json!(true)).await
+}
+
+async fn mock_site_with(min_version: &str, premium: Value) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(format!("{API}.ping")))
@@ -40,7 +44,8 @@ async fn mock_site(min_version: &str) -> MockServer {
             "server_time": "2026-09-27T12:00:00",
             "min_supported_version": min_version,
             "latest_version": "9.9.9",
-            "download_url": null
+            "download_url": null,
+            "premium": premium
         }})))
         .mount(&server)
         .await;
@@ -84,6 +89,7 @@ async fn whoami_prints_user_courses_and_versions() {
     assert!(out.contains("ESP GPIO (esp-gpio)"), "{out}");
     assert!(out.contains(env!("CARGO_PKG_VERSION")), "{out}");
     assert!(out.contains("TER_TOKEN"), "{out}");
+    assert!(out.contains("premium  yes"), "{out}");
     assert!(
         !out.contains("good-token"),
         "the token must never be printed"
@@ -99,6 +105,7 @@ async fn whoami_json() {
     let v: Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["user"], "learner@example.com");
     assert_eq!(v["supported"], true);
+    assert_eq!(v["premium"], true);
     assert_eq!(v["courses"][0]["course_id"], "esp-gpio");
     assert!(!stdout(&o).contains("good-token"));
 }
@@ -179,4 +186,21 @@ fn self_update_prints_a_reinstall_command() {
         v["command"],
         "cargo install --git https://example.com/ter-cli.git ter-cli --force"
     );
+}
+
+#[tokio::test]
+async fn whoami_shows_when_the_account_is_not_premium() {
+    let site = mock_site_with("0.1.0", json!(false)).await;
+    let o = ter(&site.uri(), Some("good-token"), &["whoami"]);
+    assert!(o.status.success());
+    assert!(stdout(&o).contains("premium  no"), "{}", stdout(&o));
+}
+
+#[tokio::test]
+async fn whoami_from_a_site_without_premium_says_unknown() {
+    let site = mock_site_with("0.1.0", Value::Null).await;
+    let o = ter(&site.uri(), Some("good-token"), &["whoami", "--json"]);
+    assert!(o.status.success());
+    let v: Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["premium"], Value::Null);
 }
