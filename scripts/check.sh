@@ -4,7 +4,9 @@
 #
 #   scripts/check.sh                 everything that runs offline
 #   scripts/check.sh --live          also the tests against the live site
-#                                    (needs TER_TOKEN for a test account)
+#                                    (needs TER_TOKEN for a test account;
+#                                    TER_CURRICULUM=<checkout> adds the
+#                                    --dev and solution build checks)
 #   scripts/check.sh --install-hook  install the git pre-commit hook
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

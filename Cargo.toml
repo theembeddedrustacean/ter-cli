@@ -22,12 +22,14 @@ homepage = "https://github.com/theembeddedrustacean/ter-cli"
 [workspace.dependencies]
 ter-sdk = { path = "ter-sdk" }
 ter-check = { path = "ter-check" }
+base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
 directories = "6"
 reqwest = { version = "0.13", features = ["json", "query"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 toml = "1"

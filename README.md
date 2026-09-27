@@ -6,8 +6,8 @@ Learn account, fetches exercises as small Cargo projects, builds and runs
 them on your board or in a simulator, checks what the program did, and
 records the attempt on the site.
 
-This is an early version: `ter login`, `ter logout`, `ter whoami` and
-`ter self-update` work today.
+This is an early version: pairing (`ter login`, `ter logout`,
+`ter whoami`), exercises (`ter ex`) and `ter self-update` work today.
 
 ## Install
 
@@ -23,6 +23,10 @@ On Debian and Ubuntu, install `pkg-config libudev-dev` first.
 ter login             pair this machine with your TER Learn account
 ter logout            remove this machine's device token
 ter whoami            the account, courses and versions
+ter ex list           the exercises in your courses (--course C for one)
+ter ex fetch <id>     fetch an exercise as a Cargo project
+ter ex clean          delete build output, keep the source
+ter ex remove <id>    delete an exercise's folder
 ter self-update       how to update ter
 ```
 
@@ -44,6 +48,27 @@ Devices page. When the site reports the token revoked or expired, `ter`
 removes it and asks you to `ter login` again.
 
 `TER_TOKEN`, when set, is used instead of the stored token.
+
+### Exercises
+
+`ter ex fetch <id>` puts an exercise in `<courses-root>/<course>/<id>/`
+(`~/ter-courses` by default), or in the folder you name after the id. It
+is an ordinary Cargo project: `cargo run` in it builds the program,
+flashes your board and shows its serial output. Next to the project,
+`ter.toml` records the exercise, its course and target, and the `mode`
+(`hardware` or `simulation`) a bare `ter run` uses; you may change `mode`.
+
+When `ter` builds an exercise, every exercise in a course shares one build
+cache, `<course>/.target` (and `<course>/.embuild` for ESP-IDF tools), so
+the HAL compiles once per course. `ter ex clean` in an exercise folder, or
+`ter ex clean <id>`, drops that exercise's build output and run
+recordings; `--course C` also drops the course's cache, `--all` every
+course's. `ter ex remove <id>` deletes the folder; if you have changed the
+source since fetching, it refuses unless you add `--force`.
+
+For curriculum authors, `ter ex fetch <id> --dev <checkout>` builds the
+exercise from a local curriculum checkout (with its
+`tools/exercise_sync.py`) instead of the site, and needs no account.
 
 ## Configuration
 
@@ -77,7 +102,9 @@ that reaches the network; `scripts/check-deps.sh` enforces it.
 
 ```
 scripts/check.sh                 fmt, clippy, tests, dependency rule
-scripts/check.sh --live          plus tests against the live site (needs TER_TOKEN)
+scripts/check.sh --live          plus tests against the live site (needs TER_TOKEN;
+                                 TER_CURRICULUM=<checkout> adds the --dev and
+                                 solution build checks)
 scripts/check.sh --install-hook  pre-commit hook running the fast part
 ```
 

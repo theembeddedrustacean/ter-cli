@@ -25,6 +25,12 @@ impl From<ter_sdk::Error> for CliError {
     }
 }
 
+impl From<ter_sdk::project::ProjectError> for CliError {
+    fn from(e: ter_sdk::project::ProjectError) -> Self {
+        Self::new(e.code, e.message)
+    }
+}
+
 /// With `--json` the error goes to stdout as `{"error": {code, message}}`,
 /// the same envelope the site uses; otherwise to stderr.
 pub fn print_error(err: &CliError, json: bool) {

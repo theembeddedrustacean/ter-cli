@@ -4,6 +4,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
+use crate::exercise::{Exercise, ExerciseRef};
 use crate::pairing::{PairStart, PollStatus};
 use crate::{Error, envelope::parse_response, version::check_supported};
 
@@ -46,9 +47,30 @@ pub struct Lesson {
     #[serde(default)]
     pub locked: bool,
     #[serde(default)]
-    pub exercise: Option<Value>,
+    pub exercise: Option<ExerciseRef>,
     #[serde(default)]
-    pub exercises: Vec<Value>,
+    pub exercises: Vec<ExerciseRef>,
+}
+
+impl Lesson {
+    /// The lesson's exercises, from `exercises` or, from a site that sends
+    /// only the one, `exercise`.
+    pub fn all_exercises(&self) -> impl Iterator<Item = &ExerciseRef> {
+        let single = self.exercise.iter().filter(|_| self.exercises.is_empty());
+        self.exercises.iter().chain(single)
+    }
+}
+
+impl Enrollments {
+    /// The course an exercise belongs to, if it is in an enrolled course.
+    pub fn course_of(&self, exercise_id: &str) -> Option<&Course> {
+        self.courses.iter().find(|c| {
+            c.lessons
+                .iter()
+                .flat_map(Lesson::all_exercises)
+                .any(|e| e.exercise_id == exercise_id)
+        })
+    }
 }
 
 /// A client for the TER API on one site, as one CLI version, with one
@@ -105,6 +127,12 @@ impl Client {
 
     pub async fn enrollments(&self) -> Result<Enrollments, Error> {
         self.get("enrollments", &[]).await
+    }
+
+    /// One exercise with its files: `not_found`, `not_enrolled` or `locked`
+    /// when this account may not have it.
+    pub async fn exercise(&self, exercise_id: &str) -> Result<Exercise, Error> {
+        self.get("exercise", &[("exercise_id", exercise_id)]).await
     }
 
     /// Ask for a pairing code. Needs no token.
