@@ -93,14 +93,52 @@ echo "Timeout: simulation did not finish in ${timeout}ms" >&2
 exit 42
 "#;
 
+/// Plays `espflash`: keeps its arguments, fails with the exit code in
+/// `exit-code`, and otherwise says it flashed and leaves `flashed` for the
+/// test's board to start printing.
+const FAKE_ESPFLASH: &str = r#"#!/bin/sh
+here="$(dirname "$0")"
+echo "$@" > "$here/got-args"
+code="$(cat "$here/exit-code")"
+if [ "$code" != 0 ]; then
+  echo "Error: espflash::connection_failed" >&2
+  echo "  x Error while connecting to device" >&2
+  exit "$code"
+fi
+echo "Flashing has completed!"
+touch "$here/flashed"
+"#;
+
+/// A serial check a bare board can see and a pin check it cannot.
+const BANNER_AND_BLINK: &str = "\
+timeout_ms: 1500
+assert:
+  - id: banner
+    serial_contains: \"Hello world!\"
+    within_ms: 1000
+  - id: blink-rate
+    pin: user_led
+    toggles_per_s: { min: 1.8, max: 2.2 }
+    window_ms: [200, 1200]
+";
+
 const GOOD: &str = "fn main() {\n    println!(\"blink\");\n}\n";
 const BROKEN: &str = "fn main() {\n    let _ = led;\n}\n";
+
+/// Held to spawn a process, and exclusively while a test's board opens
+/// its pty: `TTYPort::pair` opens it without close-on-exec, and a `ter`
+/// spawned in that moment would inherit it and keep the board plugged in.
+static SPAWN: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 struct Machine {
     config: TempDir,
     courses: TempDir,
     /// A stand-in for `wokwi-cli`, first on the PATH, when set.
     fake_wokwi: Option<TempDir>,
+    /// A stand-in for `espflash`, first on the PATH, when set.
+    fake_espflash: Option<TempDir>,
+    /// `TER_PORT`, when set.
+    port: Option<String>,
 }
 
 impl Machine {
@@ -118,6 +156,8 @@ impl Machine {
             config,
             courses,
             fake_wokwi: None,
+            fake_espflash: None,
+            port: None,
         };
         let dir = m.exercise();
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -154,7 +194,17 @@ impl Machine {
             .env("TER_SITE_URL", site)
             .env("TER_CONFIG_DIR", self.config.path())
             .env("TER_TOKEN", "good-token")
-            .env_remove("WOKWI_CLI_TOKEN");
+            .env_remove("WOKWI_CLI_TOKEN")
+            .env_remove("TER_PORT");
+        if let Some(port) = &self.port {
+            cmd.env("TER_PORT", port);
+        }
+        if let Some(fake) = &self.fake_espflash {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut dirs = vec![fake.path().to_path_buf()];
+            dirs.extend(std::env::split_paths(&path));
+            cmd.env("PATH", std::env::join_paths(dirs).unwrap());
+        }
         if let Some(fake) = &self.fake_wokwi {
             let path = std::env::var_os("PATH").unwrap_or_default();
             let mut dirs = vec![fake.path().to_path_buf()];
@@ -162,7 +212,15 @@ impl Machine {
             cmd.env("PATH", std::env::join_paths(dirs).unwrap())
                 .env("WOKWI_CLI_TOKEN", "fake-wokwi");
         }
-        cmd.output().unwrap()
+        let child = {
+            let _spawning = SPAWN.read().unwrap();
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        child.wait_with_output().unwrap()
     }
 
     /// Make the exercise a simulated one: `check` as its check.yaml, the
@@ -190,6 +248,35 @@ impl Machine {
         std::fs::write(fake.path().join("exit-code"), exit_code.to_string()).unwrap();
         self.fake_wokwi = Some(fake);
         self
+    }
+
+    /// Make the exercise one for the board: `check` as its check.yaml, an
+    /// espflash runner, a fake `espflash` that exits with `exit_code`, and
+    /// `port` as TER_PORT.
+    #[cfg(unix)]
+    fn on_board(mut self, check: &str, exit_code: i32, port: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.exercise();
+        std::fs::write(dir.join("check.yaml"), check).unwrap();
+        std::fs::create_dir_all(dir.join(".cargo")).unwrap();
+        std::fs::write(
+            dir.join(".cargo/config.toml"),
+            "[target.riscv32imc-unknown-none-elf]\nrunner = \"espflash flash --monitor --chip esp32c3\"\n",
+        )
+        .unwrap();
+        let fake = tempfile::tempdir().unwrap();
+        let script = fake.path().join("espflash");
+        std::fs::write(&script, FAKE_ESPFLASH).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(fake.path().join("exit-code"), exit_code.to_string()).unwrap();
+        self.fake_espflash = Some(fake);
+        self.port = Some(port.to_string());
+        self
+    }
+
+    fn espflash_saw(&self) -> String {
+        let fake = self.fake_espflash.as_ref().unwrap();
+        std::fs::read_to_string(fake.path().join("got-args")).unwrap()
     }
 
     fn fake_saw(&self, file: &str) -> String {
@@ -379,17 +466,243 @@ async fn an_outdated_ter_does_not_build_or_post() {
     assert!(!m.exercise().join(".runs").exists());
 }
 
+/// A board on a pseudo-terminal: once the fake espflash has flashed, it
+/// prints `lines` 100 ms apart, then, with `unplug`, goes away.
+#[cfg(unix)]
+struct Board {
+    port: String,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl Board {
+    fn start(flashed: PathBuf, lines: &'static [&'static str], unplug: bool) -> Self {
+        use serialport::SerialPort;
+        use std::io::Write;
+        // pair() leaves both ends open across exec, so ter would hold the
+        // pty open and never see the unplug; keep close-on-exec copies.
+        let (mut master, slave, port) = {
+            let _alone = SPAWN.write().unwrap();
+            let (master, slave) = serialport::TTYPort::pair().unwrap();
+            let port = slave.name().unwrap();
+            (
+                master.try_clone_native().unwrap(),
+                slave.try_clone_native().unwrap(),
+                port,
+            )
+        };
+        let thread = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while !flashed.exists() {
+                if started.elapsed() > std::time::Duration::from_secs(300) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            for line in lines {
+                let _ = master.write_all(line.as_bytes());
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if unplug {
+                drop(master);
+                drop(slave);
+                return;
+            }
+            // Quiet, and plugged in, until the capture is over.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            drop(slave);
+        });
+        Self { port, thread }
+    }
+}
+
+#[cfg(unix)]
+fn flashed(m: &Machine) -> PathBuf {
+    m.fake_espflash.as_ref().unwrap().path().join("flashed")
+}
+
+#[cfg(unix)]
 #[tokio::test]
-async fn a_checked_run_on_a_board_is_not_available_yet() {
+async fn a_bare_board_judges_the_serial_check_and_names_the_pin_check_unseen() {
     let server = site("0.1.0", run_answer()).await;
-    let m = Machine::with_exercise(GOOD, &["hardware"]);
-    std::fs::write(m.exercise().join("check.yaml"), HEARTBEAT_CHECK).unwrap();
+    let mut m = Machine::with_exercise(GOOD, &["hardware", "simulation"]);
+    m = m.on_board(BANNER_AND_BLINK, 0, "");
+    let board = Board::start(
+        flashed(&m),
+        &["\u{1b}[32mHello world!\u{1b}[0m\r\n", "Hello world!\r\n"],
+        false,
+    );
+    m.port = Some(board.port.clone());
+
+    let (ok, v) = m.json(&server.uri(), &["run"]);
+    board.thread.join().unwrap();
+
+    assert!(ok, "{v}");
+    let args = m.espflash_saw();
+    assert!(
+        args.contains(&format!("--port {}", board.port)) && args.contains("--chip esp32c3"),
+        "{args}"
+    );
+    assert!(
+        args.contains("--after hard-reset"),
+        "ter cannot reset through a port it does not know, so espflash does: {args}"
+    );
+    let run = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(run["mode"], "hardware");
+    assert_eq!(run["venue"], "local");
+    assert_eq!(run["check_status"], "passed", "{run}");
+    assert_eq!(
+        (run["checks_seen"].as_u64(), run["checks_total"].as_u64()),
+        (Some(1), Some(2)),
+        "a partial pass: the site does not count it"
+    );
+    assert!(run["first_failure"].is_null());
+    assert!(
+        run["transcript_tail"]
+            .as_str()
+            .unwrap()
+            .contains("Hello world!")
+    );
+    let verdicts = v["verdicts"].as_array().unwrap();
+    assert_eq!(verdicts[0]["status"], "pass");
+    assert_eq!(verdicts[1]["status"], "not_observable");
+
+    let rec = m.exercise().join(".runs/1");
+    for f in [
+        "build.log",
+        "flash.log",
+        "serial.log",
+        "events.jsonl",
+        "check.yaml",
+        "check.toml",
+    ] {
+        assert!(rec.join(f).is_file(), "{f}");
+    }
+    let events = std::fs::read_to_string(rec.join("events.jsonl")).unwrap();
+    assert!(
+        events
+            .lines()
+            .next()
+            .unwrap()
+            .contains(r#""venue":"local""#)
+    );
+    assert!(
+        events.lines().nth(1).unwrap().contains(r#""kind":"reset""#),
+        "a reset synthesised at capture start: {events}"
+    );
+    let again = m.ter_in(
+        &server.uri(),
+        &[
+            "telemetry",
+            "check",
+            rec.to_str().unwrap(),
+            "--check",
+            rec.join("check.yaml").to_str().unwrap(),
+        ],
+        &m.exercise(),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&again.stdout),
+        std::fs::read_to_string(rec.join("check.toml")).unwrap(),
+        "re-checking the recording gives the same verdicts"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn text_output_shows_the_serial_and_the_partial_pass() {
+    let server = site("0.1.0", run_answer()).await;
+    let mut m = Machine::with_exercise(GOOD, &["hardware", "simulation"]);
+    m = m.on_board(BANNER_AND_BLINK, 0, "");
+    let board = Board::start(flashed(&m), &["Hello world!\r\n"], false);
+    m.port = Some(board.port.clone());
+
+    let o = m.ter_in(&server.uri(), &["run"], &m.exercise());
+    board.thread.join().unwrap();
+
+    let out = String::from_utf8_lossy(&o.stdout);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{out}\n{err}");
+    assert!(
+        err.contains("1 of 2 checks cannot be seen here (blink-rate)"),
+        "{err}"
+    );
+    assert!(out.contains("Ran on the board in"), "{out}");
+    assert!(out.contains("  | Hello world!"), "{out}");
+    assert!(out.contains("unseen  blink-rate"), "{out}");
+    assert!(
+        out.contains("1 of 2 checks seen on this setup, all passed. Full check: ter run --sim"),
+        "{out}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_board_unplugged_mid_capture_posts_not_run_never_failed() {
+    let server = site("0.1.0", run_answer()).await;
+    let mut m = Machine::with_exercise(GOOD, &["hardware"]);
+    m = m.on_board(BANNER_AND_BLINK, 0, "");
+    let board = Board::start(flashed(&m), &["booting\r\n"], true);
+    m.port = Some(board.port.clone());
+
+    let (ok, v) = m.json(&server.uri(), &["run"]);
+    board.thread.join().unwrap();
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    let run = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(run["check_status"], "not_run");
+    assert!(run["first_failure"].is_null());
+    let tail = run["transcript_tail"].as_str().unwrap();
+    assert_eq!(tail.lines().next(), Some("venue_unavailable"), "{tail}");
+    assert!(
+        tail.contains("went away") && tail.contains("booting"),
+        "{tail}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_flash_posts_not_run() {
+    let server = site("0.1.0", run_answer()).await;
+    let mut m = Machine::with_exercise(GOOD, &["hardware"]);
+    m = m.on_board(BANNER_AND_BLINK, 1, "");
+    let board = Board::start(flashed(&m), &[], false);
+    m.port = Some(board.port.clone());
+
+    let (ok, v) = m.json(&server.uri(), &["run"]);
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "flash_failed", "{v}");
+    let run = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(run["check_status"], "not_run");
+    let tail = run["transcript_tail"].as_str().unwrap();
+    assert_eq!(tail.lines().next(), Some("flash_failed"), "{tail}");
+    assert!(tail.contains("Error while connecting"), "{tail}");
+    assert!(m.exercise().join(".runs/1/flash.log").is_file());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn no_board_stops_before_the_build() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware"]).on_board(
+        BANNER_AND_BLINK,
+        0,
+        "/dev/ter-no-such-board",
+    );
 
     let (ok, v) = m.json(&server.uri(), &["run"]);
 
     assert!(!ok);
     assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("--sim"));
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("plugged in"),
+        "{v}"
+    );
     assert!(posted(&server, "run").await.is_empty());
     assert!(
         !m.exercise().join(".runs").exists(),

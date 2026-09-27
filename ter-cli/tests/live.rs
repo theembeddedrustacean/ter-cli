@@ -792,3 +792,235 @@ fn live_sim_refused_wokwi_token_is_not_run() {
     let tail = v["transcript_tail"].as_str().unwrap();
     assert_eq!(tail.lines().next(), Some("venue_unavailable"), "{tail}");
 }
+
+/// The bench tests need a bare XIAO ESP32-C3 on this machine's USB (and the
+/// user in `dialout`); they skip unless `TER_BENCH=1`. Every run posts to
+/// the test account.
+fn bench_ready() -> bool {
+    let ready = std::env::var("TER_BENCH").is_ok_and(|v| v == "1");
+    if !ready {
+        eprintln!("skipped: plug in a XIAO ESP32-C3 and set TER_BENCH=1");
+    }
+    ready
+}
+
+/// env-first-build prints its banner and blinks: it ships complete, so the
+/// fetched scaffold is the reference program.
+const LIVE_BANNER: &str = "env-first-build--xiao-esp32c3-nostd";
+const LIVE_HW_ONLY_PINS: &str = "sandbox-hw-only--xiao-esp32c3-nostd";
+
+fn fetched(m: &LiveMachine, id: &str) -> std::path::PathBuf {
+    let (ok, v) = m.json(&["ex", "fetch", id], m.courses.path());
+    assert!(ok, "{v}");
+    std::path::PathBuf::from(v["path"].as_str().unwrap())
+}
+
+fn events(v: &Value) -> Vec<Value> {
+    let run = std::path::Path::new(v["recording"].as_str().unwrap());
+    std::fs::read_to_string(run.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// A serial check passes on the board and in Wokwi with the same
+/// check.yaml. With `TER_LIVE_SERIAL_ONLY=<id>` it is that exercise's own;
+/// otherwise env-first-build's, cut to its banner check.
+#[test]
+#[ignore = "live site and board"]
+fn bench_a_serial_check_passes_on_the_board_and_in_wokwi() {
+    if !bench_ready() {
+        return;
+    }
+    let m = LiveMachine::new();
+    let dir = match std::env::var("TER_LIVE_SERIAL_ONLY") {
+        Ok(id) => fetched(&m, &id),
+        Err(_) => {
+            let dir = fetched(&m, LIVE_BANNER);
+            let check = std::fs::read_to_string(dir.join("check.yaml")).unwrap();
+            assert!(
+                check.contains("serial_contains: \"Hello world!\""),
+                "{check}"
+            );
+            std::fs::write(
+                dir.join("check.yaml"),
+                "timeout_ms: 3000\nassert:\n  - id: banner\n    serial_contains: \"Hello world!\"\n    within_ms: 2000\n",
+            )
+            .unwrap();
+            dir
+        }
+    };
+
+    let v = {
+        let _turn = take_turn();
+        m.json(&["run", "--hw"], &dir).1
+    };
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(
+        (&v["mode"], &v["venue"]),
+        (&"hardware".into(), &"local".into())
+    );
+    assert_eq!(v["check_status"], "passed", "{v}");
+    assert_eq!(v["checks_seen"], v["checks_total"], "{v}");
+    let ev = events(&v);
+    assert!(
+        ev[0]["capture"]["provides"]
+            .as_array()
+            .unwrap()
+            .contains(&"reset".into()),
+        "ter resets a USB-Serial-JTAG board itself: {}",
+        ev[0]
+    );
+    assert_eq!(ev[1]["kind"], "reset");
+    let run = std::path::Path::new(v["recording"].as_str().unwrap());
+    let replay = telemetry_check(&m, &dir, run.to_str().unwrap());
+    assert_eq!(
+        replay.stdout,
+        std::fs::read(run.join("check.toml")).unwrap()
+    );
+    eprintln!(
+        "board: run {} attempt {}: {}\n{}",
+        v["name"], v["site"]["attempt"], v["verdicts"], v["transcript_tail"]
+    );
+
+    if std::env::var("WOKWI_CLI_TOKEN").is_ok_and(|t| !t.is_empty()) {
+        let v = {
+            let _turn = take_turn();
+            m.json(&["run", "--sim"], &dir).1
+        };
+        assert!(v.get("error").is_none(), "{v}");
+        assert_eq!(v["venue"], "wokwi");
+        assert_eq!(v["check_status"], "passed", "{v}");
+        eprintln!("wokwi: run {} {}", v["name"], v["verdicts"]);
+    } else {
+        eprintln!("Wokwi half skipped: set WOKWI_CLI_TOKEN");
+    }
+}
+
+/// On a bare board a pin check is named as unseen: env-first-build's blink
+/// makes its run a partial pass, which the site does not count, and
+/// sandbox-hw-only (pin checks only) is posted as not run.
+#[test]
+#[ignore = "live site and board"]
+fn bench_pin_checks_are_named_unseen_and_not_counted() {
+    if !bench_ready() {
+        return;
+    }
+    let m = LiveMachine::new();
+    let dir = fetched(&m, LIVE_BANNER);
+    let v = {
+        let _turn = take_turn();
+        m.json(&["run", "--hw"], &dir).1
+    };
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(v["check_status"], "passed", "{v}");
+    assert_eq!(
+        (&v["checks_seen"], &v["checks_total"]),
+        (&serde_json::json!(1), &serde_json::json!(2))
+    );
+    assert_eq!(v["verdicts"][1]["id"], "blink-rate");
+    assert_eq!(v["verdicts"][1]["status"], "not_observable");
+    let deltas = v["site"]["concept_deltas"].as_array().unwrap();
+    assert!(
+        deltas.iter().all(|d| d["before"] == d["after"]),
+        "a partial pass is not counted: {v}"
+    );
+    eprintln!(
+        "partial pass: run {} attempt {}",
+        v["name"], v["site"]["attempt"]
+    );
+
+    let dir = fetched(&m, LIVE_HW_ONLY_PINS);
+    let v = {
+        let _turn = take_turn();
+        m.json(&["run", "--hw"], &dir).1
+    };
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(v["check_status"], "not_run", "{v}");
+    assert_eq!(
+        (&v["checks_seen"], &v["checks_total"]),
+        (&serde_json::json!(0), &serde_json::json!(2))
+    );
+    eprintln!(
+        "nothing seen: run {} attempt {}",
+        v["name"], v["site"]["attempt"]
+    );
+}
+
+/// The board's USB device, as sysfs knows it: the folder with `authorized`.
+fn usb_device_of(port: &str) -> Option<std::path::PathBuf> {
+    let tty = std::path::Path::new(port)
+        .file_name()?
+        .to_str()?
+        .to_string();
+    let mut dir = std::fs::canonicalize(format!("/sys/class/tty/{tty}/device")).ok()?;
+    while !dir.join("authorized").is_file() || !dir.join("idVendor").is_file() {
+        dir = dir.parent()?.to_path_buf();
+    }
+    Some(dir)
+}
+
+fn set_authorized(device: &std::path::Path, on: bool) {
+    let ok = Command::new("sudo")
+        .args(["-n", "tee"])
+        .arg(device.join("authorized"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            c.stdin
+                .take()
+                .unwrap()
+                .write_all(if on { b"1" } else { b"0" })?;
+            c.wait()
+        })
+        .is_ok_and(|s| s.success());
+    assert!(ok, "could not switch {} (needs sudo -n)", device.display());
+}
+
+/// The board is unplugged (its USB device de-authorised, which the kernel
+/// treats as a disconnect) a second into the capture: the run is posted
+/// as not run with `venue_unavailable`, never as failed.
+#[test]
+#[ignore = "live site and board"]
+fn bench_unplugging_the_board_mid_capture_is_not_run() {
+    if !bench_ready() {
+        return;
+    }
+    let port = std::env::var("TER_PORT").unwrap_or_else(|_| "/dev/ttyACM0".into());
+    let Some(device) = usb_device_of(&port) else {
+        panic!("no USB device behind {port}; set TER_PORT");
+    };
+    let m = LiveMachine::new();
+    let dir = fetched(&m, LIVE_BANNER);
+    let flash_log = dir.join(".runs/1/flash.log");
+    let unplug = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while !flash_log.exists() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(600));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        set_authorized(&device, false);
+        device
+    });
+    let (ok, v) = {
+        let _turn = take_turn();
+        m.json(&["run", "--hw"], &dir)
+    };
+    let device = unplug.join().unwrap();
+    set_authorized(&device, true);
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    assert_eq!(v["check_status"], "not_run", "never failed: {v}");
+    assert!(v["first_failure"].is_null() || v.get("first_failure").is_none());
+    let tail = v["transcript_tail"].as_str().unwrap();
+    assert_eq!(tail.lines().next(), Some("venue_unavailable"), "{tail}");
+    eprintln!(
+        "unplugged: run {} attempt {}\n{tail}",
+        v["name"], v["site"]["attempt"]
+    );
+}

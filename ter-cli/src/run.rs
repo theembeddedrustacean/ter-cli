@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use ter_check::{CheckFile, CheckStatus, CheckVerdict, REPORT_FILE};
 use ter_sdk::project::{Layout, TerToml, new_recording};
 use ter_sdk::run::{LastRun, RunAnswer, RunRecord};
+use ter_telemetry::local::Local;
 use ter_telemetry::wokwi::Wokwi;
 use ter_telemetry::{Capture, Venue, rfc3339_utc};
 
@@ -19,8 +20,8 @@ use crate::config::Config;
 use crate::output::{CliError, print_json};
 use crate::record::{Infra, Outcome, RunContext, assemble, file_sha256};
 use crate::session::Session;
-use crate::sim;
 use crate::telemetry::{RUN_CHECK, bad_check, check_recording};
+use crate::{hw, sim};
 
 pub const CHECK_YAML: &str = "check.yaml";
 pub const NO_CHECK_NOTE: &str = "This exercise has no automatic check yet. Run it with cargo run.";
@@ -40,13 +41,15 @@ enum Plan {
     BuildOnly,
     /// No check.yaml: build only, whatever the mode.
     NoCheck,
-    Wokwi(Box<Simulated>),
+    Wokwi(Box<Checked<sim::Ready>>),
+    Local(Box<Checked<hw::Ready>>),
 }
 
-struct Simulated {
+/// A checked run: the check.yaml, and the venue ready to run it.
+struct Checked<R> {
     file: CheckFile,
     text: String,
-    ready: sim::Ready,
+    ready: R,
 }
 
 /// The default venue of each mode, and the ones this ter can run.
@@ -88,11 +91,6 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
         Plan::BuildOnly
     } else if !check_path.is_file() {
         Plan::NoCheck
-    } else if venue == "local" {
-        return Err(CliError::new(
-            "venue_unavailable",
-            "This ter cannot run exercises on a board yet. `ter run --sim` runs it in Wokwi; `ter run --no-check` builds it and records the attempt.",
-        ));
     } else {
         let text = std::fs::read_to_string(&check_path).map_err(|e| {
             CliError::new(
@@ -101,8 +99,13 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
             )
         })?;
         let file = CheckFile::parse(&text).map_err(|e| bad_check(&check_path, e))?;
-        let ready = sim::ready(sim::plan(&dir, &ter, &file)?)?;
-        Plan::Wokwi(Box::new(Simulated { file, text, ready }))
+        if venue == "local" {
+            let ready = hw::ready(&dir)?;
+            Plan::Local(Box::new(Checked { file, text, ready }))
+        } else {
+            let ready = sim::ready(sim::plan(&dir, &ter, &file)?)?;
+            Plan::Wokwi(Box::new(Checked { file, text, ready }))
+        }
     };
 
     // Everything that would stop the post is checked before the build: a
@@ -117,12 +120,18 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
 
     let (number, recording) = new_recording(&dir)?;
     if !json {
-        let how = match plan {
-            Plan::BuildOnly => "build only",
-            Plan::NoCheck => "build only, no check.yaml",
-            Plan::Wokwi(_) => "then Wokwi",
+        let how = match &plan {
+            Plan::BuildOnly => "build only".to_string(),
+            Plan::NoCheck => "build only, no check.yaml".to_string(),
+            Plan::Wokwi(_) => "then Wokwi".to_string(),
+            Plan::Local(hw) => format!("then the board on {}", hw.ready.port.path),
         };
         eprintln!("Building {} ({mode}, {how})", ter.exercise);
+        if let Plan::Local(hw) = &plan
+            && let Some(note) = hw::unseen_note(&hw.file, &hw.ready.provides())
+        {
+            eprintln!("{note}");
+        }
     }
     let started = Instant::now();
     let layout = Layout::new(Config::load()?.courses_root);
@@ -140,12 +149,12 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
         },
         (Plan::BuildOnly, _) => Outcome::Built,
         (Plan::NoCheck, _) => Outcome::NoCheck,
-        (Plan::Wokwi(_), None) => Outcome::Infra {
+        (Plan::Wokwi(_) | Plan::Local(_), None) => Outcome::Infra {
             failure: Infra::VenueUnavailable,
             output: "cargo built no program to run".into(),
         },
         (Plan::Wokwi(sim), Some(elf)) => {
-            let Simulated { file, text, ready } = sim.as_ref();
+            let Checked { file, text, ready } = sim.as_ref();
             if !json {
                 eprintln!(
                     "Running {} ms in Wokwi (a few seconds more than that)",
@@ -153,14 +162,43 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
                 );
             }
             let t = Instant::now();
-            let capture = Capture {
-                target: ter.target.clone(),
-                cli_version: client.cli_version().to_string(),
-                elf_sha256: elf_sha256.clone().unwrap_or_default(),
-                ..Capture::default()
+            let mut wokwi = Wokwi {
+                cli: ready.cli.clone(),
+                token: ready.token.clone(),
+                run_dir: recording.to_path_buf(),
+                plan: ready.plan.clone(),
+                timeout_ms: file.timeout_ms,
+                capture: capture(&ter, client.cli_version(), &elf_sha256),
             };
-            let outcome = simulate(ready, file, text, elf, capture, &recording)?;
-            ran_in = Some(t.elapsed());
+            // wokwi-cli paces the simulation step by step over the network;
+            // allow it far longer than the simulated time.
+            let budget = Duration::from_secs(120) + Duration::from_millis(file.timeout_ms * 20);
+            let outcome = record_and_judge(&mut wokwi, file, text, elf, budget, &recording)?;
+            ran_in = Some((t.elapsed(), "in Wokwi"));
+            outcome
+        }
+        (Plan::Local(hw), Some(elf)) => {
+            let Checked { file, text, ready } = hw.as_ref();
+            if !json {
+                eprintln!(
+                    "Flashing with {} on {}, then {} ms of serial",
+                    ready.tool.program(),
+                    ready.port.path,
+                    file.timeout_ms
+                );
+            }
+            let t = Instant::now();
+            let mut local = Local::new(
+                ready.tool.clone(),
+                ready.program.clone(),
+                ready.port.clone(),
+                recording.to_path_buf(),
+                file.timeout_ms,
+            );
+            local.capture = capture(&ter, client.cli_version(), &elf_sha256);
+            let budget = Duration::from_millis(file.timeout_ms) + Duration::from_secs(5);
+            let outcome = record_and_judge(&mut local, file, text, elf, budget, &recording)?;
+            ran_in = Some((t.elapsed(), "on the board"));
             outcome
         }
     };
@@ -168,7 +206,7 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
         RunContext {
             ter: &ter,
             mode: &mode,
-            venue: matches!(plan, Plan::Wokwi(_)).then_some(venue),
+            venue: matches!(plan, Plan::Wokwi(_) | Plan::Local(_)).then_some(venue),
             elf_sha256,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             hints_used: previous.as_ref().map_or(0, |p| p.hints.used),
@@ -208,7 +246,17 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
             failure.as_ref(),
         ));
     } else {
-        print_text(&record, &answer, &outcome, build.duration, ran_in);
+        let sim_allowed = ter.modes.iter().any(|m| m == "simulation");
+        let local = matches!(plan, Plan::Local(_));
+        print_text(
+            &record,
+            &answer,
+            &outcome,
+            build.duration,
+            ran_in,
+            local,
+            sim_allowed,
+        );
     }
     match failure {
         Some(mut err) => {
@@ -219,30 +267,30 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
     }
 }
 
-/// Run the program in Wokwi, record the run into `recording`, and judge
+/// What every capture header carries, whatever the venue.
+fn capture(ter: &TerToml, cli_version: &str, elf_sha256: &Option<String>) -> Capture {
+    Capture {
+        target: ter.target.clone(),
+        cli_version: cli_version.to_string(),
+        elf_sha256: elf_sha256.clone().unwrap_or_default(),
+        ..Capture::default()
+    }
+}
+
+/// Run the program on `venue`, record the run into `recording`, and judge
 /// the recording.
-fn simulate(
-    ready: &sim::Ready,
+fn record_and_judge(
+    venue: &mut dyn Venue,
     file: &CheckFile,
     text: &str,
     elf: &Path,
-    capture: Capture,
+    budget: Duration,
     recording: &Path,
 ) -> Result<Outcome, CliError> {
-    let mut wokwi = Wokwi {
-        cli: ready.cli.clone(),
-        token: ready.token.clone(),
-        run_dir: recording.to_path_buf(),
-        plan: ready.plan.clone(),
-        timeout_ms: file.timeout_ms,
-        capture,
-    };
-    // wokwi-cli paces the simulation step by step over the network; allow
-    // it far longer than the simulated time.
-    let budget = Duration::from_secs(120) + Duration::from_millis(file.timeout_ms * 20);
-    let recorded = wokwi
+    let recorded = venue
         .prepare(elf)
-        .and_then(|()| wokwi.run(&file.stimuli(), budget));
+        .and_then(|()| venue.reset())
+        .and_then(|()| venue.run(&file.stimuli(), budget));
     let rec = match recorded {
         Ok(rec) => rec,
         Err(e) => {
@@ -335,7 +383,7 @@ fn answer_json(
     out
 }
 
-fn print_verdicts(verdicts: &[CheckVerdict]) {
+fn print_verdicts(verdicts: &[CheckVerdict], sim_allowed: bool) {
     let width = verdicts.iter().map(|v| v.id.len()).max().unwrap_or(0);
     for v in verdicts {
         let status = match v.status {
@@ -348,17 +396,41 @@ fn print_verdicts(verdicts: &[CheckVerdict]) {
             v.id, v.expected, v.observed
         );
     }
+    if let Some(line) = partial_line(verdicts, sim_allowed) {
+        println!("{line}");
+    }
+}
+
+/// The line that says a run could not see every check, if it could not.
+fn partial_line(verdicts: &[CheckVerdict], sim_allowed: bool) -> Option<String> {
     let seen = verdicts
         .iter()
         .filter(|v| v.status != CheckStatus::NotObservable)
         .count();
     let all_passed = verdicts.iter().all(|v| v.status != CheckStatus::Fail);
-    if seen < verdicts.len() && seen > 0 && all_passed {
-        println!(
-            "{seen} of {} checks seen on this setup, all passed. Full check: ter run --sim",
+    let full = if sim_allowed {
+        " Full check: ter run --sim"
+    } else {
+        ""
+    };
+    if seen == verdicts.len() || !all_passed {
+        None
+    } else if seen == 0 {
+        Some(format!(
+            "No check can be seen on this setup, so the run is posted as not run.{full}"
+        ))
+    } else {
+        Some(format!(
+            "{seen} of {} checks seen on this setup, all passed.{full}",
             verdicts.len()
-        );
+        ))
     }
+}
+
+/// The last `n` lines of what the board printed.
+fn serial_tail(transcript: &str, n: usize) -> String {
+    let lines: Vec<&str> = transcript.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 fn print_text(
@@ -366,12 +438,14 @@ fn print_text(
     answer: &RunAnswer,
     outcome: &Outcome,
     built_in: Duration,
-    ran_in: Option<Duration>,
+    ran_in: Option<(Duration, &str)>,
+    local: bool,
+    sim_allowed: bool,
 ) {
     if record.build_status == "passed" {
         print!("Built in {:.1} s.", built_in.as_secs_f64());
-        if let Some(t) = ran_in {
-            print!(" Ran in Wokwi in {:.1} s.", t.as_secs_f64());
+        if let Some((t, venue)) = ran_in {
+            print!(" Ran {venue} in {:.1} s.", t.as_secs_f64());
         }
         println!();
     } else {
@@ -380,7 +454,18 @@ fn print_text(
     match outcome {
         Outcome::Built => println!("Not checked: --no-check builds only."),
         Outcome::NoCheck => println!("{NO_CHECK_NOTE}"),
-        Outcome::Checked { verdicts, .. } => print_verdicts(verdicts),
+        Outcome::Checked {
+            verdicts,
+            transcript,
+        } => {
+            if local && !transcript.trim().is_empty() {
+                println!("The board printed:");
+                for line in serial_tail(transcript, 20).lines() {
+                    println!("  | {line}");
+                }
+            }
+            print_verdicts(verdicts, sim_allowed)
+        }
         Outcome::Infra { .. } | Outcome::BuildFailed { .. } => {}
     }
     println!("Posted attempt {} to TER Learn.", answer.attempt);
@@ -418,6 +503,41 @@ pub fn exercise_dir(dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_pass_says_so_and_points_at_the_full_check() {
+        let v = |id: &str, status| CheckVerdict {
+            id: id.into(),
+            status,
+            expected: String::new(),
+            observed: String::new(),
+        };
+        use CheckStatus::{Fail, NotObservable, Pass};
+        let some = [
+            v("banner", Pass),
+            v("blink", NotObservable),
+            v("rate", NotObservable),
+        ];
+        assert_eq!(
+            partial_line(&some, true).unwrap(),
+            "1 of 3 checks seen on this setup, all passed. Full check: ter run --sim"
+        );
+        assert_eq!(
+            partial_line(&some, false).unwrap(),
+            "1 of 3 checks seen on this setup, all passed."
+        );
+        let none = [v("blink", NotObservable)];
+        assert!(
+            partial_line(&none, true)
+                .unwrap()
+                .starts_with("No check can be seen")
+        );
+        assert_eq!(partial_line(&[v("a", Pass)], true), None);
+        assert_eq!(
+            partial_line(&[v("a", Fail), v("b", NotObservable)], true),
+            None
+        );
+    }
 
     #[test]
     fn each_mode_has_its_venue() {

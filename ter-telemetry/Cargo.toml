@@ -9,8 +9,13 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+ter-flash.workspace = true
+serialport = "4.10"
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -7,10 +7,10 @@ them on your board or in a simulator, checks what the program did, and
 records the attempt on the site.
 
 This is an early version: pairing (`ter login`, `ter logout`,
-`ter whoami`), exercises (`ter ex`), checked runs in the Wokwi simulator
-(`ter run --sim`), build-only runs (`ter run --no-check`), `ter status`,
-`ter hint`, `ter telemetry check` and `ter self-update` work today.
-Running on your own board comes next.
+`ter whoami`), exercises (`ter ex`), checked runs on your own board
+(`ter run --hw`) and in the Wokwi simulator (`ter run --sim`), build-only
+runs (`ter run --no-check`), `ter venues`, `ter status`, `ter hint`,
+`ter telemetry check` and `ter self-update` work today.
 
 ## Install
 
@@ -30,8 +30,10 @@ ter ex list           the exercises in your courses (--course C for one)
 ter ex fetch <id>     fetch an exercise as a Cargo project
 ter ex clean          delete build output, keep the source
 ter ex remove <id>    delete an exercise's folder
+ter run --hw          build, flash your board, check, and record the run on the site
 ter run --sim         build, run in Wokwi, check, and record the run on the site
 ter run --no-check    build the exercise and record the attempt on the site
+ter venues            where this machine can run exercises, and what each sees
 ter telemetry check   judge a recorded run against a check.yaml, offline
 ter install wokwi-cli install Wokwi's simulator and store your Wokwi token
 ter status            your exercises and their last runs (--disk: disk use)
@@ -85,6 +87,25 @@ output. `ter run --no-check` builds only and posts the attempt as built
 but not checked. An exercise with no `check.yaml` builds only in either
 mode: "This exercise has no automatic check yet. Run it with cargo run."
 
+On hardware the program runs on your board, plugged in over USB. `ter`
+flashes it with the tool the exercise's `cargo run` uses (espflash or
+probe-rs; install it first, e.g. `cargo install espflash --locked`),
+then listens to the board's serial port for the check's time. On an ESP
+board `ter` resets the chip itself once the port is open, so it sees the
+program from its first line, and times in `check.yaml` count from that
+reset. If one board is plugged in `ter` finds it; with several, set
+`TER_PORT` to the one to use (on Linux you need to be in the `dialout`
+group). `ter venues` lists the boards and tools it sees.
+
+A bare board shows serial output only. Checks on pins, and checks that
+press a button, cannot be seen there: `ter` names them as unseen, and if
+every check it could see passed, the run is a partial pass (`1 of 2
+checks seen on this setup, all passed. Full check: ter run --sim`),
+posted with the counts so the site does not count it towards mastery. If
+no check can be seen, the board still runs and its output is shown, and
+the run is posted as not run. A flash that fails, or a board unplugged
+during the run, is posted as not run, never as failed.
+
 In simulation the program runs in [Wokwi](https://wokwi.com), on your own
 Wokwi account: `ter install wokwi-cli` installs `wokwi-cli` and stores
 your Wokwi CI token (from https://wokwi.com/dashboard/ci) the way it
@@ -96,9 +117,10 @@ never changed. If Wokwi cannot be reached, refuses the token or your
 account is out of simulation time, the run is posted as not run, never as
 failed.
 
-Every checked run is a recording in `.runs/<n>/`: the build log, the run's
-circuit and scenario, what Wokwi captured (`wokwi.vcd`, `serial.log`),
-the event stream (`events.jsonl`), the `check.yaml` it was judged against
+Every checked run is a recording in `.runs/<n>/`: the build log; on a
+board, what the flashing tool printed (`flash.log`) and the raw serial
+bytes (`serial.log`); in Wokwi, the run's circuit and scenario and what
+Wokwi captured (`wokwi.vcd`, `serial.log`); the event stream (`events.jsonl`), the `check.yaml` it was judged against
 and the verdicts (`check.toml`). `ter telemetry check .runs/<n> --check
 check.yaml` judges a recording again with no simulator and no account,
 and prints the same `check.toml`; after a change to `check.yaml` it shows

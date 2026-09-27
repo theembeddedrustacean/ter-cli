@@ -9,6 +9,7 @@
 //! through that service's own command line tool.
 
 pub mod event;
+pub mod local;
 pub mod recording;
 pub mod vcd;
 pub mod venue;

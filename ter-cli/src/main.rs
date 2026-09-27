@@ -7,6 +7,7 @@ mod build;
 mod config;
 mod exercises;
 mod hint;
+mod hw;
 mod install;
 mod login;
 mod output;
@@ -18,6 +19,7 @@ mod sim;
 mod status;
 mod telemetry;
 mod token_store;
+mod venues;
 mod whoami;
 
 use exercises::CleanScope;
@@ -63,7 +65,8 @@ enum Command {
         /// Run on hardware this time, whatever ter.toml's `mode` says.
         #[arg(long)]
         hw: bool,
-        /// Where to run within the mode: `wokwi` in simulation.
+        /// Where to run within the mode: `local` (your board on USB) on
+        /// hardware, `wokwi` in simulation.
         #[arg(long)]
         venue: Option<String>,
         /// Build only: post the attempt without running or checking it.
@@ -81,6 +84,8 @@ enum Command {
         /// The exercise folder; the one you are in by default.
         dir: Option<PathBuf>,
     },
+    /// Where this machine can run exercises, and what each place can see.
+    Venues,
     /// Recorded runs: judge one against a check.yaml, offline.
     Telemetry {
         #[command(subcommand)]
@@ -199,6 +204,7 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
         Command::Status { disk: true } => status::disk(json),
         Command::Status { disk: false } => status::status(json).await,
         Command::Hint { dir } => hint::hint(dir, json).await,
+        Command::Venues => venues::run(json),
         Command::Telemetry {
             command: TelemetryCommand::Check { recording, check },
         } => telemetry::check(recording, check, json),
