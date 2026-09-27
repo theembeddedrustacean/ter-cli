@@ -175,6 +175,22 @@ async fn mock_site() -> MockServer {
     )
     .mount(&server)
     .await;
+    // What the site sends once scaffolds carry a lock file and `exercise`
+    // says which modes are allowed.
+    let mut with_lock_and_modes = exercise(
+        "sim-only--xiao-esp32c3-nostd",
+        scaffold_files(Some(&format!(
+            "[target.riscv32imc-unknown-none-elf]\nrunner = \"{RUNNER}\"\n"
+        ))),
+    );
+    with_lock_and_modes["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"path": "Cargo.lock", "content": "version = 4\n", "encoding": "utf8"}));
+    with_lock_and_modes["modes"] = json!(["simulation"]);
+    exercise_answer("sim-only--xiao-esp32c3-nostd", ok(with_lock_and_modes))
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("{API}.exercise")))
         .and(header("authorization", "Bearer revoked-token"))
@@ -370,6 +386,28 @@ async fn fetch_with_a_revoked_stored_token_forgets_it() {
     assert!(!o.status.success());
     assert!(stderr(&o).contains("Token revoked."), "{}", stderr(&o));
     assert!(!token_file.exists());
+}
+
+#[tokio::test]
+async fn fetch_uses_the_sites_modes_and_writes_its_lock_file() {
+    let site = mock_site().await;
+    let m = Machine::new();
+    let id = "sim-only--xiao-esp32c3-nostd";
+    let (ok, v) = m.json(&site.uri(), &["ex", "fetch", id]);
+    assert!(ok, "{v}");
+    assert_eq!(v["modes"], json!(["simulation"]));
+    assert_eq!(v["mode"], "simulation");
+    let dir = m.exercise_dir("unlisted", id);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("Cargo.lock")).unwrap(),
+        "version = 4\n"
+    );
+
+    // Cargo may rewrite the lock file; that is not an edit.
+    std::fs::write(dir.join("Cargo.lock"), "version = 4\n# updated by cargo\n").unwrap();
+    let (ok, v) = m.json(&site.uri(), &["ex", "remove", id]);
+    assert!(ok, "{v}");
+    assert_eq!(v["edited"], false);
 }
 
 #[tokio::test]
