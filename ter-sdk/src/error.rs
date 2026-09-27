@@ -33,6 +33,11 @@ pub enum Error {
     NoToken,
 
     #[error(
+        "The pairing code expired before it was approved. Run `ter login` again for a fresh one."
+    )]
+    PairingExpired,
+
+    #[error(
         "ter {current} is older than the oldest version the site accepts ({minimum}). Run `ter self-update`."
     )]
     Outdated { current: String, minimum: String },
@@ -45,6 +50,7 @@ impl Error {
             Error::Server { .. } | Error::UnexpectedAnswer { .. } => "server_error",
             Error::Network(_) => "network_error",
             Error::NoToken => "no_token",
+            Error::PairingExpired => "pairing_expired",
             Error::Outdated { .. } => "outdated",
         }
     }

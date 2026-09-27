@@ -8,9 +8,17 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const API: &str = "/api/method/ter_courses.api";
 
+/// `ter`, kept away from the system keychain so no test reads or writes a
+/// developer's real token.
+fn bin() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ter"));
+    cmd.env("TER_KEYCHAIN", "off");
+    cmd
+}
+
 fn ter(site: &str, token: Option<&str>, args: &[&str]) -> Output {
     let config = tempfile::tempdir().unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ter"));
+    let mut cmd = bin();
     cmd.args(args)
         .env("TER_SITE_URL", site)
         .env("TER_CONFIG_DIR", config.path())
@@ -159,7 +167,7 @@ fn whoami_without_token_is_no_token() {
 fn bad_config_file_is_config_error() {
     let config = tempfile::tempdir().unwrap();
     std::fs::write(config.path().join("config.toml"), "not toml [").unwrap();
-    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+    let o = bin()
         .args(["whoami", "--json"])
         .env("TER_CONFIG_DIR", config.path())
         .env_remove("TER_SITE_URL")
@@ -179,7 +187,7 @@ fn self_update_prints_a_reinstall_command() {
             .to_string(),
     )
     .unwrap();
-    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+    let o = bin()
         .args(["self-update", "--json"])
         .env("CARGO_HOME", cargo_home.path())
         .output()
@@ -254,7 +262,7 @@ async fn below_minimum_gets_the_outdated_warning_not_the_notice() {
 #[test]
 fn commands_without_ping_print_no_notice() {
     let cargo_home = tempfile::tempdir().unwrap();
-    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+    let o = bin()
         .arg("self-update")
         .env("CARGO_HOME", cargo_home.path())
         .output()

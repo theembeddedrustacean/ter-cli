@@ -6,7 +6,8 @@ Learn account, fetches exercises as small Cargo projects, builds and runs
 them on your board or in a simulator, checks what the program did, and
 records the attempt on the site.
 
-This is an early version: `ter whoami` and `ter self-update` work today.
+This is an early version: `ter login`, `ter logout`, `ter whoami` and
+`ter self-update` work today.
 
 ## Install
 
@@ -14,11 +15,13 @@ This is an early version: `ter whoami` and `ter self-update` work today.
 cargo install --git <repository URL> ter-cli
 ```
 
-On Debian and Ubuntu, install `pkg-config libdbus-1-dev libudev-dev` first.
+On Debian and Ubuntu, install `pkg-config libudev-dev` first.
 
 ## Use
 
 ```
+ter login             pair this machine with your TER Learn account
+ter logout            remove this machine's device token
 ter whoami            the account, courses and versions
 ter self-update       how to update ter
 ```
@@ -26,7 +29,21 @@ ter self-update       how to update ter
 Every command takes `--json`. On failure `ter` exits non-zero and prints a
 stable error code (`token_invalid`, `not_enrolled`, `outdated`, ...).
 
-Until `ter login` lands, set `TER_TOKEN` to a device token.
+`ter login` prints a short code and a link to the site's `/cli` page (and
+opens it when there is a browser; `--no-browser` skips that). Approve the
+code there while signed in, and `ter` receives a device token. No password
+ever reaches `ter`.
+
+The token is kept in the system keychain: Keychain on macOS, Credential
+Manager on Windows, the Secret Service (GNOME Keyring, KWallet) on Linux.
+Where there is none, as on a headless machine or WSL, it goes to
+`~/.config/ter/token`, readable only by you, and `ter login` says so.
+`TER_KEYCHAIN=off` always uses the file. `ter logout` removes the token
+from both; to cut the device off on the site as well, revoke it on your
+Devices page. When the site reports the token revoked or expired, `ter`
+removes it and asks you to `ter login` again.
+
+`TER_TOKEN`, when set, is used instead of the stored token.
 
 ## Configuration
 

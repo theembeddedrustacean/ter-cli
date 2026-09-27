@@ -6,6 +6,7 @@
 mod client;
 mod envelope;
 mod error;
+pub mod pairing;
 pub mod version;
 
 pub use client::{Client, Course, Enrollments, Lesson, Ping};

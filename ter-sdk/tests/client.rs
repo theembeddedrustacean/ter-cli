@@ -1,8 +1,9 @@
 //! The client against a local mock of the site.
 
 use serde_json::{Value, json};
+use ter_sdk::pairing::PollStatus;
 use ter_sdk::{Client, Error};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const API: &str = "/api/method/ter_courses.api";
@@ -165,4 +166,71 @@ async fn lesson_exercise_may_be_an_object() {
     let client = Client::new(&server.uri(), Some("t".into()), "0.1.0").unwrap();
     let e = client.enrollments().await.unwrap();
     assert_eq!(e.courses[0].lessons.len(), 2);
+}
+
+#[tokio::test]
+async fn pairing_calls_need_no_token_and_send_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("{API}.pair_start")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"message": {"code": "WXYZ-1234", "expires_in": 600}})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{API}.pair_poll")))
+        .and(query_param("code", "WXYZ-1234"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"message": {"status": "approved", "token": "fresh"}})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(&server.uri(), None, "0.1.0").unwrap();
+    let start = client.pair_start().await.unwrap();
+    assert_eq!(start.code, "WXYZ-1234");
+    assert_eq!(start.expires_in, 600);
+    assert_eq!(
+        client.pair_poll(&start.code).await.unwrap(),
+        PollStatus::Approved {
+            token: "fresh".into()
+        }
+    );
+    for req in server.received_requests().await.unwrap() {
+        assert!(!req.headers.contains_key("authorization"), "{req:?}");
+        assert_eq!(req.headers["user-agent"], "ter-cli/0.1.0");
+    }
+}
+
+#[tokio::test]
+async fn pair_start_rate_limited_is_the_site_code() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("{API}.pair_start")))
+        .respond_with(
+            ResponseTemplate::new(429).set_body_json(json!({"message": {"error": {
+                "code": "rate_limited", "message": "Too many pairing codes. Try again later."
+            }}})),
+        )
+        .mount(&server)
+        .await;
+    let client = Client::new(&server.uri(), None, "0.1.0").unwrap();
+    assert_eq!(
+        client.pair_start().await.unwrap_err().code(),
+        "rate_limited"
+    );
+}
+
+#[test]
+fn pairing_url_carries_the_code() {
+    let client = Client::new("https://learn.example.com/", None, "0.1.0").unwrap();
+    assert_eq!(
+        client.pairing_url("WXYZ-1234"),
+        "https://learn.example.com/cli?code=WXYZ-1234"
+    );
 }

@@ -21,6 +21,19 @@ serde_json.workspace = true
 ter-sdk.workspace = true
 tokio.workspace = true
 toml.workspace = true
+webbrowser.workspace = true
+keyring-core = "1"
+
+# The system keychain on each platform. Where none is reachable the token
+# goes to a mode 600 file instead.
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -4,6 +4,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
+use crate::pairing::{PairStart, PollStatus};
 use crate::{Error, envelope::parse_response, version::check_supported};
 
 /// The site's answer to `ping`: who the token belongs to and which CLI
@@ -62,6 +63,8 @@ pub struct Client {
 
 impl Client {
     pub fn new(site_url: &str, token: Option<String>, cli_version: &str) -> Result<Self, Error> {
+        reqwest::Url::parse(site_url)
+            .map_err(|e| Error::Network(format!("site URL {site_url:?} is not valid: {e}")))?;
         let http = reqwest::Client::builder()
             .user_agent(format!("ter-cli/{cli_version}"))
             .build()
@@ -102,6 +105,43 @@ impl Client {
 
     pub async fn enrollments(&self) -> Result<Enrollments, Error> {
         self.get("enrollments", &[]).await
+    }
+
+    /// Ask for a pairing code. Needs no token.
+    pub async fn pair_start(&self) -> Result<PairStart, Error> {
+        let req = self
+            .http
+            .post(self.endpoint("pair_start"))
+            .json(&serde_json::json!({}));
+        self.send("pair_start", req).await
+    }
+
+    /// Whether `code` has been approved yet. Needs no token.
+    pub async fn pair_poll(&self, code: &str) -> Result<PollStatus, Error> {
+        let req = self
+            .http
+            .get(self.endpoint("pair_poll"))
+            .query(&[("code", code)]);
+        self.send("pair_poll", req).await
+    }
+
+    /// The page where the learner approves `code`, with the code filled in.
+    pub fn pairing_url(&self, code: &str) -> String {
+        let mut url = reqwest::Url::parse(&format!("{}/cli", self.site_url))
+            .expect("the site URL was parsed when the client was built");
+        url.query_pairs_mut().append_pair("code", code);
+        url.into()
+    }
+
+    /// A client for the same site and CLI version with another token.
+    pub fn with_token(&self, token: String) -> Self {
+        Self {
+            http: self.http.clone(),
+            site_url: self.site_url.clone(),
+            token: Some(token),
+            cli_version: self.cli_version.clone(),
+            ping: OnceCell::new(),
+        }
     }
 
     /// GET a token endpoint.
