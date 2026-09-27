@@ -1,0 +1,32 @@
+venue = "wokwi"
+instruments = []
+target = "xiao-esp32c3-nostd"
+cli_version = "0.1.0"
+elf_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+check_sha256 = "9413c04a44b1487024de1e62afa23f2de3a82eb334554c89656ee1d97d534755"
+started_at = "2026-09-27T12:00:00Z"
+ended_at = "2026-09-27T12:00:09Z"
+
+[[verdict]]
+id = "reading-line"
+status = "fail"
+expected = '"Reading: " on serial within 2000 ms'
+observed = "not printed"
+
+[[verdict]]
+id = "led-state-line"
+status = "fail"
+expected = '", LED: " on serial within 2000 ms'
+observed = "not printed"
+
+[[verdict]]
+id = "keeps-reporting"
+status = "fail"
+expected = '"Reading: " on serial from 3000 ms on'
+observed = "not printed"
+
+[[verdict]]
+id = "led-steady"
+status = "pass"
+expected = "at most 2 level changes between 600 and 5000 ms"
+observed = "no level changes"

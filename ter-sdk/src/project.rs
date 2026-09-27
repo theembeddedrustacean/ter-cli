@@ -13,6 +13,7 @@
 //!     .runs/            one recording per run
 //! ```
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -101,6 +102,10 @@ pub struct TerToml {
     pub venue: Option<String>,
     /// Of the source as fetched, to tell an edited exercise from a fresh one.
     pub fetched_sha256: String,
+    /// The target's pin names and their GPIOs, from the site at fetch.
+    /// Checks name pins; a simulator wires GPIOs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pins: BTreeMap<String, String>,
 }
 
 const TER_TOML_HEADER: &str = "\
@@ -253,6 +258,7 @@ pub struct Scaffold {
     pub files: Vec<(PathBuf, Vec<u8>)>,
     /// The `runner` its `.cargo/config.toml` sets.
     pub runner: String,
+    pub pins: BTreeMap<String, String>,
 }
 
 impl Scaffold {
@@ -300,6 +306,7 @@ impl Scaffold {
             target: ex.target.clone(),
             files,
             runner,
+            pins: ex.pins.clone(),
         })
     }
 
@@ -371,6 +378,7 @@ impl Scaffold {
             modes,
             venue: None,
             fetched_sha256: source_sha256(dir)?,
+            pins: self.pins.clone(),
         };
         ter.save(dir)?;
         Ok(ter)
@@ -611,6 +619,7 @@ mod tests {
             instructions_md: String::new(),
             files,
             modes: None,
+            pins: BTreeMap::from([("user_led".into(), "GPIO3".into())]),
         }
     }
 
@@ -647,6 +656,7 @@ mod tests {
         assert_eq!(f.ter.target, "xiao-esp32c3-nostd");
         assert_eq!(f.ter.modes, ["hardware", "simulation"]);
         assert_eq!(f.ter.mode, "hardware");
+        assert_eq!(f.ter.pins["user_led"], "GPIO3", "the pin map is kept");
         assert!(!f.is_edited().unwrap());
         // No staging folder is left behind.
         let names: Vec<_> = std::fs::read_dir(root.path().join("esp-gpio"))
@@ -692,12 +702,17 @@ mod tests {
             mode: "simulation".into(),
             venue: Some("local".into()),
             fetched_sha256: "ab".repeat(32),
+            pins: BTreeMap::from([
+                ("user_button".into(), "GPIO5".into()),
+                ("user_led".into(), "GPIO3".into()),
+            ]),
         };
         ter.save(dir.path()).unwrap();
         assert_eq!(TerToml::load(dir.path()).unwrap(), ter);
         let text = std::fs::read_to_string(dir.path().join(TER_TOML)).unwrap();
         assert!(text.starts_with("# Written by `ter ex fetch`."), "{text}");
         assert!(text.contains("exercise = \"gpio-button-led\""), "{text}");
+        assert!(text.contains("[pins]\nuser_button = \"GPIO5\""), "{text}");
 
         let no_venue = TerToml { venue: None, ..ter };
         no_venue.save(dir.path()).unwrap();
@@ -962,6 +977,7 @@ mod tests {
             mode: "hardware".into(),
             venue: None,
             fetched_sha256: String::new(),
+            pins: BTreeMap::new(),
         };
         let env = layout.cargo_env(&ter, Path::new("/elsewhere/e"));
         assert_eq!(

@@ -7,9 +7,10 @@ them on your board or in a simulator, checks what the program did, and
 records the attempt on the site.
 
 This is an early version: pairing (`ter login`, `ter logout`,
-`ter whoami`), exercises (`ter ex`), build-only runs (`ter run --no-check`),
-`ter status`, `ter hint` and `ter self-update` work today. Running on a
-board or in a simulator comes next.
+`ter whoami`), exercises (`ter ex`), checked runs in the Wokwi simulator
+(`ter run --sim`), build-only runs (`ter run --no-check`), `ter status`,
+`ter hint`, `ter telemetry check` and `ter self-update` work today.
+Running on your own board comes next.
 
 ## Install
 
@@ -29,7 +30,10 @@ ter ex list           the exercises in your courses (--course C for one)
 ter ex fetch <id>     fetch an exercise as a Cargo project
 ter ex clean          delete build output, keep the source
 ter ex remove <id>    delete an exercise's folder
+ter run --sim         build, run in Wokwi, check, and record the run on the site
 ter run --no-check    build the exercise and record the attempt on the site
+ter telemetry check   judge a recorded run against a check.yaml, offline
+ter install wokwi-cli install Wokwi's simulator and store your Wokwi token
 ter status            your exercises and their last runs (--disk: disk use)
 ter hint              the next hint for the last run
 ter self-update       how to update ter
@@ -73,11 +77,32 @@ source since fetching, it refuses unless you add `--force`.
 
 ### Runs and hints
 
-`ter run --no-check` in an exercise folder builds it (into the course's
-shared cache) and posts the attempt to TER Learn: a failed build with the
-end of the compiler output, a good build as built but not checked. `--sim`
-or `--hw` picks the mode for one run instead of `ter.toml`'s. Each run's
-build log is kept in `.runs/<n>/build.log` in the exercise.
+`ter run` in an exercise folder builds it (into the course's shared
+cache), runs it, checks it against the exercise's `check.yaml` and posts
+the run to TER Learn. `--sim` or `--hw` picks the mode for one run instead
+of `ter.toml`'s. A failed build is posted with the end of the compiler
+output. `ter run --no-check` builds only and posts the attempt as built
+but not checked. An exercise with no `check.yaml` builds only in either
+mode: "This exercise has no automatic check yet. Run it with cargo run."
+
+In simulation the program runs in [Wokwi](https://wokwi.com), on your own
+Wokwi account: `ter install wokwi-cli` installs `wokwi-cli` and stores
+your Wokwi CI token (from https://wokwi.com/dashboard/ci) the way it
+stores the TER token; `WOKWI_CLI_TOKEN`, when set, is used instead. The
+exercise's circuit (`diagram.json`) is copied into the run folder with a
+logic analyzer added on the pins the checks watch, and a scenario presses
+the buttons the check names at the times it gives. Your `diagram.json` is
+never changed. If Wokwi cannot be reached, refuses the token or your
+account is out of simulation time, the run is posted as not run, never as
+failed.
+
+Every checked run is a recording in `.runs/<n>/`: the build log, the run's
+circuit and scenario, what Wokwi captured (`wokwi.vcd`, `serial.log`),
+the event stream (`events.jsonl`), the `check.yaml` it was judged against
+and the verdicts (`check.toml`). `ter telemetry check .runs/<n> --check
+check.yaml` judges a recording again with no simulator and no account,
+and prints the same `check.toml`; after a change to `check.yaml` it shows
+what the new check makes of the old run.
 
 `ter hint` asks the site for the next hint on the last run posted from
 the folder; the next `ter run` reports how many you took. `ter status` in
@@ -125,7 +150,8 @@ that reaches the network; `scripts/check-deps.sh` enforces it.
 scripts/check.sh                 fmt, clippy, tests, dependency rule
 scripts/check.sh --live          plus tests against the live site (needs TER_TOKEN;
                                  TER_CURRICULUM=<checkout> adds the --dev and
-                                 solution build checks)
+                                 solution build checks; WOKWI_CLI_TOKEN with
+                                 TER_CURRICULUM adds the Wokwi runs)
 scripts/check.sh --install-hook  pre-commit hook running the fast part
 ```
 

@@ -1,0 +1,4 @@
+{"capture":{"venue":"wokwi","instruments":[],"target":"xiao-esp32c3-nostd","provides":["serial","pins","reset","stimulus"],"pins":["user_led"],"stimuli":[{"at_ms":1000,"kind":"press","name":"user_button"},{"at_ms":2500,"kind":"release","name":"user_button"}],"end_us":4000000,"cli_version":"0.1.0","elf_sha256":"0000000000000000000000000000000000000000000000000000000000000000","started_at":"2026-09-27T12:00:00Z","ended_at":"2026-09-27T12:00:09Z"}}
+{"t_us":0,"kind":"reset"}
+{"t_us":0,"kind":"pin_edge","name":"user_led","level":"low"}
+{"t_us":1008000,"kind":"pin_edge","name":"user_led","level":"high"}

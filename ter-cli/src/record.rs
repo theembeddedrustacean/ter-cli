@@ -8,16 +8,14 @@
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
+use ter_check::{CheckStatus, CheckVerdict};
 use ter_sdk::project::TerToml;
 use ter_sdk::run::{RunRecord, TAIL_LIMIT, tail, transcript_with_code};
+use ter_telemetry::VenueFailure;
 
 use crate::output::CliError;
 
 /// A failure of where the program runs, not of the program.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "reported by venues; a build-only run has none")
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Infra {
     /// The venue is not reachable or died mid-capture; also a provider
@@ -25,6 +23,16 @@ pub enum Infra {
     VenueUnavailable,
     BenchOffline,
     FlashFailed,
+}
+
+impl From<VenueFailure> for Infra {
+    fn from(f: VenueFailure) -> Self {
+        match f {
+            VenueFailure::Unavailable => Infra::VenueUnavailable,
+            VenueFailure::BenchOffline => Infra::BenchOffline,
+            VenueFailure::FlashFailed => Infra::FlashFailed,
+        }
+    }
 }
 
 impl Infra {
@@ -51,12 +59,15 @@ pub enum Outcome {
     BuildFailed { log: String },
     /// It built and nothing ran (`--no-check`).
     Built,
+    /// It built, and the exercise has no check.yaml to run it against.
+    NoCheck,
     /// It built, and the venue failed; `output` is what it said.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "reported by venues; a build-only run has none")
-    )]
     Infra { failure: Infra, output: String },
+    /// It ran and was judged. `transcript` is what the module printed.
+    Checked {
+        verdicts: Vec<CheckVerdict>,
+        transcript: String,
+    },
 }
 
 /// Everything about a run that is not its outcome.
@@ -93,11 +104,48 @@ pub fn assemble(ctx: RunContext<'_>, outcome: &Outcome) -> RunRecord {
             record.elf_sha256 = None;
         }
         Outcome::Built => {}
+        Outcome::NoCheck => {
+            record.checks_seen = Some(0);
+            record.checks_total = Some(0);
+        }
         Outcome::Infra { failure, output } => {
             record.transcript_tail = Some(transcript_with_code(failure.code(), output));
         }
+        Outcome::Checked {
+            verdicts,
+            transcript,
+        } => {
+            let seen: Vec<&CheckVerdict> = verdicts
+                .iter()
+                .filter(|v| v.status != CheckStatus::NotObservable)
+                .collect();
+            record.checks_seen = Some(count(seen.len()));
+            record.checks_total = Some(count(verdicts.len()));
+            record.transcript_tail = Some(tail(transcript, TAIL_LIMIT).to_string());
+            record.check_status =
+                if let Some(v) = seen.iter().find(|v| v.status == CheckStatus::Fail) {
+                    record.first_failure = Some(first_failure(v));
+                    "failed"
+                } else if seen.is_empty() {
+                    "not_run"
+                } else {
+                    // Some unseen with every seen one passed is a partial pass:
+                    // the counts tell the site not to count it.
+                    "passed"
+                }
+                .into();
+        }
     }
     record
+}
+
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// The run record's `first_failure`: `{id, expected, observed}` as JSON.
+pub fn first_failure(v: &CheckVerdict) -> String {
+    serde_json::json!({"id": v.id, "expected": v.expected, "observed": v.observed}).to_string()
 }
 
 /// sha256 of the built program, lowercase hex.
@@ -127,6 +175,7 @@ mod tests {
             mode: "hardware".into(),
             venue: None,
             fetched_sha256: String::new(),
+            pins: Default::default(),
         }
     }
 
@@ -194,6 +243,80 @@ mod tests {
             assert_eq!(t.lines().next(), Some(failure.code()));
             assert!(t.chars().count() <= TAIL_LIMIT);
         }
+    }
+
+    fn v(id: &str, status: CheckStatus) -> CheckVerdict {
+        CheckVerdict {
+            id: id.into(),
+            status,
+            expected: format!("{id} expected"),
+            observed: format!("{id} observed"),
+        }
+    }
+
+    fn checked(verdicts: Vec<CheckVerdict>) -> RunRecord {
+        let ter = ter();
+        assemble(
+            ctx(&ter),
+            &Outcome::Checked {
+                verdicts,
+                transcript: "Hello world!\n".into(),
+            },
+        )
+    }
+
+    use CheckStatus::{Fail, NotObservable, Pass};
+
+    #[test]
+    fn all_seen_and_passed_is_passed() {
+        let r = checked(vec![v("a", Pass), v("b", Pass)]);
+        assert_eq!(r.check_status, "passed");
+        assert_eq!((r.checks_seen, r.checks_total), (Some(2), Some(2)));
+        assert_eq!(r.first_failure, None);
+        assert_eq!(r.transcript_tail.as_deref(), Some("Hello world!\n"));
+    }
+
+    #[test]
+    fn the_first_seen_failure_is_the_first_failure() {
+        let r = checked(vec![
+            v("a", Pass),
+            v("b", NotObservable),
+            v("c", Fail),
+            v("d", Fail),
+        ]);
+        assert_eq!(r.check_status, "failed");
+        let ff: serde_json::Value =
+            serde_json::from_str(r.first_failure.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            ff,
+            serde_json::json!({"id": "c", "expected": "c expected", "observed": "c observed"})
+        );
+        assert_eq!((r.checks_seen, r.checks_total), (Some(3), Some(4)));
+    }
+
+    #[test]
+    fn some_unseen_all_seen_passed_is_a_partial_pass() {
+        let r = checked(vec![v("a", Pass), v("b", NotObservable)]);
+        assert_eq!(r.check_status, "passed");
+        assert_eq!((r.checks_seen, r.checks_total), (Some(1), Some(2)));
+    }
+
+    #[test]
+    fn nothing_seen_is_not_run() {
+        let r = checked(vec![v("a", NotObservable)]);
+        assert_eq!(r.check_status, "not_run");
+        assert_eq!((r.checks_seen, r.checks_total), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn no_check_yaml_is_not_run_with_no_checks() {
+        let ter = ter();
+        let r = assemble(ctx(&ter), &Outcome::NoCheck);
+        assert_eq!(
+            (r.build_status.as_str(), r.check_status.as_str()),
+            ("passed", "not_run")
+        );
+        assert_eq!((r.checks_seen, r.checks_total), (Some(0), Some(0)));
     }
 
     #[test]

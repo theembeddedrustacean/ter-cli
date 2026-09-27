@@ -14,12 +14,93 @@ const COURSE: &str = "esp-gpio";
 const EXERCISE: &str = "gpio-blinky--xiao-esp32c3-nostd";
 const USER: &str = "learner@example.com";
 
+/// gpio-blinky's check, plus the banner the generated project prints.
+const HEARTBEAT_CHECK: &str = "\
+timeout_ms: 5500
+assert:
+  - id: banner
+    serial_contains: \"Hello world!\"
+    within_ms: 2000
+  - id: heartbeat-rate
+    pin: user_led
+    toggles_per_s: { min: 3.6, max: 4.4 }
+    window_ms: [900, 4900]
+  - id: flash-width
+    pin: user_led
+    pulse_width_ms: { min: 80, max: 120 }
+    window_ms: [900, 4900]
+";
+
+/// The course's uFerris circuit, trimmed to the LED and the button.
+const UFERRIS: &str = r#"{
+  "version": 1,
+  "parts": [
+    {"type": "board-xiao-esp32-c3", "id": "xiao", "top": 60, "left": 0, "attrs": {}},
+    {"type": "wokwi-led", "id": "led1", "top": -30, "left": 140, "attrs": {"color": "red"}},
+    {"type": "wokwi-resistor", "id": "r1", "top": 30, "left": 150, "attrs": {"value": "220"}},
+    {"type": "wokwi-pushbutton", "id": "btn1", "top": 120, "left": 150, "attrs": {"bounce": "0"}}
+  ],
+  "connections": [
+    ["xiao:D1", "r1:1", "green", []],
+    ["r1:2", "led1:A", "green", []],
+    ["led1:C", "xiao:GND", "black", []],
+    ["btn1:1.l", "xiao:D3", "orange", []],
+    ["btn1:2.l", "xiao:GND", "black", []]
+  ]
+}
+"#;
+
+/// Plays `wokwi-cli`'s part: prints the scenario's step markers around the
+/// program's serial output, writes the serial log and the VCD, and exits
+/// 42, its code for a run that reached `--timeout`. It keeps what it was
+/// given, for the test to look at.
+const FAKE_WOKWI_CLI: &str = r#"#!/bin/sh
+dir="$1"; shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --serial-log-file) serial="$2"; shift ;;
+    --vcd-file) vcd="$2"; shift ;;
+    --scenario) scenario="$2"; shift ;;
+    --timeout) timeout="$2"; shift ;;
+  esac
+  shift
+done
+here="$(dirname "$0")"
+[ "$WOKWI_CLI_TOKEN" = "fake-wokwi" ] || { echo "Error: bad token" >&2; exit 1; }
+cp "$dir/diagram.json" "$here/got-diagram.json"
+cp "$scenario" "$here/got-scenario.yaml"
+echo "$timeout" > "$here/got-timeout"
+code="$(cat "$here/exit-code")"
+if [ "$code" != 42 ]; then
+  echo "API Error: You have used up your monthly simulation minutes" >&2
+  exit "$code"
+fi
+printf '[ter-clock] Executing step: @0
+[ter-clock] delay 50ms
+'
+printf 'Hello world!
+'
+printf '[ter-clock] Executing step: @50
+[ter-clock] delay 50ms
+'
+printf '[ter-clock] Executing step: @100
+[ter-clock] delay 50ms
+'
+printf 'Hello world!
+' > "$serial"
+[ -z "$vcd" ] || cp "$here/fixture.vcd" "$vcd"
+echo "Timeout: simulation did not finish in ${timeout}ms" >&2
+exit 42
+"#;
+
 const GOOD: &str = "fn main() {\n    println!(\"blink\");\n}\n";
 const BROKEN: &str = "fn main() {\n    let _ = led;\n}\n";
 
 struct Machine {
     config: TempDir,
     courses: TempDir,
+    /// A stand-in for `wokwi-cli`, first on the PATH, when set.
+    fake_wokwi: Option<TempDir>,
 }
 
 impl Machine {
@@ -33,7 +114,11 @@ impl Machine {
             format!("courses_root = {:?}\n", courses.path()),
         )
         .unwrap();
-        let m = Self { config, courses };
+        let m = Self {
+            config,
+            courses,
+            fake_wokwi: None,
+        };
         let dir = m.exercise();
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(
@@ -62,15 +147,54 @@ impl Machine {
     }
 
     fn ter_in(&self, site: &str, args: &[&str], cwd: &Path) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_ter"))
-            .args(args)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ter"));
+        cmd.args(args)
             .current_dir(cwd)
             .env("TER_KEYCHAIN", "off")
             .env("TER_SITE_URL", site)
             .env("TER_CONFIG_DIR", self.config.path())
             .env("TER_TOKEN", "good-token")
-            .output()
-            .unwrap()
+            .env_remove("WOKWI_CLI_TOKEN");
+        if let Some(fake) = &self.fake_wokwi {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut dirs = vec![fake.path().to_path_buf()];
+            dirs.extend(std::env::split_paths(&path));
+            cmd.env("PATH", std::env::join_paths(dirs).unwrap())
+                .env("WOKWI_CLI_TOKEN", "fake-wokwi");
+        }
+        cmd.output().unwrap()
+    }
+
+    /// Make the exercise a simulated one: `check` as its check.yaml, the
+    /// uFerris circuit, the target's pins in ter.toml, and a fake
+    /// `wokwi-cli` that plays back `vcd` (a file in tests/fixtures/wokwi)
+    /// and exits with `exit_code`.
+    #[cfg(unix)]
+    fn simulated(mut self, check: &str, vcd: &str, exit_code: i32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.exercise();
+        std::fs::write(dir.join("check.yaml"), check).unwrap();
+        std::fs::write(dir.join("diagram.json"), UFERRIS).unwrap();
+        let mut ter = std::fs::read_to_string(dir.join("ter.toml")).unwrap();
+        ter.push_str("\n[pins]\nuser_led = \"GPIO3\"\nuser_button = \"GPIO5\"\n");
+        std::fs::write(dir.join("ter.toml"), ter).unwrap();
+
+        let fake = tempfile::tempdir().unwrap();
+        let script = fake.path().join("wokwi-cli");
+        std::fs::write(&script, FAKE_WOKWI_CLI).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/wokwi")
+            .join(vcd);
+        std::fs::copy(fixture, fake.path().join("fixture.vcd")).unwrap();
+        std::fs::write(fake.path().join("exit-code"), exit_code.to_string()).unwrap();
+        self.fake_wokwi = Some(fake);
+        self
+    }
+
+    fn fake_saw(&self, file: &str) -> String {
+        let fake = self.fake_wokwi.as_ref().unwrap();
+        std::fs::read_to_string(fake.path().join(file)).unwrap()
     }
 
     /// `ter <args> --json` in the exercise folder.
@@ -256,21 +380,52 @@ async fn an_outdated_ter_does_not_build_or_post() {
 }
 
 #[tokio::test]
-async fn running_on_a_venue_is_not_available_yet() {
+async fn a_checked_run_on_a_board_is_not_available_yet() {
     let server = site("0.1.0", run_answer()).await;
     let m = Machine::with_exercise(GOOD, &["hardware"]);
+    std::fs::write(m.exercise().join("check.yaml"), HEARTBEAT_CHECK).unwrap();
 
     let (ok, v) = m.json(&server.uri(), &["run"]);
 
     assert!(!ok);
     assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("--no-check")
-    );
+    assert!(v["error"]["message"].as_str().unwrap().contains("--sim"));
     assert!(posted(&server, "run").await.is_empty());
+    assert!(
+        !m.exercise().join(".runs").exists(),
+        "refused before the build"
+    );
+}
+
+#[tokio::test]
+async fn no_check_yaml_builds_only_in_either_mode() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]);
+
+    for mode in ["--sim", "--hw"] {
+        let (ok, v) = m.json(&server.uri(), &["run", mode]);
+        assert!(ok, "{v}");
+    }
+    let bodies = posted(&server, "run").await;
+    assert_eq!(bodies.len(), 2);
+    for (b, mode) in bodies.iter().zip(["simulation", "hardware"]) {
+        let p = &b["payload"];
+        assert_eq!(p["mode"], mode);
+        assert_eq!(p["build_status"], "passed");
+        assert_eq!(p["check_status"], "not_run");
+        assert_eq!(
+            (&p["checks_seen"], &p["checks_total"]),
+            (&json!(0), &json!(0))
+        );
+        assert!(p.get("venue").is_none(), "nothing ran: {p}");
+    }
+    let text = m.ter_in(&server.uri(), &["run", "--sim"], &m.exercise());
+    assert!(
+        String::from_utf8_lossy(&text.stdout)
+            .contains("This exercise has no automatic check yet. Run it with cargo run."),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
 }
 
 #[tokio::test]
@@ -410,4 +565,181 @@ async fn text_run_says_what_was_posted() {
     assert!(out.contains("GPIO output"), "{out}");
     assert!(err.contains("E0425"), "cargo's errors are shown: {err}");
     assert!(err.contains("error[build_failed]"), "{err}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_simulated_run_is_recorded_judged_and_posted() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        42,
+    );
+    let learners_diagram = std::fs::read_to_string(m.exercise().join("diagram.json")).unwrap();
+
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim"]);
+
+    assert!(ok, "{v}");
+    let p = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(p["mode"], "simulation");
+    assert_eq!(p["venue"], "wokwi");
+    assert_eq!(p["build_status"], "passed");
+    assert_eq!(p["check_status"], "passed", "{v}");
+    assert_eq!(
+        (&p["checks_seen"], &p["checks_total"]),
+        (&json!(3), &json!(3))
+    );
+    assert!(p.get("first_failure").is_none());
+    assert_eq!(p["transcript_tail"], "Hello world!\n");
+    assert_eq!(
+        v["verdicts"][1]["observed"],
+        "4 toggles per second (16 level changes)"
+    );
+    assert_eq!(v["verdicts"][2]["observed"], "8 pulses, 100 ms");
+
+    // The run copy of the circuit got the analyzer on the LED; the
+    // learner's did not.
+    let run = m.exercise().join(".runs/1");
+    let got: Value = serde_json::from_str(&m.fake_saw("got-diagram.json")).unwrap();
+    let conns = got["connections"].as_array().unwrap();
+    assert!(
+        conns.contains(&json!(["xiao:D1", "ter_logic:D0", "violet", []])),
+        "{got}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(m.exercise().join("diagram.json")).unwrap(),
+        learners_diagram
+    );
+    assert_eq!(m.fake_saw("got-timeout").trim(), "5500");
+    for f in [
+        "diagram.json",
+        "scenario.yaml",
+        "events.jsonl",
+        "check.toml",
+        "check.yaml",
+        "wokwi.vcd",
+        "build.log",
+    ] {
+        assert!(run.join(f).is_file(), "{f} is in the run folder");
+    }
+
+    // Re-checking the recording offline gives check.toml back byte for byte.
+    let o = m.ter_in(
+        "http://127.0.0.1:9",
+        &["telemetry", "check", ".runs/1", "--check", "check.yaml"],
+        &m.exercise(),
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(o.stdout, std::fs::read(run.join("check.toml")).unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_wrong_program_fails_the_right_check() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "even-blink.vcd",
+        42,
+    );
+
+    let (ok, v) = m.json(&server.uri(), &["run"]);
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "check_failed", "{v}");
+    let p = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(p["check_status"], "failed");
+    let ff: Value = serde_json::from_str(p["first_failure"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        ff,
+        json!({
+            "id": "heartbeat-rate",
+            "expected": "3.6 to 4.4 toggles per second between 900 and 4900 ms",
+            "observed": "2 toggles per second (8 level changes)"
+        })
+    );
+
+    // Offline, the same verdict, with a hint, and the same exit code.
+    let o = m.ter_in(
+        "http://127.0.0.1:9",
+        &["telemetry", "check", ".runs/1", "--check", "check.yaml"],
+        &m.exercise(),
+    );
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("hint: heartbeat-rate: expected"), "{err}");
+    assert!(err.contains("error[check_failed]"), "{err}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_wokwi_quota_failure_is_posted_as_not_run() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        1,
+    );
+
+    let (ok, v) = m.json(&server.uri(), &["run"]);
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    let p = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(p["check_status"], "not_run", "never failed");
+    assert!(p.get("first_failure").is_none());
+    let tail = p["transcript_tail"].as_str().unwrap();
+    assert_eq!(tail.lines().next(), Some("venue_unavailable"));
+    assert!(tail.contains("monthly simulation minutes"), "{tail}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn no_wokwi_token_stops_before_the_build() {
+    let server = site("0.1.0", run_answer()).await;
+    let mut m = Machine::with_exercise(GOOD, &["simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        42,
+    );
+    // Keep the circuit, lose the fake (and with it the token).
+    m.fake_wokwi = None;
+
+    let (ok, v) = m.json(&server.uri(), &["run"]);
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    assert!(posted(&server, "run").await.is_empty());
+    assert!(!m.exercise().join(".runs").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_press_is_scheduled_on_the_button_wired_to_the_pin() {
+    let server = site("0.1.0", run_answer()).await;
+    let check = "timeout_ms: 300\nsetup:\n  - press: user_button\n    at_ms: 120\n    hold_ms: 30\nassert:\n  - id: banner\n    serial_contains: \"Hello\"\n    within_ms: 200\n";
+    let m = Machine::with_exercise(GOOD, &["simulation"]).simulated(check, "heartbeat.vcd", 42);
+
+    let (ok, v) = m.json(&server.uri(), &["run"]);
+
+    assert!(ok, "{v}");
+    let scenario = m.fake_saw("got-scenario.yaml");
+    assert!(
+        scenario.contains("  - set-control:\n      part-id: btn1\n      control: pressed\n      value: 1\n  - name: \"@120\""),
+        "{scenario}"
+    );
+    assert!(
+        scenario.contains("value: 0\n  - name: \"@150\""),
+        "{scenario}"
+    );
+    let got: Value = serde_json::from_str(&m.fake_saw("got-diagram.json")).unwrap();
+    assert!(
+        !got["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["type"] == "wokwi-logic-analyzer"),
+        "no pin checks, no analyzer"
+    );
 }

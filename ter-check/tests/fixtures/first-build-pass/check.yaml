@@ -1,0 +1,15 @@
+# Checks that the generated project reached its loop: the banner it prints on
+# every pass, and the user LED toggling once per 500 ms wait. The program ships
+# complete, so a failure here is the environment, not the code.
+# Nothing is unobservable: no input, one LED, one serial line.
+timeout_ms: 7000
+assert:
+  - id: banner
+    serial_contains: "Hello world!"
+    within_ms: 2000
+  - id: blink-rate
+    pin: user_led
+    # One toggle per 500 ms wait is 2 per second; a 6 s window holds 12 toggles,
+    # so one cut at either end still lands inside the bounds.
+    toggles_per_s: { min: 1.8, max: 2.2 }
+    window_ms: [600, 6600]

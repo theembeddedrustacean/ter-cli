@@ -1,0 +1,20 @@
+venue = "wokwi"
+instruments = []
+target = "xiao-esp32c3-nostd"
+cli_version = "0.1.0"
+elf_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+check_sha256 = "9c373992488faa69224907bb7636f307999c59c7c811dcd59697c3e35075f37d"
+started_at = "2026-09-27T12:00:00Z"
+ended_at = "2026-09-27T12:00:09Z"
+
+[[verdict]]
+id = "banner"
+status = "pass"
+expected = '"Hello world!" on serial within 2000 ms'
+observed = "printed between 400 and 450 ms"
+
+[[verdict]]
+id = "blink-rate"
+status = "pass"
+expected = "1.8 to 2.2 toggles per second between 600 and 6600 ms"
+observed = "2 toggles per second (12 level changes)"

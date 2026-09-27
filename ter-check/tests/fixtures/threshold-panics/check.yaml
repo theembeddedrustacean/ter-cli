@@ -1,0 +1,21 @@
+# Checks the fixed words of the "Reading: N, LED: state" line, that the program
+# keeps reporting, and that LED 1 does not flicker. Phase 1 cannot drive the
+# light sensor, so which side of the thresholds the reading sits on, and so
+# whether the LED is lit, is whatever the circuit gives at rest and is not checked.
+timeout_ms: 5000
+assert:
+  - id: reading-line
+    serial_contains: "Reading: "
+    within_ms: 2000
+  - id: led-state-line
+    serial_contains: ", LED: "
+    within_ms: 2000
+  - id: keeps-reporting
+    serial_contains: "Reading: "
+    after_ms: 3000
+  # A steady reading with a 200 count gap between the thresholds changes the LED
+  # at most once after reset; a single threshold on a boundary reading would not.
+  - id: led-steady
+    pin: user_led
+    edge_count: { max: 2 }
+    window_ms: [600, 5000]

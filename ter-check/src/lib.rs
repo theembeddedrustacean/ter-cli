@@ -9,6 +9,16 @@
 //! local check enforces it.
 
 use serde::{Deserialize, Serialize};
+use ter_telemetry::Recording;
+
+pub mod eval;
+pub mod hints;
+pub mod report;
+pub mod spec;
+
+pub use eval::evaluate;
+pub use report::{REPORT_FILE, Report};
+pub use spec::CheckFile;
 
 /// The outcome of one check in `check.yaml`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +37,14 @@ pub struct CheckVerdict {
     pub status: CheckStatus,
     pub expected: String,
     pub observed: String,
+}
+
+/// Judge `rec` against the text of a `check.yaml`: the report `ter run`
+/// writes and `ter telemetry check` prints.
+pub fn check(check_yaml: &str, rec: &Recording) -> Result<Report, String> {
+    let file = CheckFile::parse(check_yaml)?;
+    let verdicts = evaluate(&file, rec);
+    Ok(Report::new(&rec.capture, check_yaml.as_bytes(), verdicts))
 }
 
 #[cfg(test)]

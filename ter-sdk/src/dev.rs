@@ -4,6 +4,7 @@
 //! exercise, so what `ter` writes is exactly what the sync would send the
 //! site: the same layers, generator and substitutions.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
@@ -15,6 +16,7 @@ use crate::project::ProjectError;
 
 const SYNC_TOOL: &str = "tools/exercise_sync.py";
 const SYNC_STATE: &str = ".ter-sync/state.json";
+const TARGETS: &str = "targets";
 
 /// An exercise resolved from a checkout, with what the site would have
 /// said about its course and modes.
@@ -118,11 +120,30 @@ pub fn load(curriculum: &Path, exercise_id: &str) -> Result<DevExercise, Project
     .filter(|(allowed, _)| *allowed != 0)
     .map(|(_, mode)| mode.to_string())
     .collect();
+    let mut exercise = payload.exercise;
+    if exercise.pins.is_empty() {
+        exercise.pins = target_pins(curriculum, &exercise.target)?;
+    }
     Ok(DevExercise {
-        exercise: payload.exercise,
+        exercise,
         course,
         modes,
     })
+}
+
+/// The pin map in the checkout's `targets/<target>/target.yaml`.
+fn target_pins(curriculum: &Path, target: &str) -> Result<BTreeMap<String, String>, ProjectError> {
+    #[derive(Deserialize)]
+    struct Target {
+        #[serde(default, deserialize_with = "crate::exercise::pin_map")]
+        pins: BTreeMap<String, String>,
+    }
+    let path = curriculum.join(TARGETS).join(target).join("target.yaml");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| dev_error(format!("Could not read {}: {e}", path.display())))?;
+    let parsed: Target = serde_norway::from_str(&text)
+        .map_err(|e| dev_error(format!("{} is not valid: {e}", path.display())))?;
+    Ok(parsed.pins)
 }
 
 /// The site's course id for the lesson an exercise attaches to. The sync
@@ -205,6 +226,26 @@ mod tests {
         let err = load(dir.path(), "a--b").unwrap_err();
         assert_eq!(err.code, "dev_error");
         assert!(err.message.contains("not a curriculum checkout"));
+    }
+
+    #[test]
+    fn pins_come_from_the_target_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("targets/xiao-esp32c3-nostd");
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(
+            t.join("target.yaml"),
+            "id: xiao-esp32c3-nostd\npins:\n  user_led: GPIO3   # LED 1\n  qwiic_i2c: { sda: GPIO6, scl: GPIO7 }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            target_pins(dir.path(), "xiao-esp32c3-nostd").unwrap(),
+            BTreeMap::from([("user_led".to_string(), "GPIO3".to_string())])
+        );
+        assert_eq!(
+            target_pins(dir.path(), "nope").unwrap_err().code,
+            "dev_error"
+        );
     }
 
     #[test]

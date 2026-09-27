@@ -1,0 +1,43 @@
+$timescale 1ns $end
+$scope module logic $end
+$var wire 1 ! D0 $end
+$var wire 1 " D1 $end
+$var wire 1 # D2 $end
+$var wire 1 $ D3 $end
+$var wire 1 % D4 $end
+$var wire 1 & D5 $end
+$var wire 1 ' D6 $end
+$var wire 1 ( D7 $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+0!
+0"
+0#
+0$
+0%
+0&
+0'
+0(
+$end
+#500000000
+1!
+#1000000000
+0!
+#1500000000
+1!
+#2000000000
+0!
+#2500000000
+1!
+#3000000000
+0!
+#3500000000
+1!
+#4000000000
+0!
+#4500000000
+1!
+#5000000000
+0!

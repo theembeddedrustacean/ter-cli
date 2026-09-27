@@ -15,6 +15,8 @@ use crate::output::CliError;
 
 const SERVICE: &str = "ter";
 const ACCOUNT: &str = "device-token";
+/// The learner's own Wokwi CI token, kept the same way.
+const WOKWI_ACCOUNT: &str = "wokwi-token";
 
 /// A place a token can be kept, where the file is not.
 pub trait Keychain {
@@ -54,14 +56,25 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
+    /// The TER device token's store.
     pub fn open() -> Result<Self, CliError> {
+        Self::open_account(ACCOUNT, "token")
+    }
+
+    /// The learner's Wokwi token's store: `wokwi-token` in the keychain,
+    /// else the `wokwi-token` file.
+    pub fn open_wokwi() -> Result<Self, CliError> {
+        Self::open_account(WOKWI_ACCOUNT, "wokwi-token")
+    }
+
+    fn open_account(account: &'static str, file: &str) -> Result<Self, CliError> {
         let keychain_off = std::env::var("TER_KEYCHAIN").is_ok_and(|v| v == "off");
         let keychain: Option<Box<dyn Keychain>> = if keychain_off {
             None
         } else {
-            Some(Box::new(SystemKeychain))
+            Some(Box::new(SystemKeychain { account }))
         };
-        Ok(Self::new(keychain, config_dir()?.join("token")))
+        Ok(Self::new(keychain, config_dir()?.join(file)))
     }
 
     pub fn new(keychain: Option<Box<dyn Keychain>>, file: PathBuf) -> Self {
@@ -165,20 +178,23 @@ fn write_private(path: &Path, token: &str) -> Result<(), CliError> {
     writeln!(file, "{token}").map_err(fail)
 }
 
-/// The platform's keychain, through `keyring-core`.
-pub struct SystemKeychain;
+/// The platform's keychain, through `keyring-core`: one entry of the
+/// `ter` service.
+pub struct SystemKeychain {
+    account: &'static str,
+}
 
 impl SystemKeychain {
-    fn entry() -> Result<keyring_core::Entry, String> {
+    fn entry(&self) -> Result<keyring_core::Entry, String> {
         static STORE: OnceLock<Result<(), String>> = OnceLock::new();
         STORE.get_or_init(set_default_store).clone()?;
-        keyring_core::Entry::new(SERVICE, ACCOUNT).map_err(|e| e.to_string())
+        keyring_core::Entry::new(SERVICE, self.account).map_err(|e| e.to_string())
     }
 }
 
 impl Keychain for SystemKeychain {
     fn get(&self) -> Result<Option<String>, String> {
-        match Self::entry()?.get_password() {
+        match self.entry()?.get_password() {
             Ok(token) => Ok(Some(token)),
             Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(e) => Err(e.to_string()),
@@ -186,13 +202,11 @@ impl Keychain for SystemKeychain {
     }
 
     fn set(&self, token: &str) -> Result<(), String> {
-        Self::entry()?
-            .set_password(token)
-            .map_err(|e| e.to_string())
+        self.entry()?.set_password(token).map_err(|e| e.to_string())
     }
 
     fn delete(&self) -> Result<bool, String> {
-        match Self::entry()?.delete_credential() {
+        match self.entry()?.delete_credential() {
             Ok(()) => Ok(true),
             Err(keyring_core::Error::NoEntry) => Ok(false),
             Err(e) => Err(e.to_string()),

@@ -1,0 +1,32 @@
+venue = "wokwi"
+instruments = []
+target = "xiao-esp32c3-nostd"
+cli_version = "0.1.0"
+elf_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+check_sha256 = "78cb1ac4bb1a47e99376d0d768dc32cdf06313f3bed8f77b2812fad5bd366dd0"
+started_at = "2026-09-27T12:00:00Z"
+ended_at = "2026-09-27T12:00:09Z"
+
+[[verdict]]
+id = "led-off-at-start"
+status = "pass"
+expected = "low between 600 and 950 ms"
+observed = "low for the whole window"
+
+[[verdict]]
+id = "led-toggles-once-on-press"
+status = "pass"
+expected = "exactly 1 level change between 950 and 1150 ms"
+observed = "1 level change, at 1008 ms"
+
+[[verdict]]
+id = "led-on-through-hold"
+status = "pass"
+expected = "high between 1200 and 2400 ms"
+observed = "high for the whole window"
+
+[[verdict]]
+id = "led-on-after-release"
+status = "pass"
+expected = "high between 2600 and 3500 ms"
+observed = "high for the whole window"

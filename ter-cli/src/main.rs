@@ -7,13 +7,16 @@ mod build;
 mod config;
 mod exercises;
 mod hint;
+mod install;
 mod login;
 mod output;
 mod record;
 mod run;
 mod self_update;
 mod session;
+mod sim;
 mod status;
+mod telemetry;
 mod token_store;
 mod whoami;
 
@@ -50,7 +53,7 @@ enum Command {
         #[command(subcommand)]
         command: ExCommand,
     },
-    /// Build the exercise and post the run to TER Learn.
+    /// Build the exercise, run it, check it and post the run to TER Learn.
     Run {
         /// The exercise folder; the one you are in by default.
         dir: Option<PathBuf>,
@@ -60,6 +63,9 @@ enum Command {
         /// Run on hardware this time, whatever ter.toml's `mode` says.
         #[arg(long)]
         hw: bool,
+        /// Where to run within the mode: `wokwi` in simulation.
+        #[arg(long)]
+        venue: Option<String>,
         /// Build only: post the attempt without running or checking it.
         #[arg(long)]
         no_check: bool,
@@ -75,8 +81,34 @@ enum Command {
         /// The exercise folder; the one you are in by default.
         dir: Option<PathBuf>,
     },
+    /// Recorded runs: judge one against a check.yaml, offline.
+    Telemetry {
+        #[command(subcommand)]
+        command: TelemetryCommand,
+    },
+    /// Install a tool ter uses: `wokwi-cli`, with your Wokwi token.
+    Install {
+        /// The tool.
+        #[arg(value_parser = ["wokwi-cli"])]
+        tool: String,
+        /// Read the Wokwi token from standard input instead of asking.
+        #[arg(long)]
+        token_stdin: bool,
+    },
     /// Update ter to the latest version.
     SelfUpdate,
+}
+
+#[derive(Subcommand)]
+enum TelemetryCommand {
+    /// Judge a recording (a `.runs/<n>` folder or its events.jsonl)
+    /// against a check.yaml, and print the check.toml. Needs no account.
+    Check {
+        recording: PathBuf,
+        /// The check.yaml to judge it against.
+        #[arg(long)]
+        check: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -145,6 +177,7 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
             dir,
             sim,
             hw,
+            venue,
             no_check,
         } => {
             let mode = match (sim, hw) {
@@ -156,6 +189,7 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
                 run::RunArgs {
                     dir,
                     mode,
+                    venue,
                     no_check,
                 },
                 json,
@@ -165,6 +199,10 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
         Command::Status { disk: true } => status::disk(json),
         Command::Status { disk: false } => status::status(json).await,
         Command::Hint { dir } => hint::hint(dir, json).await,
+        Command::Telemetry {
+            command: TelemetryCommand::Check { recording, check },
+        } => telemetry::check(recording, check, json),
+        Command::Install { tool, token_stdin } => install::run(&tool, token_stdin, json).await,
         Command::Whoami => {
             let session = Session::open()?;
             let result = whoami::run(&session, json).await;

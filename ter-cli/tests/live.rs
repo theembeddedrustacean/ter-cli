@@ -622,3 +622,168 @@ fn live_good_build_is_posted_with_its_hash() {
         v["name"], v["site"]["attempt"], v["duration_ms"]
     );
 }
+
+/// The learner's own Wokwi token, from the environment. The Wokwi tests
+/// skip without it, and without a curriculum checkout: the site does not
+/// send the target's pin map yet, so they fetch with `--dev`.
+fn wokwi_ready() -> Option<String> {
+    let has_token = std::env::var("WOKWI_CLI_TOKEN").is_ok_and(|t| !t.is_empty());
+    match (has_token, std::env::var("TER_CURRICULUM")) {
+        (true, Ok(curriculum)) => Some(curriculum),
+        _ => {
+            eprintln!("skipped: set WOKWI_CLI_TOKEN and TER_CURRICULUM");
+            None
+        }
+    }
+}
+
+/// Heartbeat fetched from the checkout into a fresh machine, with the
+/// reference solution laid over it and `edit` applied to its main.rs.
+fn simulated_heartbeat(
+    curriculum: &str,
+    edit: impl Fn(String) -> String,
+) -> (LiveMachine, std::path::PathBuf) {
+    let m = LiveMachine::new();
+    let (ok, v) = m.json(
+        &["ex", "fetch", LIVE_OPEN, "--dev", curriculum],
+        m.courses.path(),
+    );
+    assert!(ok, "{v}");
+    let dir = std::path::PathBuf::from(v["path"].as_str().unwrap());
+    lay_solution_over(curriculum, &dir);
+    let main = dir.join("src/bin/main.rs");
+    let source = std::fs::read_to_string(&main).unwrap();
+    std::fs::write(&main, edit(source)).unwrap();
+    (m, dir)
+}
+
+fn telemetry_check(m: &LiveMachine, dir: &std::path::Path, run: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["telemetry", "check", run, "--check", "check.yaml"])
+        .current_dir(dir)
+        .env("TER_CONFIG_DIR", m.config.path())
+        .env_remove("TER_TOKEN")
+        .output()
+        .unwrap()
+}
+
+/// The reference solution passes in Wokwi, the site answers with concept
+/// deltas, and the recording re-checks to the same check.toml offline.
+#[test]
+#[ignore = "live site and Wokwi"]
+fn live_sim_solution_passes_and_replays() {
+    let Some(curriculum) = wokwi_ready() else {
+        return;
+    };
+    let (m, dir) = simulated_heartbeat(&curriculum, |s| s);
+    let v = {
+        let _turn = take_turn();
+        m.json(&["run", "--sim"], &dir).1
+    };
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(v["venue"], "wokwi");
+    assert_eq!(v["check_status"], "passed", "{v}");
+    assert_eq!(
+        (&v["checks_seen"], &v["checks_total"]),
+        (&serde_json::json!(2), &serde_json::json!(2))
+    );
+    assert!(
+        !v["site"]["concept_deltas"].as_array().unwrap().is_empty(),
+        "a pass is evidence: {v}"
+    );
+    let run = std::path::Path::new(v["recording"].as_str().unwrap());
+    let replay = telemetry_check(&m, &dir, run.to_str().unwrap());
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(
+        replay.stdout,
+        std::fs::read(run.join("check.toml")).unwrap()
+    );
+    eprintln!(
+        "posted run {} attempt {}: {}",
+        v["name"], v["site"]["attempt"], v["verdicts"]
+    );
+}
+
+/// Pauses of 300 ms instead of 700: the flashes are right and the rate is
+/// not, so the rate check is the one that fails.
+#[test]
+#[ignore = "live site and Wokwi"]
+fn live_sim_wrong_solution_fails_the_right_check() {
+    let Some(curriculum) = wokwi_ready() else {
+        return;
+    };
+    let (m, dir) = simulated_heartbeat(&curriculum, |s| {
+        assert!(s.contains("(Level::Low, 700)"), "the solution changed");
+        s.replace("(Level::Low, 700)", "(Level::Low, 300)")
+    });
+    let (ok, v) = {
+        let _turn = take_turn();
+        m.json(&["run", "--sim"], &dir)
+    };
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "check_failed", "{v}");
+    assert_eq!(v["check_status"], "failed");
+    let ff: Value = serde_json::from_str(v["first_failure"].as_str().unwrap()).unwrap();
+    assert_eq!(ff["id"], "heartbeat-rate", "{ff}");
+    assert_eq!(
+        v["verdicts"][1]["status"], "pass",
+        "the flashes are right: {v}"
+    );
+}
+
+/// With no check.yaml, `--sim` builds only and posts `not_run` with no
+/// checks, and Wokwi is never called.
+#[test]
+#[ignore = "live site"]
+fn live_sim_without_a_check_builds_only() {
+    let Ok(curriculum) = std::env::var("TER_CURRICULUM") else {
+        eprintln!("skipped: set TER_CURRICULUM to a curriculum checkout");
+        return;
+    };
+    let (m, dir) = simulated_heartbeat(&curriculum, |s| s);
+    std::fs::remove_file(dir.join("check.yaml")).unwrap();
+    let (ok, v) = {
+        let _turn = take_turn();
+        m.json(&["run", "--sim"], &dir)
+    };
+    assert!(ok, "{v}");
+    assert_eq!(v["check_status"], "not_run");
+    assert_eq!(
+        (&v["checks_seen"], &v["checks_total"]),
+        (&serde_json::json!(0), &serde_json::json!(0))
+    );
+    assert!(v.get("venue").is_none(), "{v}");
+}
+
+/// A token Wokwi refuses is the venue's failure, not the learner's: posted
+/// as `not_run` with `venue_unavailable` first in the transcript.
+#[test]
+#[ignore = "live site and Wokwi"]
+fn live_sim_refused_wokwi_token_is_not_run() {
+    let Some(curriculum) = wokwi_ready() else {
+        return;
+    };
+    let (m, dir) = simulated_heartbeat(&curriculum, |s| s);
+    let o = {
+        let _turn = take_turn();
+        Command::new(env!("CARGO_BIN_EXE_ter"))
+            .args(["run", "--sim", "--json"])
+            .current_dir(&dir)
+            .env("TER_CONFIG_DIR", m.config.path())
+            .env("TER_TOKEN", &m.token)
+            .env("TER_KEYCHAIN", "off")
+            .env("WOKWI_CLI_TOKEN", "not-a-wokwi-token")
+            .output()
+            .unwrap()
+    };
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(!o.status.success());
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    assert_eq!(v["check_status"], "not_run", "never failed: {v}");
+    let tail = v["transcript_tail"].as_str().unwrap();
+    assert_eq!(tail.lines().next(), Some("venue_unavailable"), "{tail}");
+}

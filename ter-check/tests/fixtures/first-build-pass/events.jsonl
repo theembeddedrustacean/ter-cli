@@ -1,0 +1,17 @@
+{"capture":{"venue":"wokwi","instruments":[],"target":"xiao-esp32c3-nostd","provides":["serial","pins","reset"],"pins":["user_led"],"stimuli":[],"end_us":7000000,"cli_version":"0.1.0","elf_sha256":"0000000000000000000000000000000000000000000000000000000000000000","started_at":"2026-09-27T12:00:00Z","ended_at":"2026-09-27T12:00:09Z"}}
+{"t_us":0,"kind":"reset"}
+{"t_us":0,"kind":"pin_edge","name":"user_led","level":"low"}
+{"t_us":400000,"kind":"serial","text":"INFO - Hello world!\n","span_us":50000}
+{"t_us":450000,"kind":"pin_edge","name":"user_led","level":"high"}
+{"t_us":950000,"kind":"pin_edge","name":"user_led","level":"low"}
+{"t_us":1450000,"kind":"pin_edge","name":"user_led","level":"high"}
+{"t_us":1950000,"kind":"pin_edge","name":"user_led","level":"low"}
+{"t_us":2450000,"kind":"pin_edge","name":"user_led","level":"high"}
+{"t_us":2950000,"kind":"pin_edge","name":"user_led","level":"low"}
+{"t_us":3450000,"kind":"pin_edge","name":"user_led","level":"high"}
+{"t_us":3950000,"kind":"pin_edge","name":"user_led","level":"low"}
+{"t_us":4450000,"kind":"pin_edge","name":"user_led","level":"high"}
+{"t_us":4950000,"kind":"pin_edge","name":"user_led","level":"low"}
+{"t_us":5450000,"kind":"pin_edge","name":"user_led","level":"high"}
+{"t_us":5950000,"kind":"pin_edge","name":"user_led","level":"low"}
+{"t_us":6450000,"kind":"pin_edge","name":"user_led","level":"high"}

@@ -1,0 +1,26 @@
+# Checks that the LED starts off, flips exactly once when the button goes
+# down, and then stays on through the hold and the release. The press is a
+# clean stimulus (Wokwi bounce off, the telemetry board drives the line).
+timeout_ms: 4000
+setup:
+  - press: user_button
+    at_ms: 1000
+    hold_ms: 1500
+assert:
+  - id: led-off-at-start
+    pin: user_led
+    is: low
+    between_ms: [600, 950]
+  - id: led-toggles-once-on-press
+    pin: user_led
+    edge_count: { min: 1, max: 1 }
+    window_ms: [950, 1150]
+  # A level test instead of an edge test toggles on every pass of the loop.
+  - id: led-on-through-hold
+    pin: user_led
+    is: high
+    between_ms: [1200, 2400]
+  - id: led-on-after-release
+    pin: user_led
+    is: high
+    between_ms: [2600, 3500]

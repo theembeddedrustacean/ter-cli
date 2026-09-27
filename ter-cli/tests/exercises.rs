@@ -515,6 +515,13 @@ fn fake_curriculum() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("tools")).unwrap();
     std::fs::create_dir_all(dir.path().join(".ter-sync")).unwrap();
+    let target = dir.path().join("targets/xiao-esp32c3-nostd");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join("target.yaml"),
+        "id: xiao-esp32c3-nostd\npins:\n  user_led: GPIO3\n  qwiic_i2c: { sda: GPIO6, scl: GPIO7 }\n",
+    )
+    .unwrap();
     let payload = |id: &str| {
         let mut p = exercise(
             id,
@@ -570,6 +577,11 @@ fn fetch_dev_reads_a_curriculum_checkout_without_the_site() {
     assert_eq!(v["mode"], "simulation");
     let dir = m.exercise_dir("esp-bare-metal-gpio-programming", BLINKY);
     assert!(dir.join("src/bin/main.rs").is_file());
+    let ter = std::fs::read_to_string(dir.join("ter.toml")).unwrap();
+    assert!(
+        ter.contains("[pins]\nuser_led = \"GPIO3\""),
+        "the target's pin map is written: {ter}"
+    );
 
     let (ok, v) = m.json(
         site,
