@@ -637,19 +637,24 @@ fn wokwi_ready() -> Option<String> {
     }
 }
 
-/// Heartbeat fetched from the checkout into a fresh machine, with the
+/// Heartbeat fetched from the site into a fresh machine, with the
 /// reference solution laid over it and `edit` applied to its main.rs.
 fn simulated_heartbeat(
     curriculum: &str,
     edit: impl Fn(String) -> String,
 ) -> (LiveMachine, std::path::PathBuf) {
     let m = LiveMachine::new();
-    let (ok, v) = m.json(
-        &["ex", "fetch", LIVE_OPEN, "--dev", curriculum],
-        m.courses.path(),
-    );
+    let (ok, v) = m.json(&["ex", "fetch", LIVE_OPEN], m.courses.path());
     assert!(ok, "{v}");
     let dir = std::path::PathBuf::from(v["path"].as_str().unwrap());
+    // The site sends the target's pin map; the checks' pins resolve by it.
+    let ter = ter_sdk::project::TerToml::load(&dir).unwrap();
+    assert_eq!(
+        ter.pins.get("user_led").map(String::as_str),
+        Some("GPIO3"),
+        "{:?}",
+        ter.pins
+    );
     lay_solution_over(curriculum, &dir);
     let main = dir.join("src/bin/main.rs");
     let source = std::fs::read_to_string(&main).unwrap();

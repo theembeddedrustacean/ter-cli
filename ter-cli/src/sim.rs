@@ -69,8 +69,10 @@ pub fn plan(dir: &Path, ter: &TerToml, file: &CheckFile) -> Result<Plan, CliErro
     let press = file.driven_pins();
     if (!watch.is_empty() || !press.is_empty()) && ter.pins.is_empty() {
         return Err(not_observable(format!(
-            "The checks name pins, and {} has no pin map to find them on the board. TER Learn does not send one yet; `ter ex fetch --dev` from a curriculum checkout writes it.",
-            dir.join(ter_sdk::project::TER_TOML).display()
+            "The checks name pins, and {} has no pin map: the exercise was fetched before TER Learn sent one. Keep a copy of your src/, then `ter ex remove --force {}` and `ter ex fetch {}`.",
+            dir.join(ter_sdk::project::TER_TOML).display(),
+            ter.exercise,
+            ter.exercise
         )));
     }
     let diagram_path = dir.join(wokwi::RUN_DIAGRAM);
