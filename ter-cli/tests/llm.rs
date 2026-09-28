@@ -427,7 +427,7 @@ async fn the_messages_format_sends_the_key_in_its_own_header() {
         b["system"]
             .as_str()
             .unwrap()
-            .contains("Give one hint, not the solution")
+            .contains("Give one hint, never the solution")
     );
 }
 
