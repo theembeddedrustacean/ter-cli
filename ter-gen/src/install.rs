@@ -20,6 +20,10 @@ pub enum Tool {
     Targets,
     Espflash,
     ProbeRs,
+    /// The UF2 runners of the RP2040 and nRF52840 scaffolds, for `cargo
+    /// run`; ter flashes UF2 boards without them.
+    Elf2uf2Rs,
+    Uf2deploy,
     /// The project generator `ter new` runs.
     XiaoGenerate,
 }
@@ -43,6 +47,18 @@ const ESPFLASH: CargoTool = CargoTool {
 const PROBE_RS: CargoTool = CargoTool {
     program: "probe-rs",
     krate: "probe-rs-tools",
+    min_major: 0,
+};
+
+const ELF2UF2_RS: CargoTool = CargoTool {
+    program: "elf2uf2-rs",
+    krate: "elf2uf2-rs",
+    min_major: 0,
+};
+
+const UF2DEPLOY: CargoTool = CargoTool {
+    program: "uf2deploy",
+    krate: "uf2deploy",
     min_major: 0,
 };
 
@@ -235,6 +251,8 @@ pub fn plan(probe: &impl Probe, tool: Tool, project: Option<&ProjectTarget>) -> 
     match tool {
         Tool::Espflash => vec![cargo_tool(probe, &ESPFLASH)],
         Tool::ProbeRs => vec![cargo_tool(probe, &PROBE_RS)],
+        Tool::Elf2uf2Rs => vec![cargo_tool(probe, &ELF2UF2_RS)],
+        Tool::Uf2deploy => vec![cargo_tool(probe, &UF2DEPLOY)],
         Tool::XiaoGenerate => vec![cargo_tool(probe, &XIAO_GENERATE)],
         Tool::Targets => project.map(|p| targets(probe, p)).unwrap_or_default(),
     }
@@ -521,6 +539,14 @@ mod tests {
         assert_eq!(
             commands(&plan(&none, Tool::XiaoGenerate, None)),
             ["cargo install xiao-generate --locked"]
+        );
+        assert_eq!(
+            commands(&plan(&none, Tool::Elf2uf2Rs, None)),
+            ["cargo install elf2uf2-rs --locked"]
+        );
+        assert_eq!(
+            commands(&plan(&none, Tool::Uf2deploy, None)),
+            ["cargo install uf2deploy --locked"]
         );
 
         let there = Fake::default()

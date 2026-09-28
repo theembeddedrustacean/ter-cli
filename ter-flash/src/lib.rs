@@ -1,9 +1,12 @@
-//! Flashing and resetting boards with espflash or probe-rs.
+//! Flashing and resetting boards with espflash or probe-rs, or through a
+//! UF2 bootloader's drive.
 //!
 //! Which tool flashes a board is the target's `flash.tool`. The scaffold
 //! carries it as its `cargo run` runner (`espflash flash --monitor --chip
-//! esp32c3`, `probe-rs run --chip STM32F401RETx`), so [`Tool::from_runner`]
-//! reads it there: the same tool, and the same chip, that free play uses.
+//! esp32c3`, `probe-rs run --chip STM32F401RETx`, `elf2uf2-rs -d`), so
+//! [`Tool::from_runner`] reads it there: the same tool, and the same chip,
+//! that free play uses. A UF2 runner only tells ter the chip family: ter
+//! makes and copies the UF2 file itself.
 //!
 //! This crate must never depend on anything that reaches the network; the
 //! local check enforces it.
@@ -14,9 +17,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+pub mod drive;
 pub mod port;
+pub mod uf2;
 
 pub use port::{Port, PortKind};
+pub use uf2::Family;
 
 /// A flashing tool and the chip it is told about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +33,10 @@ pub enum Tool {
     },
     ProbeRs {
         chip: String,
+    },
+    /// Copied to the board's UF2 drive, by ter itself.
+    Uf2 {
+        family: &'static Family,
     },
 }
 
@@ -45,18 +55,41 @@ impl Tool {
             "probe-rs" => chip.map(|chip| Tool::ProbeRs { chip }).ok_or_else(|| {
                 format!("the runner `{runner}` does not name the chip for probe-rs")
             }),
+            // elf2uf2-rs makes RP2040 files only.
+            "elf2uf2-rs" => Ok(Tool::Uf2 {
+                family: &uf2::RP2040,
+            }),
+            "uf2deploy" => {
+                let family = arg(&words, "--family", "-f")
+                    .ok_or_else(|| format!("the runner `{runner}` does not name the UF2 family"))?;
+                Family::named(&family)
+                    .map(|family| Tool::Uf2 { family })
+                    .ok_or_else(|| {
+                        format!(
+                            "ter knows the UF2 families {}, and the runner `{runner}` names {family}",
+                            uf2::FAMILIES.map(|f| f.name).join(", ")
+                        )
+                    })
+            }
             _ => Err(format!(
-                "ter flashes with espflash or probe-rs, and the runner is `{runner}`"
+                "ter flashes with espflash, probe-rs or a UF2 runner (elf2uf2-rs, uf2deploy), and the runner is `{runner}`"
             )),
         }
     }
 
-    /// The program's name, as it is found on the PATH.
+    /// The program's name, as it is found on the PATH: `uf2` for a UF2
+    /// board, which ter flashes without one.
     pub fn program(&self) -> &'static str {
         match self {
             Tool::Espflash { .. } => "espflash",
             Tool::ProbeRs { .. } => "probe-rs",
+            Tool::Uf2 { .. } => "uf2",
         }
+    }
+
+    /// Whether flashing runs another program, which must be installed.
+    pub fn external(&self) -> bool {
+        !matches!(self, Tool::Uf2 { .. })
     }
 
     /// What a board this tool flashes shows up as on USB.
@@ -64,12 +97,15 @@ impl Tool {
         match self {
             Tool::Espflash { .. } => matches!(kind, PortKind::UsbSerialJtag | PortKind::UsbUart),
             Tool::ProbeRs { .. } => kind == PortKind::Probe,
+            // Flashed through its drive; the port comes after.
+            Tool::Uf2 { .. } => false,
         }
     }
 
     /// Arguments that write `elf` to the board. With `hold`, an ESP board
     /// is left in its bootloader for the caller to reset (and so see its
-    /// first byte); otherwise the tool starts the program itself.
+    /// first byte); otherwise the tool starts the program itself. None for
+    /// a UF2 board: see [`drive::Drive::copy`].
     pub fn flash_args(&self, elf: &Path, port: Option<&str>, hold: bool) -> Vec<OsString> {
         let mut args: Vec<OsString> = Vec::new();
         let mut push = |s: &str| args.push(s.into());
@@ -94,6 +130,7 @@ impl Tool {
                 push("--chip");
                 push(chip);
             }
+            Tool::Uf2 { .. } => return Vec::new(),
         }
         args.push(elf.as_os_str().to_owned());
         args
@@ -103,7 +140,7 @@ impl Tool {
     /// that resets through a probe rather than the serial port.
     pub fn reset_args(&self) -> Option<Vec<OsString>> {
         match self {
-            Tool::Espflash { .. } => None,
+            Tool::Espflash { .. } | Tool::Uf2 { .. } => None,
             Tool::ProbeRs { chip } => Some(
                 ["reset", "--non-interactive", "--chip", chip]
                     .iter()
@@ -115,10 +152,16 @@ impl Tool {
 }
 
 fn chip_arg(words: &[&str]) -> Option<String> {
+    arg(words, "--chip", "-c")
+}
+
+/// The value of `--long V`, `--long=V` or `-s V` in a runner.
+fn arg(words: &[&str], long: &str, short: &str) -> Option<String> {
+    let with_equals = format!("{long}=");
     words.iter().enumerate().find_map(|(i, w)| {
-        if let Some(v) = w.strip_prefix("--chip=") {
+        if let Some(v) = w.strip_prefix(&with_equals) {
             Some(v.to_string())
-        } else if *w == "--chip" || *w == "-c" {
+        } else if *w == long || *w == short {
             words.get(i + 1).map(|v| v.to_string())
         } else {
             None
@@ -262,8 +305,39 @@ mod tests {
         );
         let err = Tool::from_runner("probe-rs run").unwrap_err();
         assert!(err.contains("chip"), "{err}");
-        let err = Tool::from_runner("elf2uf2-rs -d").unwrap_err();
-        assert!(err.contains("elf2uf2-rs"), "{err}");
+        let err = Tool::from_runner("hf2 elf").unwrap_err();
+        assert!(err.contains("`hf2 elf`"), "{err}");
+    }
+
+    #[test]
+    fn a_uf2_runner_names_the_family() {
+        assert_eq!(
+            Tool::from_runner("elf2uf2-rs -d").unwrap(),
+            Tool::Uf2 {
+                family: &uf2::RP2040
+            }
+        );
+        assert_eq!(
+            Tool::from_runner("uf2deploy deploy -f nrf52840 -p auto").unwrap(),
+            Tool::Uf2 {
+                family: &uf2::NRF52840
+            }
+        );
+        assert_eq!(
+            Tool::from_runner("uf2deploy deploy --family=0xADA52840 -p auto").unwrap(),
+            Tool::Uf2 {
+                family: &uf2::NRF52840
+            }
+        );
+        let err = Tool::from_runner("uf2deploy deploy -p auto").unwrap_err();
+        assert!(err.contains("family"), "{err}");
+        let err = Tool::from_runner("uf2deploy deploy -f samd21 -p auto").unwrap_err();
+        assert!(
+            err.contains("rp2040, nrf52840") && err.contains("samd21"),
+            "{err}"
+        );
+        let t = Tool::from_runner("elf2uf2-rs -d").unwrap();
+        assert!(!t.external() && !t.wants(PortKind::Other) && t.reset_args().is_none());
     }
 
     fn strings(args: Vec<OsString>) -> Vec<String> {

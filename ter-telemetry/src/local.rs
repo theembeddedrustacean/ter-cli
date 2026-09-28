@@ -11,12 +11,20 @@
 //! the capture and times are from the real reset. Where ter cannot reset
 //! through the port (a probe, a port it does not know) the tool resets the
 //! board and a `Reset` is synthesised when the capture starts.
+//!
+//! A UF2 board has no flashing tool and, while its bootloader runs, no
+//! serial port: ter copies the program to the bootloader's drive, waits for
+//! the board to restart into it, then listens on the USB serial port the
+//! program sets up. The program has started by then, so the `Reset` is
+//! synthesised as for a probe.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ter_flash::{Port, PortKind, Tool, run_tool};
+use ter_flash::drive::Drive;
+use ter_flash::port::Appearing;
+use ter_flash::{Family, Port, PortKind, Tool, run_tool};
 
 use crate::event::{Event, EventKind, EventKinds, Kind, Stimulus, from_reset};
 use crate::recording::{Capture, Recording};
@@ -35,6 +43,25 @@ const READ_TIMEOUT: Duration = Duration::from_millis(20);
 pub const USB_SLACK_US: u64 = 2_000;
 /// Longest a flash may take before it counts as failed.
 pub const FLASH_LIMIT: Duration = Duration::from_secs(180);
+/// The UF2 file ter made, in the run folder.
+pub const UF2_FILE: &str = "firmware.uf2";
+
+/// How long a UF2 board may take to restart after the copy, and its
+/// program to show its serial port after that.
+#[derive(Debug, Clone, Copy)]
+pub struct Uf2Waits {
+    pub restart: Duration,
+    pub port: Duration,
+}
+
+impl Default for Uf2Waits {
+    fn default() -> Self {
+        Self {
+            restart: Duration::from_secs(30),
+            port: Duration::from_secs(10),
+        }
+    }
+}
 
 /// A serial connection to a board.
 pub trait Link: Send {
@@ -100,6 +127,11 @@ pub struct Local {
     pub capture: Capture,
     /// Opens the port; a board stand-in in tests.
     pub open: Opener,
+    /// A UF2 board's bootloader drive. Its `port` is the one the program
+    /// shows after the flash: named up front (`TER_PORT`), or, left
+    /// empty, the one that appears.
+    pub drive: Option<Drive>,
+    pub uf2_waits: Uf2Waits,
     link: Option<Box<dyn Link>>,
     /// When the program started (ter's reset) or, with a reset ter did not
     /// see, when the capture did.
@@ -122,6 +154,8 @@ impl Local {
             timeout_ms,
             capture: Capture::default(),
             open: Box::new(|p| SerialLink::open(p).map(|l| Box::new(l) as Box<dyn Link>)),
+            drive: None,
+            uf2_waits: Uf2Waits::default(),
             link: None,
             origin: None,
         }
@@ -158,6 +192,129 @@ impl Local {
             )
         }
     }
+
+    /// Copy the program to the UF2 drive, wait for the board to restart
+    /// into it, and find the port it prints on.
+    fn prepare_uf2(&mut self, elf: &Path, family: &'static Family) -> Result<(), VenueError> {
+        let mut log = String::new();
+        let result = self.copy_uf2(elf, family, &mut log);
+        let _ = std::fs::write(self.run_dir.join(FLASH_LOG), &log);
+        result.map_err(|mut e| {
+            e.output = log;
+            e
+        })
+    }
+
+    fn copy_uf2(
+        &mut self,
+        elf: &Path,
+        family: &'static Family,
+        log: &mut String,
+    ) -> Result<(), VenueError> {
+        let failed = |message: String| VenueError {
+            failure: VenueFailure::FlashFailed,
+            message,
+            output: String::new(),
+        };
+        let Some(drive) = self.drive.clone() else {
+            return Err(VenueError::unavailable(
+                "No UF2 drive to copy the program to",
+                "",
+            ));
+        };
+        let program = std::fs::read(elf)
+            .map_err(|e| failed(format!("Could not read {}: {e}", elf.display())))?;
+        let uf2 = ter_flash::uf2::from_elf(&program, family)
+            .map_err(|e| failed(format!("ter could not make a UF2 file: {e}")))?;
+        log.push_str(&format!(
+            "UF2 for the {} (family {:#010x}): {} blocks, {} bytes\n",
+            family.chip,
+            family.id,
+            uf2.len() / ter_flash::uf2::BLOCK,
+            uf2.len()
+        ));
+        let _ = std::fs::write(self.run_dir.join(UF2_FILE), &uf2);
+        if !drive.present() {
+            return Err(VenueError::unavailable(
+                format!(
+                    "The UF2 drive {} went away before the copy. Put the board back in its bootloader ({}) and run again",
+                    drive.path.display(),
+                    family.bootloader
+                ),
+                "",
+            ));
+        }
+
+        let before = ter_flash::port::list();
+        let started = Instant::now();
+        drive.copy(&uf2).map_err(|e| {
+            failed(format!(
+                "Could not copy the program to {}: {e}",
+                drive.path.display()
+            ))
+        })?;
+        log.push_str(&format!(
+            "Copied to {}\n",
+            drive.path.join(ter_flash::drive::FILE_NAME).display()
+        ));
+        if !drive.wait_gone(self.uf2_waits.restart) {
+            return Err(failed(format!(
+                "The board kept its UF2 drive {} for {} s after the copy, so its bootloader did not take the program. Is it a {}'s drive?",
+                drive.path.display(),
+                self.uf2_waits.restart.as_secs(),
+                family.chip
+            )));
+        }
+        log.push_str(&format!(
+            "The board restarted after {} ms\n",
+            started.elapsed().as_millis()
+        ));
+
+        let port = self.program_port(&before).ok_or_else(|| {
+            let which = if self.port.path.is_empty() {
+                "serial port".to_string()
+            } else {
+                self.port.path.clone()
+            };
+            VenueError::unavailable(
+                format!(
+                    "The board restarted, but no {which} appeared within {} s. ter hears a UF2 board only through the USB serial port its program sets up, and this program may not set one up",
+                    self.uf2_waits.port.as_secs()
+                ),
+                "",
+            )
+        })?;
+        log.push_str(&format!(
+            "The program's serial port: {} after {} ms\n",
+            port.path,
+            started.elapsed().as_millis()
+        ));
+        self.port = port;
+        Ok(())
+    }
+
+    /// The port the program shows up on: the named one once it is there
+    /// (and new), else the first that appears.
+    fn program_port(&self, before: &[Port]) -> Option<Port> {
+        let named = (!self.port.path.is_empty()).then_some(self.port.path.as_str());
+        let listed_before = |path: &str| before.iter().any(|p| p.path == path);
+        let mut appearing = Appearing::from(before);
+        let started = Instant::now();
+        while started.elapsed() < self.uf2_waits.port {
+            let new = appearing.step(&ter_flash::port::list());
+            match named {
+                None if new.is_some() => return new,
+                Some(path) if new.as_ref().is_some_and(|p| p.path == path) => return new,
+                // Not a USB port ter lists, or not there before the copy.
+                Some(path) if !listed_before(path) && ter_flash::port::present(path) => {
+                    return Some(Port::named(path));
+                }
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
 }
 
 fn ter_resets(tool: &Tool, kind: PortKind) -> bool {
@@ -193,6 +350,9 @@ impl Venue for Local {
     }
 
     fn prepare(&mut self, elf: &Path) -> Result<(), VenueError> {
+        if let Tool::Uf2 { family } = self.tool {
+            return self.prepare_uf2(elf, family);
+        }
         let args = self
             .tool
             .flash_args(elf, Some(&self.port.path), self.ter_resets());
@@ -512,6 +672,133 @@ mod tests {
         let err = v.prepare(Path::new("fw.elf")).unwrap_err();
         assert_eq!(err.failure, VenueFailure::Unavailable);
         assert!(err.message.contains("went away"), "{}", err.message);
+    }
+
+    /// A UF2 board in its bootloader: a drive in `dir`. With `takes`, it
+    /// takes the file ter copies, drops the drive, and its program's port
+    /// (a file here) appears. Returns the drive and that port.
+    fn uf2_board(dir: &Path, takes: bool) -> (Drive, PathBuf) {
+        let drive = dir.join("RPI-RP2");
+        std::fs::create_dir(&drive).unwrap();
+        let info = drive.join(ter_flash::drive::INFO_FILE);
+        std::fs::write(&info, "Model: Raspberry Pi RP2\nBoard-ID: RPI-RP2\n").unwrap();
+        let port = dir.join("ttyACM0");
+        if takes {
+            let (file, port) = (drive.join(ter_flash::drive::FILE_NAME), port.clone());
+            std::thread::spawn(move || {
+                while std::fs::metadata(&file).map_or(true, |m| m.len() == 0) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                std::fs::remove_file(info).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                std::fs::write(port, "").unwrap();
+            });
+        }
+        (Drive::at(&drive).unwrap(), port)
+    }
+
+    fn uf2_venue(dir: &Path, drive: Drive, port: &Path, elf: &[u8]) -> (Local, PathBuf) {
+        let (mut v, _) = venue(dir, PortKind::Other, vec![(0, b"hi\n")], None);
+        v.tool = Tool::Uf2 {
+            family: &ter_flash::uf2::RP2040,
+        };
+        v.port = Port {
+            path: port.display().to_string(),
+            ..Port::default()
+        };
+        v.drive = Some(drive);
+        v.uf2_waits = Uf2Waits {
+            restart: Duration::from_secs(5),
+            port: Duration::from_millis(500),
+        };
+        let path = dir.join("fw.elf");
+        std::fs::write(&path, elf).unwrap();
+        (v, path)
+    }
+
+    #[test]
+    fn a_uf2_board_takes_the_file_restarts_and_prints_on_its_new_port() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (drive, port) = uf2_board(&dir, true);
+        let elf = ter_flash::uf2::elf32(&[(0x1000_0000, &[7; 300])]);
+        let (mut v, elf_path) = uf2_venue(&dir, drive.clone(), &port, &elf);
+        assert_eq!(v.provides(), [Kind::Serial].into());
+
+        v.prepare(&elf_path).unwrap();
+        v.reset().unwrap();
+        let rec = v.run(&[], Duration::from_secs(10)).unwrap();
+
+        let copied = std::fs::read(drive.path.join(ter_flash::drive::FILE_NAME)).unwrap();
+        assert_eq!(copied.len(), 2 * ter_flash::uf2::BLOCK);
+        assert_eq!(std::fs::read(dir.join(UF2_FILE)).unwrap(), copied);
+        assert_eq!(v.port.path, port.display().to_string());
+        let log = std::fs::read_to_string(dir.join(FLASH_LOG)).unwrap();
+        assert!(
+            log.contains("family 0xe48bff56): 2 blocks")
+                && log.contains("restarted after")
+                && log.contains("serial port:"),
+            "{log}"
+        );
+        assert_eq!(rec.events[0], Event::reset(0), "synthesised");
+        assert_eq!(rec.serial_text(), "hi\n");
+    }
+
+    #[test]
+    fn a_uf2_board_that_keeps_its_drive_did_not_take_the_program() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (drive, port) = uf2_board(&dir, false);
+        let elf = ter_flash::uf2::elf32(&[(0x1000_0000, &[7; 4])]);
+        let (mut v, elf_path) = uf2_venue(&dir, drive, &port, &elf);
+        v.uf2_waits.restart = Duration::from_millis(200);
+        let err = v.prepare(&elf_path).unwrap_err();
+        assert_eq!(err.failure, VenueFailure::FlashFailed);
+        assert!(
+            err.message.contains("kept its UF2 drive"),
+            "{}",
+            err.message
+        );
+        assert!(err.output.contains("Copied to"), "{}", err.output);
+    }
+
+    #[test]
+    fn a_program_with_no_serial_port_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (drive, _) = uf2_board(&dir, true);
+        let elf = ter_flash::uf2::elf32(&[(0x1000_0000, &[7; 4])]);
+        let never = dir.join("ttyACM9");
+        let (mut v, elf_path) = uf2_venue(&dir, drive, &never, &elf);
+        let err = v.prepare(&elf_path).unwrap_err();
+        assert_eq!(err.failure, VenueFailure::Unavailable);
+        assert!(
+            err.message.contains("no ")
+                && err.message.contains("USB serial port its program sets up"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_program_the_board_cannot_take_is_a_failed_flash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (drive, port) = uf2_board(&dir, false);
+        let nrf = ter_flash::uf2::elf32(&[(0x27000, &[7; 4])]);
+        let (mut v, elf_path) = uf2_venue(&dir, drive.clone(), &port, &nrf);
+        let err = v.prepare(&elf_path).unwrap_err();
+        assert_eq!(err.failure, VenueFailure::FlashFailed);
+        assert!(
+            err.message.contains("outside the RP2040's flash"),
+            "{}",
+            err.message
+        );
+        assert!(
+            !drive.path.join(ter_flash::drive::FILE_NAME).exists(),
+            "nothing copied"
+        );
     }
 
     #[test]

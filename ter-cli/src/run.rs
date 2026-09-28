@@ -140,7 +140,7 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
             let ready = hw::tool(&dir)?;
             Plan::Bench(Box::new(Checked { file, text, ready }))
         } else if venue == "local" {
-            let ready = hw::ready(&dir)?;
+            let ready = hw::ready(&dir, !json)?;
             Plan::Local(Box::new(Checked { file, text, ready }))
         } else {
             let ready = sim::ready(sim::plan(&dir, &ter, &file)?)?;
@@ -168,7 +168,10 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
             Plan::BuildOnly => "build only".to_string(),
             Plan::NoCheck => "build only, no check.yaml".to_string(),
             Plan::Wokwi(_) => "then Wokwi".to_string(),
-            Plan::Local(hw) => format!("then the board on {}", hw.ready.port.path),
+            Plan::Local(hw) => match &hw.ready.drive {
+                Some(d) => format!("then the board through its UF2 drive {}", d.path.display()),
+                None => format!("then the board on {}", hw.ready.port.path),
+            },
             Plan::Bench(_) => {
                 let b = bench.as_ref().expect("a bench plan has a bench");
                 format!("then {}'s bench {}", b.link.owner_name, b.link.label)
@@ -179,6 +182,11 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
             && let Some(note) = hw::unseen_note(&hw.file, &hw.ready.provides())
         {
             eprintln!("{note}");
+        }
+        if let Plan::Local(hw) = &plan
+            && hw.ready.drive.is_some()
+        {
+            eprintln!("ter hears this board through the USB serial port its program sets up.");
         }
         if let (Plan::Bench(b), Some(bench)) = (&plan, &bench)
             && let Some(note) = remote::unseen_note(&b.file, &bench.info.provides)
@@ -231,12 +239,19 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         (Plan::Local(hw), Some(elf)) => {
             let Checked { file, text, ready } = hw.as_ref();
             if !json {
-                eprintln!(
-                    "Flashing with {} on {}, then {} ms of serial",
-                    ready.tool.program(),
-                    ready.port.path,
-                    file.timeout_ms
-                );
+                match &ready.drive {
+                    Some(d) => eprintln!(
+                        "Copying the program to {}, then {} ms of serial",
+                        d.path.display(),
+                        file.timeout_ms
+                    ),
+                    None => eprintln!(
+                        "Flashing with {} on {}, then {} ms of serial",
+                        ready.tool.program(),
+                        ready.port.path,
+                        file.timeout_ms
+                    ),
+                }
             }
             let t = Instant::now();
             let mut local = Local::new(
@@ -247,6 +262,7 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
                 file.timeout_ms,
             );
             local.capture = capture(&ter, client.cli_version(), &elf_sha256);
+            local.drive = ready.drive.clone();
             let budget = board_budget(file.timeout_ms);
             let outcome = record_and_judge(&mut local, file, text, elf, budget, &recording)?;
             ran_in = Some((t.elapsed(), "on the board"));

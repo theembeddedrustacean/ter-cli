@@ -205,6 +205,7 @@ enum Command {
     Install {
         /// `targets` (the Rust target of the project in this folder),
         /// `xiao-generate` (for `ter new`), `espflash`, `probe-rs`,
+        /// `elf2uf2-rs`, `uf2deploy` (UF2 boards' `cargo run`),
         /// `wokwi-cli` (with your Wokwi token).
         #[arg(required = true, value_parser = install::TOOLS)]
         tools: Vec<String>,

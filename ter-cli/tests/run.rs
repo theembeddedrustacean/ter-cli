@@ -109,6 +109,29 @@ echo "Flashing has completed!"
 touch "$here/flashed"
 "#;
 
+/// Plays the linker: writes the Arm program next to it where rustc asked
+/// for the executable.
+const FAKE_LINKER: &str = r#"#!/bin/sh
+here="$(dirname "$0")"
+for a in "$@"; do
+  case "$a" in @*) set -- "$@" $(cat "${a#@}") ;; esac
+done
+while [ $# -gt 0 ]; do
+  [ "$1" = "-o" ] && out="$2"
+  shift
+done
+cp "$here/program.elf" "$out"
+"#;
+
+fn host_triple() -> String {
+    let out = Command::new("rustc").arg("-vV").output().unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .unwrap()
+        .to_string()
+}
+
 /// A serial check a bare board can see and a pin check it cannot.
 const BANNER_AND_BLINK: &str = "\
 timeout_ms: 1500
@@ -139,6 +162,9 @@ struct Machine {
     fake_espflash: Option<TempDir>,
     /// `TER_PORT`, when set.
     port: Option<String>,
+    /// A UF2 bootloader's drive (`TER_UF2_DRIVE`) and the linker that
+    /// makes the build an Arm program for it, when set.
+    uf2: Option<TempDir>,
 }
 
 impl Machine {
@@ -158,6 +184,7 @@ impl Machine {
             fake_wokwi: None,
             fake_espflash: None,
             port: None,
+            uf2: None,
         };
         let dir = m.exercise();
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -252,9 +279,13 @@ impl Machine {
             .env("TER_CONFIG_DIR", self.config.path())
             .env("TER_TOKEN", "good-token")
             .env_remove("WOKWI_CLI_TOKEN")
-            .env_remove("TER_PORT");
+            .env_remove("TER_PORT")
+            .env_remove("TER_UF2_DRIVE");
         if let Some(port) = &self.port {
             cmd.env("TER_PORT", port);
+        }
+        if let Some(uf2) = &self.uf2 {
+            cmd.env("TER_UF2_DRIVE", uf2.path().join("RPI-RP2"));
         }
         if let Some(fake) = &self.fake_espflash {
             let path = std::env::var_os("PATH").unwrap_or_default();
@@ -321,6 +352,63 @@ impl Machine {
         self.fake_espflash = Some(fake);
         self.port = Some(port.to_string());
         self
+    }
+
+    /// Make the exercise one for an XIAO RP2040: `check` as its check.yaml,
+    /// the `elf2uf2-rs -d` runner, and a build that links an RP2040
+    /// program (a stand-in linker writes it). With `drive`, the board is in
+    /// its bootloader: TER_UF2_DRIVE names its drive, and once ter copies
+    /// the program there the drive goes away as the board restarts.
+    #[cfg(unix)]
+    fn on_uf2_board(mut self, check: &str, drive: bool) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.exercise();
+        std::fs::write(dir.join("check.yaml"), check).unwrap();
+        let uf2 = tempfile::tempdir().unwrap();
+        let linker = uf2.path().join("ld");
+        std::fs::write(&linker, FAKE_LINKER).unwrap();
+        std::fs::set_permissions(&linker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = ter_flash::uf2::elf32(&[(0x1000_0000, &[0x5a; 600])]);
+        std::fs::write(uf2.path().join("program.elf"), program).unwrap();
+        std::fs::create_dir_all(dir.join(".cargo")).unwrap();
+        std::fs::write(
+            dir.join(".cargo/config.toml"),
+            format!(
+                "[target.thumbv6m-none-eabi]\nrunner = \"elf2uf2-rs -d\"\n\n[target.{}]\nlinker = {:?}\n",
+                host_triple(),
+                linker
+            ),
+        )
+        .unwrap();
+        if drive {
+            let drive = uf2.path().join("RPI-RP2");
+            std::fs::create_dir(&drive).unwrap();
+            let info = drive.join("INFO_UF2.TXT");
+            std::fs::write(
+                &info,
+                "UF2 Bootloader v3.0\nModel: Raspberry Pi RP2\nBoard-ID: RPI-RP2\n",
+            )
+            .unwrap();
+            let copied = drive.join("ter.uf2");
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                while std::fs::metadata(&copied).map_or(true, |m| m.len() == 0) {
+                    if started.elapsed() > std::time::Duration::from_secs(300) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = std::fs::remove_file(info);
+            });
+        }
+        self.uf2 = Some(uf2);
+        self
+    }
+
+    /// The file ter copies to the UF2 drive.
+    fn uf2_copied(&self) -> PathBuf {
+        self.uf2.as_ref().unwrap().path().join("RPI-RP2/ter.uf2")
     }
 
     fn espflash_saw(&self) -> String {
@@ -793,6 +881,102 @@ async fn no_board_stops_before_the_build() {
         !m.exercise().join(".runs").exists(),
         "refused before the build"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_uf2_board_is_flashed_through_its_drive_and_heard_on_its_new_port() {
+    let server = site("0.1.0", run_answer()).await;
+    let mut m = Machine::with_exercise(GOOD, &["hardware", "simulation"]);
+    m = m.on_uf2_board(BANNER_AND_BLINK, true);
+    let board = Board::start(m.uf2_copied(), &["Hello world!\r\n"], false);
+    m.port = Some(board.port.clone());
+
+    let o = m.ter_in(&server.uri(), &["run"], &m.exercise());
+    board.thread.join().unwrap();
+
+    let out = String::from_utf8_lossy(&o.stdout);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{out}\n{err}");
+    assert!(
+        err.contains("then the board through its UF2 drive"),
+        "{err}"
+    );
+    assert!(err.contains("Copying the program to"), "{err}");
+    assert!(out.contains("  | Hello world!"), "{out}");
+    assert!(out.contains("unseen  blink-rate"), "{out}");
+    let run = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(run["venue"], "local");
+    assert_eq!(run["check_status"], "passed", "{run}");
+    assert_eq!(
+        (run["checks_seen"].as_u64(), run["checks_total"].as_u64()),
+        (Some(1), Some(2))
+    );
+
+    let rec = m.exercise().join(".runs/1");
+    let uf2 = std::fs::read(rec.join("firmware.uf2")).unwrap();
+    assert_eq!(
+        uf2,
+        std::fs::read(m.uf2_copied()).unwrap(),
+        "the file copied"
+    );
+    assert_eq!(uf2.len(), 3 * 512, "600 bytes: three pages");
+    assert_eq!(&uf2[28..32], &0xe48b_ff56u32.to_le_bytes(), "RP2040 family");
+    let log = std::fs::read_to_string(rec.join("flash.log")).unwrap();
+    assert!(
+        log.contains("UF2 for the RP2040") && log.contains("restarted after"),
+        "{log}"
+    );
+    let events = std::fs::read_to_string(rec.join("events.jsonl")).unwrap();
+    assert!(
+        events.lines().nth(1).unwrap().contains(r#""kind":"reset""#),
+        "a reset synthesised at capture start: {events}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_uf2_board_not_in_its_bootloader_stops_before_the_build() {
+    let server = site("0.1.0", run_answer()).await;
+    let mut m = Machine::with_exercise(GOOD, &["hardware"]).on_uf2_board(BANNER_AND_BLINK, false);
+    let empty = m.uf2.as_ref().unwrap().path().join("RPI-RP2");
+    std::fs::create_dir(&empty).unwrap();
+    m.port = None;
+
+    let (ok, v) = m.json(&server.uri(), &["run"]);
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("no UF2 drive there") && message.contains("hold BOOT, tap RESET"),
+        "{message}"
+    );
+    assert!(posted(&server, "run").await.is_empty());
+    assert!(
+        !m.exercise().join(".runs").exists(),
+        "refused before the build"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_program_the_uf2_board_cannot_take_posts_not_run() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware"]).on_uf2_board(BANNER_AND_BLINK, true);
+    // Linked where the RP2040 has no flash.
+    let wrong = ter_flash::uf2::elf32(&[(0x0002_7000, &[1; 16])]);
+    std::fs::write(m.uf2.as_ref().unwrap().path().join("program.elf"), wrong).unwrap();
+
+    let (ok, v) = m.json(&server.uri(), &["run"]);
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "flash_failed", "{v}");
+    let run = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(run["check_status"], "not_run");
+    let tail = run["transcript_tail"].as_str().unwrap();
+    assert!(tail.contains("outside the RP2040's flash"), "{tail}");
+    assert!(!m.uf2_copied().exists(), "nothing copied");
 }
 
 #[tokio::test]

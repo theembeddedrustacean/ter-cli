@@ -61,6 +61,7 @@ pub async fn ready(
     ter: &TerToml,
     tool: &Tool,
 ) -> Result<BenchReady, CliError> {
+    let tool = spec(tool)?;
     let site = session.client.site_url().to_string();
     let mut benches = Benches::load()?;
     let mut link = benches.current(&site, user).cloned().ok_or_else(|| {
@@ -124,7 +125,18 @@ pub async fn ready(
             link.owner_name, link.label
         )));
     }
-    let tool = match tool {
+    Ok(BenchReady {
+        link,
+        url,
+        info,
+        client,
+        tool,
+    })
+}
+
+/// What the bench is told to flash with.
+fn spec(tool: &Tool) -> Result<ToolSpec, CliError> {
+    Ok(match tool {
         Tool::Espflash { chip } => ToolSpec {
             program: "espflash".into(),
             chip: chip.clone(),
@@ -133,13 +145,12 @@ pub async fn ready(
             program: "probe-rs".into(),
             chip: Some(chip.clone()),
         },
-    };
-    Ok(BenchReady {
-        link,
-        url,
-        info,
-        client,
-        tool,
+        Tool::Uf2 { family } => {
+            return Err(unavailable(format!(
+                "A {} board is flashed through its UF2 bootloader, which someone at the board has to start for every run ({}), so it cannot run on a shared bench. Run it on your own board with `ter run --hw`.",
+                family.chip, family.bootloader
+            )));
+        }
     })
 }
 

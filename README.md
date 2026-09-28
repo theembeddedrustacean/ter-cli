@@ -45,7 +45,8 @@ ter run --hw --venue bench   run on the bench you connected to
 ter telemetry check   judge a recorded run against a check.yaml, offline
 ter new               a new project for a board (--board B --name N)
 ter install <tool>... install what the exercises need: targets, xiao-generate,
-                      espflash, probe-rs, wokwi-cli (with your Wokwi token)
+                      espflash, probe-rs, elf2uf2-rs, uf2deploy,
+                      wokwi-cli (with your Wokwi token)
 ter status            your exercises and their last runs (--disk: disk use)
 ter hint              the next hint for the last run
 ter hint --llm        a hint from your own model, with your own key
@@ -124,6 +125,24 @@ program from its first line, and times in `check.yaml` count from that
 reset. If one board is plugged in `ter` finds it; with several, set
 `TER_PORT` to the one to use (on Linux you need to be in the `dialout`
 group). `ter venues` lists the boards and tools it sees.
+
+A board with a UF2 bootloader and no probe on board (XIAO RP2040, XIAO
+nRF52840; their runner is `elf2uf2-rs -d` or `uf2deploy deploy -f
+<family> -p auto`) is flashed by `ter` itself: it turns the program into a
+UF2 file for the board's family, copies it to the bootloader's drive (the
+USB drive with an `INFO_UF2.TXT`), waits for the board to restart, then
+listens on the USB serial port the program sets up. Put the board in its
+bootloader first (XIAO RP2040: hold BOOT, tap RESET; XIAO nRF52840:
+double-tap RESET); on a terminal `ter run --hw` asks for it and waits.
+With several drives mounted, set `TER_UF2_DRIVE` to the board's; set
+`TER_PORT` if its program's port is not the one that appears after the
+flash. On a machine without a desktop the drive is not mounted by itself:
+`ter` names the device to mount. A program that sets up no USB serial
+cannot be heard, and its run is posted as not run. The UF2 file is kept
+in the run folder as `firmware.uf2`. UF2 boards cannot be shared as a
+bench: every run needs someone at the board to start its bootloader.
+`elf2uf2-rs` and `uf2deploy` are only needed for `cargo run`: `ter
+install elf2uf2-rs` or `ter install uf2deploy`.
 
 A bare board shows serial output only. Checks on pins, and checks that
 press a button, cannot be seen there: `ter` names them as unseen, and if

@@ -11,5 +11,8 @@ homepage.workspace = true
 [dependencies]
 serialport = "4.10"
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

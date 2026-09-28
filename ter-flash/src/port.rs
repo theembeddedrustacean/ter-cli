@@ -1,7 +1,7 @@
 //! Serial ports with a board behind them.
 
 /// What sits behind a USB serial port, from its vendor and product ids.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum PortKind {
     /// An ESP chip's own USB (XIAO ESP32-C3, -C6): serial and reset in one.
     UsbSerialJtag,
@@ -10,6 +10,7 @@ pub enum PortKind {
     /// A debug probe's virtual COM port (ST-LINK on a Nucleo).
     Probe,
     /// Anything else, including ports that are not on USB.
+    #[default]
     Other,
 }
 
@@ -42,8 +43,10 @@ impl std::fmt::Display for PortKind {
     }
 }
 
-/// A serial port and what is behind it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A serial port and what is behind it. The default, with no path, is a
+/// port not known yet: a UF2 board's program shows up on one only after the
+/// flash.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Port {
     pub path: String,
     pub kind: PortKind,
@@ -86,6 +89,45 @@ pub fn list() -> Vec<Port> {
     ports
 }
 
+/// Watches for the port a board's program shows up on after its
+/// bootloader restarts it: one that was not there before, or one that went
+/// away and came back (a bootloader's port and the program's can share a
+/// path, and even ids).
+pub struct Appearing {
+    before: Vec<(String, Option<String>)>,
+    gone: Vec<(String, Option<String>)>,
+}
+
+impl Appearing {
+    /// Start from the ports there now.
+    pub fn from(before: &[Port]) -> Self {
+        Self {
+            before: before.iter().map(key).collect(),
+            gone: Vec::new(),
+        }
+    }
+
+    /// The new port among `now`, if one has appeared.
+    pub fn step(&mut self, now: &[Port]) -> Option<Port> {
+        let now_keys: Vec<_> = now.iter().map(key).collect();
+        for k in &self.before {
+            if !now_keys.contains(k) && !self.gone.contains(k) {
+                self.gone.push(k.clone());
+            }
+        }
+        now.iter()
+            .find(|p| {
+                let k = key(p);
+                !self.before.contains(&k) || self.gone.contains(&k)
+            })
+            .cloned()
+    }
+}
+
+fn key(p: &Port) -> (String, Option<String>) {
+    (p.path.clone(), p.usb.clone())
+}
+
 /// Whether `path` is still there: a board that was unplugged is not.
 pub fn present(path: &str) -> bool {
     std::path::Path::new(path).exists()
@@ -108,6 +150,29 @@ mod tests {
         assert_eq!(PortKind::of(0x2e8a, 0x000a), PortKind::Other);
         assert!(PortKind::UsbSerialJtag.resets() && PortKind::UsbUart.resets());
         assert!(!PortKind::Probe.resets() && !PortKind::Other.resets());
+    }
+
+    #[test]
+    fn the_programs_port_is_the_one_that_appears() {
+        let port = |path: &str, usb: &str| Port {
+            path: path.into(),
+            kind: PortKind::Other,
+            usb: Some(usb.into()),
+            product: None,
+        };
+        let esp = port("/dev/ttyACM0", "303a:1001");
+        let boot = port("/dev/ttyACM1", "2886:0045");
+        let mut w = Appearing::from(&[esp.clone(), boot.clone()]);
+        assert_eq!(w.step(&[esp.clone(), boot.clone()]), None);
+        let program = port("/dev/ttyACM1", "2886:8045");
+        assert_eq!(w.step(&[esp.clone(), program.clone()]), Some(program));
+
+        // Same path, same ids: it has to go away first.
+        let alone = std::slice::from_ref(&boot);
+        let mut w = Appearing::from(alone);
+        assert_eq!(w.step(alone), None);
+        assert_eq!(w.step(&[]), None);
+        assert_eq!(w.step(alone), Some(boot.clone()));
     }
 
     #[test]

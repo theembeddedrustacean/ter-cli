@@ -1,8 +1,10 @@
 //! `ter install`: the tools ter and the exercises use.
 //!
 //! `targets` (the Rust target, toolchain and components of the project in
-//! the current folder), `xiao-generate` (which `ter new` runs), `espflash`
-//! and `probe-rs` are installed with rustup and cargo; `wokwi-cli` is
+//! the current folder), `xiao-generate` (which `ter new` runs), `espflash`,
+//! `probe-rs` and the UF2 runners `elf2uf2-rs` and `uf2deploy` (which
+//! `cargo run` uses; `ter run` flashes UF2 boards itself) are installed
+//! with rustup and cargo; `wokwi-cli` is
 //! Wokwi's command line simulator, downloaded, with the learner's own Wokwi
 //! token.
 //!
@@ -23,11 +25,13 @@ use crate::sim::{self, TOKEN_ENV, TOKEN_PAGE, WOKWI_CLI};
 use crate::token_store::TokenStore;
 
 /// What `ter install` takes, in the order it installs them.
-pub const TOOLS: [&str; 7] = [
+pub const TOOLS: [&str; 9] = [
     "targets",
     "xiao-generate",
     "espflash",
     "probe-rs",
+    "elf2uf2-rs",
+    "uf2deploy",
     "wokwi-cli",
     "sim86",
     "telemetry-firmware",
@@ -94,6 +98,8 @@ pub async fn run(
             "targets" => Tool::Targets,
             "espflash" => Tool::Espflash,
             "probe-rs" => Tool::ProbeRs,
+            "elf2uf2-rs" => Tool::Elf2uf2Rs,
+            "uf2deploy" => Tool::Uf2deploy,
             "xiao-generate" => Tool::XiaoGenerate,
             _ => {
                 reports.push(Report::Wokwi(wokwi(token_stdin, json).await?));

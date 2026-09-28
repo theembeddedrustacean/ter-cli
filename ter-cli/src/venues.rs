@@ -7,7 +7,7 @@ use ter_telemetry::local::Local;
 use ter_telemetry::wokwi::Wokwi;
 use ter_telemetry::{EventKinds, Kind};
 
-use crate::hw::PORT_ENV;
+use crate::hw::{PORT_ENV, UF2_DRIVE_ENV};
 use crate::output::{CliError, print_json};
 use crate::sim;
 
@@ -49,8 +49,38 @@ pub fn run(json: bool) -> Result<(), CliError> {
     let port_env = std::env::var(PORT_ENV)
         .ok()
         .filter(|p| !p.trim().is_empty());
-    let local_ready =
-        tools.iter().any(|(_, p)| p.is_some()) && (!boards.is_empty() || port_env.is_some());
+    // A UF2 board in its bootloader shows a drive, not a port; ter flashes
+    // it itself.
+    let named_drive = std::env::var(UF2_DRIVE_ENV)
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .and_then(|p| ter_flash::drive::Drive::at(std::path::Path::new(p.trim())));
+    let mut drives = ter_flash::drive::mounted();
+    drives.extend(named_drive.filter(|d| !drives.iter().any(|m| m.path == d.path)));
+    let uf2_provides: EventKinds = Local::provides_on(
+        &Tool::Uf2 {
+            family: &ter_flash::uf2::RP2040,
+        },
+        PortKind::Other,
+    );
+    let uf2_drives: Vec<Value> = drives
+        .iter()
+        .map(|d| {
+            json!({
+                "drive": d.path,
+                "board": d.board(),
+                "family": d.family().map(|f| f.name),
+                "provides": kinds(&uf2_provides),
+            })
+        })
+        .collect();
+    let unmounted: Vec<String> = ter_flash::drive::unmounted()
+        .iter()
+        .map(|d| d.display().to_string())
+        .collect();
+    let local_ready = (tools.iter().any(|(_, p)| p.is_some())
+        && (!boards.is_empty() || port_env.is_some()))
+        || !uf2_drives.is_empty();
 
     let wokwi_cli = sim::find_cli().map(|p| p.display().to_string());
     let wokwi_token = matches!(sim::token(), Ok(Some(_)));
@@ -63,6 +93,8 @@ pub fn run(json: bool) -> Result<(), CliError> {
                 "mode": "hardware",
                 "ready": local_ready,
                 "boards": boards,
+                "uf2_drives": uf2_drives,
+                "uf2_unmounted": unmounted,
                 "port_env": port_env,
                 "tools": tools.iter().map(|(t, p)| (t.to_string(), json!(p))).collect::<serde_json::Map<_, _>>(),
             },
@@ -83,7 +115,7 @@ pub fn run(json: bool) -> Result<(), CliError> {
     }
 
     println!("local (hardware): your board on USB");
-    if boards.is_empty() {
+    if boards.is_empty() && uf2_drives.is_empty() {
         println!("  no board found on USB");
     }
     for b in &boards {
@@ -104,6 +136,17 @@ pub fn run(json: bool) -> Result<(), CliError> {
                     .join(", "))
                 .unwrap_or_default()
         );
+    }
+    for d in &drives {
+        println!(
+            "  {}  UF2 drive of {}  flashed by ter; sees {} once the program sets up USB serial",
+            d.path.display(),
+            d.board(),
+            kinds(&uf2_provides).join(", ")
+        );
+    }
+    for disk in &unmounted {
+        println!("  {disk}  UF2 bootloader, not mounted (`udisksctl mount -b {disk}`)");
     }
     if let Some(p) = &port_env {
         println!("  {PORT_ENV}={p}");
