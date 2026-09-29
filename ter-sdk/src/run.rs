@@ -51,6 +51,10 @@ pub struct RunAnswer {
     pub attempt: u32,
     #[serde(default)]
     pub concept_deltas: Vec<ConceptDelta>,
+    /// Whether this run completed the lesson. False after a pass on the
+    /// learner's own board; absent from sites that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson_completed: Option<bool>,
 }
 
 /// How one concept's mastery moved on a run.
@@ -323,6 +327,12 @@ mod tests {
         .unwrap();
         assert_eq!(a.attempt, 2);
         assert_eq!(a.concept_deltas[0].label.as_deref(), Some("GPIO output"));
+        assert_eq!(a.lesson_completed, None);
+        let a: RunAnswer = serde_json::from_value(serde_json::json!({
+            "name": "a1b2c3", "attempt": 3, "lesson_completed": false
+        }))
+        .unwrap();
+        assert_eq!(a.lesson_completed, Some(false));
     }
 
     #[test]
@@ -337,6 +347,7 @@ mod tests {
                 name: "r1".into(),
                 attempt: 1,
                 concept_deltas: vec![],
+                lesson_completed: None,
             },
             posted_at: "2026-09-27T12:00:00Z".into(),
             recording: ".runs/1".into(),

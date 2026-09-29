@@ -453,6 +453,9 @@ fn answer_json(
     let mut out = serde_json::to_value(record).expect("record serialises");
     out["name"] = json!(answer.name);
     out["site"] = json!({"attempt": answer.attempt, "concept_deltas": answer.concept_deltas});
+    if let Some(completed) = answer.lesson_completed {
+        out["site"]["lesson_completed"] = json!(completed);
+    }
     out["recording"] = json!(recording);
     if let Outcome::Checked { verdicts, .. } = outcome {
         out["verdicts"] = json!(verdicts);
@@ -507,6 +510,18 @@ fn partial_line(verdicts: &[CheckVerdict], sim_allowed: bool) -> Option<String> 
     }
 }
 
+/// The line that says a pass on a board did not complete the lesson, when
+/// the site says so and the exercise can run in simulation.
+fn board_pass_line(record: &RunRecord, answer: &RunAnswer, sim_allowed: bool) -> Option<String> {
+    let on = match record.venue.as_deref() {
+        Some("local") => "your board",
+        Some("bench") => "the bench",
+        _ => return None,
+    };
+    (sim_allowed && record.check_status == "passed" && answer.lesson_completed == Some(false))
+        .then(|| format!("Passed on {on}. Run `ter run --sim` to complete the lesson."))
+}
+
 /// The last `n` lines of what the board printed.
 fn serial_tail(transcript: &str, n: usize) -> String {
     let lines: Vec<&str> = transcript.lines().collect();
@@ -525,6 +540,7 @@ fn print_text(done: &Done) {
         ..
     } = done;
     let (local, sim_allowed) = (*local, *sim_allowed);
+    let board_pass = board_pass_line(record, answer, sim_allowed);
     if record.build_status == "passed" {
         print!("Built in {:.1} s.", built_in.as_secs_f64());
         if let Some((t, venue)) = *ran_in {
@@ -547,7 +563,8 @@ fn print_text(done: &Done) {
                     println!("  | {line}");
                 }
             }
-            print_verdicts(verdicts, sim_allowed)
+            // The board-pass line points at --sim instead.
+            print_verdicts(verdicts, sim_allowed && board_pass.is_none())
         }
         Outcome::Infra { .. } | Outcome::BuildFailed { .. } => {}
     }
@@ -559,6 +576,9 @@ fn print_text(done: &Done) {
             d.before,
             d.after
         );
+    }
+    if let Some(line) = board_pass {
+        println!("{line}");
     }
     if record.build_status == "failed" || record.check_status == "failed" {
         println!("Stuck? `ter hint` gives a hint for this run.");
@@ -586,6 +606,37 @@ pub fn exercise_dir(dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pass_on_a_board_that_did_not_complete_the_lesson_points_at_sim() {
+        let record = |venue: &str, check: &str| RunRecord {
+            venue: Some(venue.into()),
+            check_status: check.into(),
+            ..RunRecord::default()
+        };
+        let answer = |completed| RunAnswer {
+            name: "r1".into(),
+            attempt: 1,
+            concept_deltas: vec![],
+            lesson_completed: completed,
+        };
+        let board = record("local", "passed");
+        assert_eq!(
+            board_pass_line(&board, &answer(Some(false)), true).unwrap(),
+            "Passed on your board. Run `ter run --sim` to complete the lesson."
+        );
+        assert_eq!(
+            board_pass_line(&record("bench", "passed"), &answer(Some(false)), true).unwrap(),
+            "Passed on the bench. Run `ter run --sim` to complete the lesson."
+        );
+        assert_eq!(board_pass_line(&board, &answer(Some(true)), true), None);
+        assert_eq!(board_pass_line(&board, &answer(None), true), None);
+        assert_eq!(board_pass_line(&board, &answer(Some(false)), false), None);
+        let failed = record("local", "failed");
+        assert_eq!(board_pass_line(&failed, &answer(Some(false)), true), None);
+        let sim = record("wokwi", "passed");
+        assert_eq!(board_pass_line(&sim, &answer(Some(false)), true), None);
+    }
 
     #[test]
     fn a_partial_pass_says_so_and_points_at_the_full_check() {

@@ -809,6 +809,34 @@ async fn text_output_shows_the_serial_and_the_partial_pass() {
     );
 }
 
+/// The site says a pass on the learner's board did not complete the
+/// lesson: one line points at the simulation run that does.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_board_pass_that_did_not_complete_the_lesson_points_at_sim() {
+    let answer = ok(json!({"name": "r-0001", "attempt": 3, "lesson_completed": false}));
+    let server = site("0.1.0", answer).await;
+    let mut m = Machine::with_exercise(GOOD, &["hardware", "simulation"]);
+    m = m.on_board(BANNER_AND_BLINK, 0, "");
+    let board = Board::start(flashed(&m), &["Hello world!\r\n"], false);
+    m.port = Some(board.port.clone());
+
+    let o = m.ter_in(&server.uri(), &["run"], &m.exercise());
+    board.thread.join().unwrap();
+
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.contains("Passed on your board. Run `ter run --sim` to complete the lesson."),
+        "{out}"
+    );
+    assert!(
+        out.contains("1 of 2 checks seen on this setup, all passed.\n"),
+        "the --sim pointer is said once: {out}"
+    );
+    assert!(!out.contains("Full check"), "{out}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_board_unplugged_mid_capture_posts_not_run_never_failed() {
