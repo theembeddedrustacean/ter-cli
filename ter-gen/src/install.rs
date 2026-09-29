@@ -2,7 +2,8 @@
 //! there, and the commands that install the ones that are not.
 //!
 //! Planning is separate from doing. [`plan`] only looks (it runs
-//! `rustup ... list` and `<tool> --version`, nothing that changes the
+//! `rustup ... list`, `<tool> --version` and `cargo install --list`,
+//! nothing that changes the
 //! machine) and returns one [`Item`] per thing a tool needs. The caller runs
 //! the [`Cmd`]s of the items that are missing. Running `ter install` twice
 //! is therefore safe: the second plan finds everything present and runs
@@ -274,7 +275,8 @@ fn cargo_tool(probe: &impl Probe, tool: &CargoTool) -> Item {
         Some(path) => {
             let version = probe
                 .output(&path, &["--version"])
-                .and_then(|out| version(&out));
+                .and_then(|out| version(&out))
+                .or_else(|| installed_version(probe, tool.krate));
             match version {
                 Some((v, major)) if major < tool.min_major => install(
                     format!(
@@ -302,6 +304,23 @@ fn version(out: &str) -> Option<(String, u64)> {
         .find(|w| w.starts_with(|c: char| c.is_ascii_digit()) && w.contains('.'))?;
     let major = word.split('.').next()?.parse().ok()?;
     Some((word.to_string(), major))
+}
+
+/// The version cargo recorded when it installed `krate`, for tools with no
+/// working `--version` (ldproxy 0.3.5 panics on it). `cargo install --list`
+/// names each crate on a line of its own: `ldproxy v0.3.5:`.
+fn installed_version(probe: &impl Probe, krate: &str) -> Option<(String, u64)> {
+    let cargo = probe.find("cargo")?;
+    let list = probe.output(&cargo, &["install", "--list"])?;
+    list.lines()
+        .filter(|l| !l.starts_with(char::is_whitespace))
+        .find_map(|l| {
+            let mut words = l.split_whitespace();
+            (words.next() == Some(krate))
+                .then(|| words.next())
+                .flatten()
+                .and_then(|v| version(v.trim_end_matches(':')))
+        })
 }
 
 fn targets(probe: &impl Probe, project: &ProjectTarget) -> Vec<Item> {
@@ -570,6 +589,46 @@ mod tests {
             run[0].to_string(),
             "cargo install espflash --locked --force"
         );
+    }
+
+    #[test]
+    fn without_a_version_line_the_version_comes_from_cargo_install_list() {
+        let list = "espflash v4.6.0:\n    espflash\nldproxy v0.3.5:\n    ldproxy\nprobe-rs-tools v0.32.0 (https://github.com/probe-rs/probe-rs#abc):\n    cargo-embed\n    probe-rs\n";
+        let host = Fake::default()
+            .with("rustup")
+            .with("ldproxy")
+            .with("probe-rs")
+            .with("cargo")
+            .says("cargo install --list", list);
+        let std_c3 = ProjectTarget {
+            triple: "riscv32imc-esp-espidf".into(),
+            build_std: true,
+            ldproxy: true,
+            ..Default::default()
+        };
+        let items = plan(&host, Tool::Targets, Some(&std_c3));
+        let ldproxy = items.iter().find(|i| i.what == "ldproxy").unwrap();
+        assert_eq!(ldproxy.state, State::Present("0.3.5, ldproxy".into()));
+        assert_eq!(
+            plan(&host, Tool::ProbeRs, None)[0].state,
+            State::Present("0.32.0, probe-rs".into())
+        );
+
+        // A version from the list is checked for too old like any other.
+        let old = Fake::default()
+            .with("espflash")
+            .with("cargo")
+            .says("cargo install --list", "espflash v3.3.0:\n    espflash\n");
+        assert!(matches!(
+            plan(&old, Tool::Espflash, None)[0].state,
+            State::Install { ref why, .. } if why.contains("3.3.0 is too old")
+        ));
+
+        // No --version and not in the list: present, version unknown.
+        let bare = Fake::default().with("ldproxy").with("cargo").with("rustup");
+        let items = plan(&bare, Tool::Targets, Some(&std_c3));
+        let ldproxy = items.iter().find(|i| i.what == "ldproxy").unwrap();
+        assert_eq!(ldproxy.state, State::Present("ldproxy".into()));
     }
 
     #[test]
