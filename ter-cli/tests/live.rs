@@ -207,19 +207,35 @@ fn live_ex_list_matches_the_site() {
     assert_eq!(from_ter, from_site);
 }
 
-// The test account is enrolled in ESP Bare Metal GPIO only and has not
-// passed Heartbeat, so the next exercise is locked and the std course is
-// not its own.
+// Heartbeat is always fetchable by the test account and the std course is
+// not its own. Which lessons are locked depends on what the account has
+// passed (the suite itself passes Heartbeat), so the locked exercise comes
+// from the site.
 const LIVE_OPEN: &str = "gpio-blinky--xiao-esp32c3-nostd";
-const LIVE_LOCKED: &str = "gpio-button-blink--xiao-esp32c3-nostd";
 const LIVE_NOT_ENROLLED: &str = "std-gpio-blinky--xiao-esp32c3-std";
+
+/// The first exercise the site says is locked for this account.
+fn site_locked_exercise(token: &str) -> String {
+    let site = site_enrollments(token);
+    site["courses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|c| c["lessons"].as_array().unwrap())
+        .filter(|l| l["locked"].as_bool().unwrap())
+        .flat_map(|l| l["exercises"].as_array().unwrap())
+        .map(|e| e["exercise_id"].as_str().unwrap().to_string())
+        .next()
+        .unwrap_or_else(|| panic!("the test account has a locked lesson: {site}"))
+}
 
 #[test]
 #[ignore = "live site"]
 fn live_fetch_refusals_come_from_the_site() {
     let token = live_token();
+    let locked = site_locked_exercise(&token);
     for (id, code) in [
-        (LIVE_LOCKED, "locked"),
+        (locked.as_str(), "locked"),
         (LIVE_NOT_ENROLLED, "not_enrolled"),
         ("no-such-exercise", "not_found"),
     ] {
@@ -472,6 +488,10 @@ fn live_failed_build_is_posted_and_attempts_count() {
     // Other tests post runs of the same exercise, so hold the turn through
     // both runs: the attempt between them must be this test's alone.
     let turn = take_turn();
+    // Open, or done once the suite has passed Heartbeat; a failed build
+    // changes neither.
+    let (ok, before) = m.json(&["status"], &dir);
+    assert!(ok, "{before}");
     let (ok, first) = m.json(&["run", "--no-check"], &dir);
     assert!(!ok, "the stub does not build: {first}");
     assert_eq!(first["error"]["code"], "build_failed", "{first}");
@@ -506,7 +526,11 @@ fn live_failed_build_is_posted_and_attempts_count() {
     let (ok, status) = m.json(&["status"], &dir);
     assert!(ok, "{status}");
     assert_eq!(status["last_run"]["attempt"], attempt + 1);
-    assert_eq!(status["state"], "open");
+    assert!(
+        before["state"] == "open" || before["state"] == "done",
+        "{before}"
+    );
+    assert_eq!(status["state"], before["state"]);
 }
 
 fn live_client() -> ter_sdk::Client {
