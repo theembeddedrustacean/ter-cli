@@ -837,6 +837,32 @@ async fn a_board_pass_that_did_not_complete_the_lesson_points_at_sim() {
     assert!(!out.contains("Full check"), "{out}");
 }
 
+/// Hardware only: the lesson page completes the lesson, not --sim.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hardware_only_board_pass_points_at_the_lesson_page() {
+    let answer = ok(json!({"name": "r-0001", "attempt": 3, "lesson_completed": false}));
+    let server = site("0.1.0", answer).await;
+    let mut m = Machine::with_exercise(GOOD, &["hardware"]);
+    m = m.on_board(BANNER_AND_BLINK, 0, "");
+    let board = Board::start(flashed(&m), &["Hello world!\r\n"], false);
+    m.port = Some(board.port.clone());
+
+    let o = m.ter_in(&server.uri(), &["run"], &m.exercise());
+    board.thread.join().unwrap();
+
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.contains(
+            "Passed on your board, but some checks can't be seen without a telemetry board. \
+             Mark the lesson complete on the lesson page to continue."
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("--sim"), "{out}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_board_unplugged_mid_capture_posts_not_run_never_failed() {

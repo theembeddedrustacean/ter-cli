@@ -511,15 +511,26 @@ fn partial_line(verdicts: &[CheckVerdict], sim_allowed: bool) -> Option<String> 
 }
 
 /// The line that says a pass on a board did not complete the lesson, when
-/// the site says so and the exercise can run in simulation.
+/// the site says so: the simulation run completes it, or, for a
+/// hardware-only exercise, the lesson page does.
 fn board_pass_line(record: &RunRecord, answer: &RunAnswer, sim_allowed: bool) -> Option<String> {
     let on = match record.venue.as_deref() {
         Some("local") => "your board",
         Some("bench") => "the bench",
         _ => return None,
     };
-    (sim_allowed && record.check_status == "passed" && answer.lesson_completed == Some(false))
-        .then(|| format!("Passed on {on}. Run `ter run --sim` to complete the lesson."))
+    if record.check_status != "passed" || answer.lesson_completed != Some(false) {
+        None
+    } else if sim_allowed {
+        Some(format!(
+            "Passed on {on}. Run `ter run --sim` to complete the lesson."
+        ))
+    } else {
+        Some(format!(
+            "Passed on {on}, but some checks can't be seen without a telemetry board. \
+             Mark the lesson complete on the lesson page to continue."
+        ))
+    }
 }
 
 /// The last `n` lines of what the board printed.
@@ -631,7 +642,12 @@ mod tests {
         );
         assert_eq!(board_pass_line(&board, &answer(Some(true)), true), None);
         assert_eq!(board_pass_line(&board, &answer(None), true), None);
-        assert_eq!(board_pass_line(&board, &answer(Some(false)), false), None);
+        assert_eq!(
+            board_pass_line(&board, &answer(Some(false)), false).unwrap(),
+            "Passed on your board, but some checks can't be seen without a telemetry board. \
+             Mark the lesson complete on the lesson page to continue."
+        );
+        assert_eq!(board_pass_line(&board, &answer(Some(true)), false), None);
         let failed = record("local", "failed");
         assert_eq!(board_pass_line(&failed, &answer(Some(false)), true), None);
         let sim = record("wokwi", "passed");
