@@ -263,14 +263,17 @@ impl ResetLines for Box<dyn serialport::SerialPort> {
 /// returns. `pause` is how long each line is held (100 ms on a board).
 pub fn reset_esp(lines: &mut impl ResetLines, kind: PortKind, pause: Duration) -> io::Result<()> {
     if kind == PortKind::UsbSerialJtag {
+        // The peripheral resets the chip the moment RTS is high with DTR
+        // low, and opening the port raised both. RTS comes down first, so
+        // the program does not start a pause before time zero.
+        lines.set_rts(false)?;
         lines.set_dtr(false)?;
         std::thread::sleep(pause);
-        // Through (1, 1), not (0, 0): DTR low with RTS high is reset, not
-        // download mode. RTS twice because Windows applies DTR on RTS.
+        // The reset. RTS twice because Windows applies DTR on RTS. The
+        // chip does not wait for RTS to come down, so neither does this.
         lines.set_rts(true)?;
         lines.set_dtr(false)?;
         lines.set_rts(true)?;
-        std::thread::sleep(pause);
         lines.set_rts(false)?;
     } else {
         lines.set_dtr(false)?;
@@ -414,6 +417,7 @@ mod tests {
         assert_eq!(
             jtag.0,
             [
+                ('R', false),
                 ('D', false),
                 ('R', true),
                 ('D', false),
