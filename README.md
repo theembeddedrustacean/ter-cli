@@ -11,7 +11,8 @@ result and records it on your account.
 cargo install ter-cli
 ```
 
-On Debian and Ubuntu, install `pkg-config libudev-dev` first.
+ter needs Rust 1.98 or newer, so run `rustup update` first.
+On Debian and Ubuntu, also install `pkg-config libudev-dev`.
 
 ## Quick start
 
