@@ -20,11 +20,11 @@ repository = "https://github.com/theembeddedrustacean/ter-cli"
 homepage = "https://github.com/theembeddedrustacean/ter-cli"
 
 [workspace.dependencies]
-ter-sdk = { path = "ter-sdk" }
-ter-check = { path = "ter-check" }
-ter-telemetry = { path = "ter-telemetry" }
-ter-flash = { path = "ter-flash" }
-ter-gen = { path = "ter-gen" }
+ter-sdk = { path = "ter-sdk", version = "0.1.0" }
+ter-check = { path = "ter-check", version = "0.1.0" }
+ter-telemetry = { path = "ter-telemetry", version = "0.1.0" }
+ter-flash = { path = "ter-flash", version = "0.1.0" }
+ter-gen = { path = "ter-gen", version = "0.1.0" }
 base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
 directories = "6"

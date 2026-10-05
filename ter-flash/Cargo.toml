@@ -1,5 +1,6 @@
 [package]
 name = "ter-flash"
+description = "Flashes and resets boards with espflash, probe-rs or a UF2 bootloader, for the ter command line tool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

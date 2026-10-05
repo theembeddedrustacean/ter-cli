@@ -1,5 +1,6 @@
 [package]
 name = "ter-telemetry"
+description = "Venues, instruments and the event stream behind ter's exercise runs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "ter-sdk"
+description = "Client for the TER Learn site, used by the ter command line tool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

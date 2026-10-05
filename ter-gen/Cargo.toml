@@ -1,5 +1,6 @@
 [package]
 name = "ter-gen"
+description = "Project generation and the tool installer behind ter new and ter install"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

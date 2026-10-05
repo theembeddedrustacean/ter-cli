@@ -1,5 +1,6 @@
 [package]
 name = "ter-check"
+description = "Evaluates a recorded run against an exercise's check.yaml, for the ter command line tool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
