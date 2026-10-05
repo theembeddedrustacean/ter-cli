@@ -1,6 +1,7 @@
 [package]
 name = "ter-cli"
 description = "The command line tool for TER Learn: fetch, build, run and check embedded Rust exercises"
+readme = "../README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
