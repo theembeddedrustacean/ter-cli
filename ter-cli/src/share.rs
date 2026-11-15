@@ -11,6 +11,10 @@
 //!
 //! The kill switch is a line on standard input: `k` drops whoever is
 //! driving and turns sharing off on the site.
+//!
+//! A driver's firmware runs on the owner's board with nothing between it
+//! and the chip, so only the boards in [`SHAREABLE`] can be shared, and
+//! the owner is told what that firmware could do before sharing starts.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -38,6 +42,33 @@ pub struct ShareArgs {
     pub url: Option<String>,
     pub bind: IpAddr,
     pub bench_port: u16,
+}
+
+/// The boards that can be shared, as target ids: the ESP32-C3 only, until
+/// each other board's risks have been looked at.
+pub const SHAREABLE: [&str; 1] = ["xiao-esp32c3"];
+
+/// What the owner reads before a bench is shared.
+pub const WARNING: &str = "Warning: whoever has the share code flashes their own firmware onto your board. That firmware can burn eFuses, which cannot be undone, and can drive pins against whatever is wired to them and short them. Share only with people you trust.";
+
+/// Refuse a board that cannot be shared yet.
+pub fn check_shareable(board: &str) -> Result<(), CliError> {
+    let board = board.trim();
+    if SHAREABLE.iter().any(|b| b.eq_ignore_ascii_case(board)) {
+        return Ok(());
+    }
+    Err(CliError::new(
+        "board_not_shareable",
+        format!(
+            "Only the ESP32-C3 ({}) can be shared for now, not {board:?}.",
+            SHAREABLE.join(", ")
+        ),
+    ))
+}
+
+/// Print [`WARNING`] where the owner sees it, whatever the output format.
+pub fn warn_owner() {
+    eprintln!("{WARNING}");
 }
 
 /// The site's heartbeat TTL: no heartbeat for this long and the bench
@@ -104,22 +135,38 @@ impl Board for BenchBoard {
     }
 }
 
-fn tool_of(run: &BenchRun) -> Tool {
-    match run.tool.program.as_str() {
-        "probe-rs" => Tool::ProbeRs {
-            chip: run.tool.chip.clone().unwrap_or_default(),
-        },
-        _ => Tool::Espflash {
-            chip: run.tool.chip.clone(),
-        },
+/// The flasher a run asks for. A shared bench is an ESP32-C3, so anything
+/// but espflash for that chip is refused before it touches the board.
+fn tool_of(run: &BenchRun) -> Result<Tool, BenchError> {
+    let c3 = run
+        .tool
+        .chip
+        .as_deref()
+        .is_none_or(|c| c.eq_ignore_ascii_case("esp32c3"));
+    if run.tool.program != "espflash" || !c3 {
+        return Err(BenchError::new(
+            "wrong_board",
+            format!(
+                "This bench is an ESP32-C3 flashed with espflash; the run asks for {}{}.",
+                run.tool.program,
+                run.tool
+                    .chip
+                    .as_deref()
+                    .map(|c| format!(" --chip {c}"))
+                    .unwrap_or_default()
+            ),
+        ));
     }
+    Ok(Tool::Espflash {
+        chip: run.tool.chip.clone(),
+    })
 }
 
 /// Flash and capture on the board here, in a scratch folder: the run's
 /// recording lives on the driver's machine.
 fn flash_and_capture(run: BenchRun, elf: Vec<u8>) -> Result<BenchAnswer, BenchError> {
     let unavailable = |m: String| BenchError::new("venue_unavailable", m);
-    let tool = tool_of(&run);
+    let tool = tool_of(&run)?;
     let program = ter_flash::find_program(tool.program()).ok_or_else(|| {
         unavailable(format!(
             "{} is not installed on the bench's machine.",
@@ -172,6 +219,8 @@ pub async fn start(
     args: ShareArgs,
     turn: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<Sharing, CliError> {
+    check_shareable(&args.board)?;
+    warn_owner();
     let listener = tokio::net::TcpListener::bind((args.bind, args.bench_port))
         .await
         .map_err(|e| {
@@ -236,6 +285,9 @@ pub async fn start(
         label: registered.label.clone(),
     });
     benches.save()?;
+    // The site may know this bench under another board than the one asked
+    // for (re-registered by label): what is shared is what it answered.
+    check_shareable(&registered.board)?;
     let shared = client
         .bench_share(&registered.bench)
         .await

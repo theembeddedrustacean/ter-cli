@@ -1077,7 +1077,7 @@ fn live_serve_fetches_runs_and_posts_for_the_page() {
     std::fs::create_dir_all(m.courses.path()).unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ter"))
-        .args(["serve", "--port", "0"])
+        .args(["serve", "--port", "0", "--dev"])
         .env("TER_CONFIG_DIR", m.config.path())
         .env("TER_TOKEN", &m.token)
         .env("TER_KEYCHAIN", "off")

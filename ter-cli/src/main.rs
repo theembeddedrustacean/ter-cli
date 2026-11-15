@@ -111,12 +111,20 @@ enum Command {
         /// config, 7357).
         #[arg(long)]
         port: Option<u16>,
+        /// Also answer a lesson page served from http://localhost:8080 (a
+        /// development copy of the site). Without it only the TER Learn
+        /// site's own lesson page can start a run.
+        #[arg(long)]
+        dev: bool,
         /// Also share the board on this machine as a bench: register it on
         /// TER Learn, share it under a code, and take runs from people who
-        /// connect with that code.
+        /// connect with that code. They flash their own firmware onto your
+        /// board, which can burn eFuses or short pins: share only with
+        /// people you trust.
         #[arg(long, requires = "board")]
         share: bool,
-        /// The board you share, as a target id (`xiao-esp32c3`).
+        /// The board you share, as a target id. Only `xiao-esp32c3` can be
+        /// shared for now.
         #[arg(long, requires = "share")]
         board: Option<String>,
         /// A name for the bench on the Devices page (default: the board).
@@ -402,6 +410,7 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
         Command::Venues => venues::run(json),
         Command::Serve {
             port,
+            dev,
             share,
             board,
             label,
@@ -416,7 +425,7 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
                 bind,
                 bench_port,
             });
-            serve::serve(port, share, json).await
+            serve::serve(port, dev, share, json).await
         }
         Command::Connect { code } => bench::connect(&code, json).await,
         Command::Bench { command } => match command {

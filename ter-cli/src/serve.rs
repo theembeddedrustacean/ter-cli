@@ -219,6 +219,7 @@ pub struct ShareFlags {
 
 pub async fn serve(
     port: Option<u16>,
+    dev: bool,
     share: Option<ShareFlags>,
     json: bool,
 ) -> Result<(), CliError> {
@@ -277,11 +278,20 @@ pub async fn serve(
             json!({"bench": s.bench, "label": s.label, "board": s.board,
                    "share_code": s.code, "url": s.url, "listen": s.listen})
         });
-        format!("{}\n", json!({"url": url, "port": bound, "bench": bench}))
+        format!(
+            "{}\n",
+            json!({"url": url, "port": bound, "dev": dev, "bench": bench})
+        )
     } else {
         let mut b = format!(
             "ter serve on {url}, {who}\nThe lesson page's Run button builds here. Stop with Ctrl-C.\n"
         );
+        if dev {
+            b.push_str(&format!(
+                "--dev: a lesson page on {} can start runs here too.\n",
+                ter_remote::serve::DEV_ORIGIN
+            ));
+        }
         if let Some(s) = &sharing {
             b.push_str(&format!(
                 "Bench {} ({}, {}) is shared as {}: others run `ter connect {}`. Runs reach it at {} (listening on {}).\nType k and Enter to drop whoever is driving and stop sharing.\n",
@@ -299,7 +309,7 @@ pub async fn serve(
     }
 
     let service = Arc::new(Serve(Arc::new(Inner { turn })));
-    ter_remote::serve::serve(listener, service)
+    ter_remote::serve::serve(listener, service, dev)
         .await
         .map_err(|e| CliError::new("io_error", format!("ter serve stopped: {e}")))
 }

@@ -1525,6 +1525,139 @@ async fn serve_refuses_any_other_origin() {
     );
 }
 
+#[tokio::test]
+async fn serve_refuses_a_run_that_names_no_origin() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]);
+    let served = m.serve(&server.uri());
+
+    let r = reqwest::Client::new()
+        .post(format!("{}/run", served.url))
+        .json(&json!({"exercise_id": EXERCISE, "files": page_files(&m, BROKEN)}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status().as_u16(), 403);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "origin_refused");
+    assert!(posted(&server, "run").await.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(m.exercise().join("src/main.rs")).unwrap(),
+        GOOD
+    );
+    let health = reqwest::get(format!("{}/health", served.url))
+        .await
+        .unwrap();
+    assert_eq!(health.status().as_u16(), 200, "a health probe still works");
+}
+
+#[tokio::test]
+async fn serve_trusts_the_dev_server_only_with_dev() {
+    const DEV: &str = "http://localhost:8080";
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]);
+    let health = |url: String| async move {
+        reqwest::Client::new()
+            .get(format!("{url}/health"))
+            .header("origin", DEV)
+            .send()
+            .await
+            .unwrap()
+    };
+
+    let plain = m.serve(&server.uri());
+    let r = health(plain.url.clone()).await;
+    assert_eq!(r.status().as_u16(), 403);
+    assert!(r.headers().get("access-control-allow-origin").is_none());
+    assert!(!plain.banner.contains("8080"), "{}", plain.banner);
+    drop(plain);
+
+    let dev = m.serve_with(&server.uri(), &["--dev"]);
+    let r = health(dev.url.clone()).await;
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.headers()["access-control-allow-origin"], DEV);
+}
+
+#[tokio::test]
+async fn only_an_esp32_c3_can_be_shared() {
+    let bench_port = free_port();
+    let server = bench_site(bench_port, 30).await;
+    let m = Machine::with_exercise(GOOD, &["hardware"]);
+    for board in ["xiao-rp2040", "nucleo-f401re", "xiao-esp32s3"] {
+        let out = m.ter_in(
+            &server.uri(),
+            &[
+                "serve",
+                "--port",
+                "0",
+                "--share",
+                "--board",
+                board,
+                "--bench-port",
+                &bench_port.to_string(),
+            ],
+            m.courses.path(),
+        );
+        assert!(!out.status.success(), "{board}");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(said.contains("Only the ESP32-C3"), "{board}: {said}");
+        assert!(said.contains(board), "{board}: {said}");
+    }
+    assert!(posted(&server, "bench_register").await.is_empty());
+    assert!(posted(&server, "bench_share").await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_owner_is_warned_before_the_bench_is_shared() {
+    use std::io::{BufRead, Read};
+    let bench_port = free_port();
+    let server = bench_site(bench_port, 30).await;
+    let (owner, _board) = owner_with_board(&[]);
+    let port = bench_port.to_string();
+    let mut cmd = owner.command(
+        &server.uri(),
+        &[
+            "serve",
+            "--port",
+            "0",
+            "--share",
+            "--board",
+            "xiao-esp32c3",
+            "--bench-port",
+            &port,
+        ],
+        owner.courses.path(),
+    );
+    let mut child = {
+        let _spawning = SPAWN.read().unwrap();
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    // The banner comes once the bench is shared.
+    let mut banner = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut banner)
+        .unwrap();
+    assert!(banner.starts_with("ter serve on "), "{banner}");
+    assert_eq!(posted(&server, "bench_share").await.len(), 1);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let mut said = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut said)
+        .unwrap();
+    assert!(said.contains("burn eFuses"), "{said}");
+    assert!(said.contains("short"), "{said}");
+}
+
 /// A port nothing listens on yet.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")

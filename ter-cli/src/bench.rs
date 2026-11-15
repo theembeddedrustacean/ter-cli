@@ -248,6 +248,8 @@ pub async fn list(json: bool) -> Result<(), CliError> {
 pub async fn share(bench: Option<String>, json: bool) -> Result<(), CliError> {
     let (session, _) = signed_in().await?;
     let b = own(&session, bench.as_deref()).await?;
+    crate::share::check_shareable(&b.board)?;
+    crate::share::warn_owner();
     let shared = session
         .client
         .bench_share(&b.name)

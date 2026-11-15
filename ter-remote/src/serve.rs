@@ -7,11 +7,14 @@
 //! CORS, the origin and host guards and body validation. What a run does
 //! is the [`Service`] ter-cli plugs in.
 //!
-//! Only the two allowed origins get an answer a browser will read, and any
+//! Only the lesson page's origin gets an answer a browser will read (and
+//! the fork's dev server, when `ter serve --dev` asks for it), and any
 //! other origin is refused before anything runs: a POST from an unknown
-//! page must not build or post, whatever CORS lets it read. A `Host` that
-//! is not this loopback address is refused too, so a site that rebinds its
-//! own name to 127.0.0.1 cannot reach the service.
+//! page must not build or post, whatever CORS lets it read. A `/run` with
+//! no `Origin` at all is refused too: every browser sends one on a
+//! cross-origin POST, so a request without it is not the lesson page. A
+//! `Host` that is not this loopback address is refused as well, so a site
+//! that rebinds its own name to 127.0.0.1 cannot reach the service.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,11 +30,11 @@ use axum::routing::{get, post};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-/// The lesson page on the site, and the fork's dev server.
-pub const ALLOWED_ORIGINS: [&str; 2] = [
-    "https://learn.theembeddedrustacean.com",
-    "http://localhost:8080",
-];
+/// The lesson page on the site.
+pub const SITE_ORIGIN: &str = "https://learn.theembeddedrustacean.com";
+/// The fork's dev server: trusted only when `ter serve --dev` says so, since
+/// anything a learner runs on that port would otherwise count as the page.
+pub const DEV_ORIGIN: &str = "http://localhost:8080";
 
 /// The largest body `/run` takes: an exercise's files, with room to spare.
 pub const BODY_LIMIT: usize = 4 * 1024 * 1024;
@@ -211,11 +214,28 @@ pub fn editable(path: &str) -> bool {
 struct Ctx {
     service: Arc<dyn Service>,
     port: u16,
+    /// Whether [`DEV_ORIGIN`] is trusted next to the site.
+    dev: bool,
 }
 
-/// The routes, behind the origin and host guards.
-pub fn router(service: Arc<dyn Service>, port: u16) -> Router {
-    let ctx = Ctx { service, port };
+impl Ctx {
+    fn origins(&self) -> &'static [&'static str] {
+        if self.dev {
+            &[SITE_ORIGIN, DEV_ORIGIN]
+        } else {
+            &[SITE_ORIGIN]
+        }
+    }
+
+    fn allowed_origin(&self, origin: &str) -> bool {
+        self.origins().contains(&origin)
+    }
+}
+
+/// The routes, behind the origin and host guards. `dev` also trusts the
+/// fork's dev server.
+pub fn router(service: Arc<dyn Service>, port: u16, dev: bool) -> Router {
+    let ctx = Ctx { service, port, dev };
     Router::new()
         .route("/health", get(health))
         .route("/", get(health))
@@ -263,10 +283,6 @@ async fn not_found() -> Response {
     ServeError::new("not_found", "ter serve answers /health and /run.").into_response()
 }
 
-fn allowed_origin(origin: &str) -> bool {
-    ALLOWED_ORIGINS.contains(&origin)
-}
-
 /// `127.0.0.1:<port>` or `localhost:<port>`: the names this service is
 /// reached by. Anything else is a page that rebound its own name here.
 fn allowed_host(host: &str, port: u16) -> bool {
@@ -300,12 +316,21 @@ async fn guard(State(ctx): State<Ctx>, request: Request, next: Next) -> Response
             "ter serve only answers requests to 127.0.0.1 or localhost.",
         )
         .into_response()
-    } else if origin.as_deref().is_some_and(|o| !allowed_origin(o)) {
+    } else if origin.as_deref().is_some_and(|o| !ctx.allowed_origin(o)) {
         ServeError::new(
             "origin_refused",
             format!(
                 "ter serve only answers the TER Learn lesson page ({}).",
-                ALLOWED_ORIGINS.join(" or ")
+                ctx.origins().join(" or ")
+            ),
+        )
+        .into_response()
+    } else if origin.is_none() && matches!(path.as_str(), "/run" | "/run/") {
+        ServeError::new(
+            "origin_refused",
+            format!(
+                "ter serve only takes runs from the TER Learn lesson page ({}), and this request names no origin. In a terminal, use `ter run`.",
+                ctx.origins().join(" or ")
             ),
         )
         .into_response()
@@ -340,7 +365,7 @@ async fn guard(State(ctx): State<Ctx>, request: Request, next: Next) -> Response
     let h = response.headers_mut();
     h.insert(header::VARY, HeaderValue::from_static("Origin"));
     if host_ok
-        && let Some(o) = origin.as_deref().filter(|o| allowed_origin(o))
+        && let Some(o) = origin.as_deref().filter(|o| ctx.allowed_origin(o))
         && let Ok(v) = HeaderValue::from_str(o)
     {
         h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
@@ -353,13 +378,15 @@ async fn guard(State(ctx): State<Ctx>, request: Request, next: Next) -> Response
     response
 }
 
-/// Serve on `listener` until the process ends.
+/// Serve on `listener` until the process ends. `dev` also trusts the
+/// fork's dev server.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     service: Arc<dyn Service>,
+    dev: bool,
 ) -> std::io::Result<()> {
     let port = listener.local_addr()?.port();
-    let app = router(service, port).layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT));
+    let app = router(service, port, dev).layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT));
     axum::serve(listener, app).await
 }
 
@@ -389,11 +416,16 @@ mod tests {
     const PORT: u16 = 7357;
 
     fn app(answer: Result<Value, ServeError>) -> (Router, Arc<Fake>) {
+        app_with(answer, false)
+    }
+
+    /// As `ter serve --dev` when `dev`.
+    fn app_with(answer: Result<Value, ServeError>, dev: bool) -> (Router, Arc<Fake>) {
         let fake = Arc::new(Fake {
             asked: Mutex::new(Vec::new()),
             answer,
         });
-        (router(fake.clone(), PORT), fake)
+        (router(fake.clone(), PORT, dev), fake)
     }
 
     fn req(method: &str, path: &str, origin: Option<&str>, body: &str) -> Request {
@@ -419,7 +451,7 @@ mod tests {
         (status, headers, v)
     }
 
-    const SITE: &str = "https://learn.theembeddedrustacean.com";
+    const SITE: &str = SITE_ORIGIN;
     const BODY: &str = r#"{"exercise_id": "gpio-blinky--xiao-esp32c3-nostd",
         "files": [{"path": "src/bin/main.rs", "content": "fn main() {}"}]}"#;
 
@@ -437,9 +469,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_origins_are_allowed_and_preflight_is_answered() {
-        let (app, _) = app(Ok(json!({"check_status": "passed"})));
-        for origin in ALLOWED_ORIGINS {
+    async fn with_dev_both_origins_are_allowed_and_preflight_is_answered() {
+        let (app, _) = app_with(Ok(json!({"check_status": "passed"})), true);
+        for origin in [SITE_ORIGIN, DEV_ORIGIN] {
             let mut r = req("OPTIONS", "/run", Some(origin), "");
             r.headers_mut().insert(
                 "access-control-request-private-network",
@@ -465,6 +497,46 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{origin}");
             assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], origin);
             assert_eq!(v["check_status"], "passed");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_dev_server_is_refused_without_dev() {
+        let (app, fake) = app(Ok(json!({})));
+        for (method, body) in [("POST", BODY), ("OPTIONS", "")] {
+            let (status, h, v) = send(&app, req(method, "/run", Some(DEV_ORIGIN), body)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}");
+            assert_eq!(v["error"]["code"], "origin_refused");
+            assert!(
+                !v["error"]["message"].as_str().unwrap().contains("8080"),
+                "the dev server is not offered: {v}"
+            );
+            assert!(h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        }
+        let (status, _, _) = send(&app, req("GET", "/health", Some(DEV_ORIGIN), "")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(fake.asked.lock().unwrap().is_empty());
+
+        let (status, h, _) = send(&app, req("POST", "/run", Some(SITE), BODY)).await;
+        assert_eq!(status, StatusCode::OK, "the site still runs");
+        assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], SITE);
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_origin_is_refused_and_nothing_runs() {
+        for dev in [false, true] {
+            let (app, fake) = app_with(Ok(json!({})), dev);
+            for path in ["/run", "/run/"] {
+                let (status, h, v) = send(&app, req("POST", path, None, BODY)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{path}, dev {dev}");
+                assert_eq!(v["error"]["code"], "origin_refused");
+                assert!(h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+            }
+            assert!(fake.asked.lock().unwrap().is_empty());
+            // A health probe from a terminal names no origin and is harmless.
+            let (status, _, v) = send(&app, req("GET", "/health", None, "")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v["service"], "ter");
         }
     }
 
@@ -521,7 +593,7 @@ mod tests {
     #[tokio::test]
     async fn the_request_reaches_the_service_with_simulation_by_default() {
         let (app, fake) = app(Ok(json!({})));
-        let (status, _, _) = send(&app, req("POST", "/run", None, BODY)).await;
+        let (status, _, _) = send(&app, req("POST", "/run", Some(SITE), BODY)).await;
         assert_eq!(status, StatusCode::OK);
         let asked = fake.asked.lock().unwrap();
         assert_eq!(asked[0].exercise_id, "gpio-blinky--xiao-esp32c3-nostd");

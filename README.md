@@ -38,7 +38,7 @@ ter llm setup                    choose that model and store your key
 ter install <tool>               the toolchain, flashing tools and the simulator
 ter new --board <board>          a new project for a board
 ter serve                        lets the lesson page's Run button use this machine
-ter serve --share | ter connect  share a board as a bench, or use one
+ter serve --share | ter connect  share an ESP32-C3 as a bench, or use one
 ter venues                       the boards and tools ter can see
 ter self-update                  how to update ter
 ```
@@ -48,6 +48,13 @@ also takes `--json`.
 
 ## Good to know
 
+- `ter serve` only takes runs from the lesson page on
+  learn.theembeddedrustacean.com. `ter serve --dev` also trusts a copy of
+  the site served from `http://localhost:8080`.
+- Sharing a bench lets whoever has the code flash their own firmware onto
+  your board. Firmware can burn eFuses, which cannot be undone, and can
+  short pins against whatever is wired to them. Share only with people you
+  trust. Only the XIAO ESP32-C3 can be shared for now.
 - `ter login` approves the machine on the site's `/cli` page. Your
   password never reaches `ter`, and the token is kept in the system
   keychain.
