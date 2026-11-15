@@ -40,6 +40,12 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Keep courses in this folder for this command, instead of the one in
+    /// TER_COURSES_ROOT or `courses_root` in ter's config.toml (default:
+    /// ~/ter-courses).
+    #[arg(long, global = true, value_name = "DIR")]
+    root: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -304,6 +310,17 @@ enum ExCommand {
         course: Option<String>,
     },
     /// Fetch an exercise into its course folder, as a Cargo project.
+    ///
+    /// It goes to <courses-root>/<course>/<id>. The courses root is
+    /// ~/ter-courses unless you set another, in this order: `--root DIR`
+    /// for one command, the TER_COURSES_ROOT environment variable, or
+    /// `courses_root = "DIR"` in ter's config.toml (~/.config/ter on
+    /// Linux). To put one exercise somewhere else, name the folder:
+    /// `ter ex fetch <id> <dir>`.
+    ///
+    /// The other commands look for fetched exercises under the same root,
+    /// so set it once in the environment or the config rather than passing
+    /// --root each time.
     Fetch {
         /// The exercise id, as `ter ex list` shows it.
         id: String,
@@ -339,6 +356,16 @@ enum ExCommand {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    // An empty value, from the flag or the variable, names no folder.
+    let named = |root: PathBuf| Some(root).filter(|r| !r.as_os_str().is_empty());
+    let root = cli.root.clone().and_then(named).or_else(|| {
+        std::env::var_os("TER_COURSES_ROOT")
+            .map(PathBuf::from)
+            .and_then(named)
+    });
+    if let Some(root) = root {
+        config::set_courses_root(&root);
+    }
     match run(cli.command, cli.json).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

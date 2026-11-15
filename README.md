@@ -64,6 +64,15 @@ also takes `--json`.
   start is recorded as not run, never as failed.
 - Each checked run is saved in the exercise's `.runs/` folder.
 
+- `ter ex fetch <id>` puts exercises in `~/ter-courses/<course>/<id>`.
+  To keep them elsewhere, set `courses_root = "<dir>"` in the config
+  file or the `TER_COURSES_ROOT` environment variable, or pass
+  `--root <dir>` to a command. `ter ex fetch <id> <dir>` puts one
+  exercise in a folder of your choice.
+- A fetched exercise and a `ter new` project get a `.gitignore` that
+  covers `.ter/`, `.runs/` and `target/`, so they are ready for your own
+  git repository.
+
 Settings live in `~/.config/ter/config.toml`, and every key is optional.
 
 ## Development

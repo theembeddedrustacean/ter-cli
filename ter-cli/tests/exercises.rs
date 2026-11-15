@@ -315,6 +315,94 @@ async fn fetch_json_and_explicit_dir() {
 }
 
 #[tokio::test]
+async fn fetch_writes_a_gitignore_and_the_exercise_is_still_unedited() {
+    let site = mock_site().await;
+    let m = Machine::new();
+    let o = m.ter(&site.uri(), &["ex", "fetch", BLINKY]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let dir = m.exercise_dir("esp-gpio", BLINKY);
+    let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+    for line in [".ter/", ".runs/", "target/"] {
+        assert!(ignore.lines().any(|l| l == line), "{line} in {ignore}");
+    }
+    let o = m.ter(&site.uri(), &["ex", "remove", BLINKY]);
+    assert!(o.status.success(), "{}", stderr(&o));
+}
+
+#[tokio::test]
+async fn the_courses_root_comes_from_the_flag_then_the_environment_then_the_config() {
+    let site = mock_site().await;
+    let m = Machine::new();
+    let from_env = tempfile::tempdir().unwrap();
+    let from_flag = tempfile::tempdir().unwrap();
+    let ter = |args: &[&str], env_root: Option<&Path>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_ter"));
+        c.args(args)
+            .current_dir(m.courses.path())
+            .env("TER_KEYCHAIN", "off")
+            .env("TER_SITE_URL", site.uri())
+            .env("TER_CONFIG_DIR", m.config.path())
+            .env("TER_TOKEN", "good-token");
+        match env_root {
+            Some(root) => c.env("TER_COURSES_ROOT", root),
+            None => c.env_remove("TER_COURSES_ROOT"),
+        };
+        c.output().unwrap()
+    };
+    let fetched = |root: &Path| {
+        root.join("esp-gpio")
+            .join(BLINKY)
+            .join("ter.toml")
+            .is_file()
+    };
+
+    // The environment beats config.toml.
+    let o = ter(&["ex", "fetch", BLINKY], Some(from_env.path()));
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(fetched(from_env.path()));
+    assert!(m.is_empty(), "nothing under the config's root");
+
+    // The flag beats the environment, before or after the subcommand.
+    let flag = from_flag.path().to_str().unwrap();
+    let o = ter(
+        &["ex", "fetch", BLINKY, "--root", flag],
+        Some(from_env.path()),
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(fetched(from_flag.path()));
+
+    // Other commands look under the same root.
+    let o = ter(&["--root", flag, "ex", "remove", BLINKY], None);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(!fetched(from_flag.path()));
+    assert!(fetched(from_env.path()), "the other root is untouched");
+
+    // An empty variable is no root at all: the config's applies.
+    let o = ter(&["ex", "fetch", BLINKY], Some(Path::new("")));
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(fetched(m.courses.path()));
+
+    // A relative --root is taken from the current folder.
+    let o = ter(&["ex", "remove", BLINKY], None);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = ter(&["ex", "fetch", BLINKY, "--root", "mine"], None);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(fetched(&m.courses.path().join("mine")));
+}
+
+#[test]
+fn fetch_help_says_how_to_choose_the_folder() {
+    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["ex", "fetch", "--help"])
+        .output()
+        .unwrap();
+    let help = stdout(&o);
+    for needle in ["--root", "TER_COURSES_ROOT", "courses_root", "<id> <dir>"] {
+        assert!(help.contains(needle), "{needle} in {help}");
+    }
+}
+
+#[tokio::test]
 async fn fetch_passes_the_sites_refusals_through_and_writes_nothing() {
     let site = mock_site().await;
     let m = Machine::new();

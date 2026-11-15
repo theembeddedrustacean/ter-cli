@@ -18,6 +18,7 @@ const FAKE: &str = r#"#!/bin/sh
 for a in "$@"; do echo "$a"; done >> "$FAKE/args"
 case "$1" in --list-*) echo "Supported XIAO module variants:"; exit 0 ;; esac
 echo "generated"
+if [ -n "$FAKE_PROJECT" ]; then mkdir -p "$FAKE_PROJECT"; printf 'debug/\ntarget/\n' > "$FAKE_PROJECT/.gitignore"; fi
 exit "${FAKE_EXIT:-0}"
 "#;
 
@@ -149,6 +150,33 @@ fn json_names_the_project_folder_and_keeps_the_generators_output_off_stdout() {
         m.root.path().join("blinky")
     );
     assert!(text(&out.stderr).contains("generated"));
+}
+
+#[test]
+fn the_new_project_ignores_ters_folders_as_well_as_the_generators() {
+    let m = Machine::new(true);
+    let project = m.root.path().join("blinky");
+    let out = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["new", "--board", "xiao-esp32c3", "--name", "blinky"])
+        .current_dir(m.root.path())
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", m.root.path().join("bin").display()),
+        )
+        .env("FAKE", m.root.path())
+        .env("FAKE_PROJECT", &project)
+        .env("HOME", m.root.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let ignore = std::fs::read_to_string(project.join(".gitignore")).unwrap();
+    let lines: Vec<&str> = ignore.lines().collect();
+    assert!(ignore.starts_with("debug/\ntarget/\n"), "{ignore}");
+    assert!(
+        lines.contains(&".ter/") && lines.contains(&".runs/"),
+        "{ignore}"
+    );
+    assert_eq!(lines.iter().filter(|l| **l == "target/").count(), 1);
 }
 
 #[test]

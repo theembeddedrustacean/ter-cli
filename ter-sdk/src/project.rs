@@ -35,6 +35,15 @@ pub const COURSE_EMBUILD_DIR: &str = ".embuild";
 /// Not build output: `ter ex clean` keeps it.
 pub const STATE_DIR: &str = ".ter";
 
+/// Git's ignore file, at the top of an exercise or a new project.
+pub const GITIGNORE: &str = ".gitignore";
+
+/// What that file must ignore: ter's own state, the run recordings and
+/// cargo's build output.
+const IGNORED: [&str; 3] = [".ter/", ".runs/", "target/"];
+
+const GITIGNORE_HEADER: &str = "# Added by ter: its own state, run recordings and build output.\n";
+
 /// Build output inside an exercise: cargo's own `target/` when something
 /// builds it without `ter`, and the run recordings.
 const EXERCISE_BUILD_OUTPUT: [&str; 2] = ["target", RUNS_DIR];
@@ -370,6 +379,8 @@ impl Scaffold {
             }
             std::fs::write(&path, bytes).map_err(|e| ProjectError::io("write", &path, e))?;
         }
+        // Before the hash, so the file as ter leaves it is the fetched one.
+        ensure_gitignore(dir)?;
         let ter = TerToml {
             exercise: self.exercise_id.clone(),
             course: course.to_string(),
@@ -383,6 +394,46 @@ impl Scaffold {
         ter.save(dir)?;
         Ok(ter)
     }
+}
+
+/// Make `dir`'s `.gitignore` ignore `.ter/`, `.runs/` and `target/`. A
+/// file that is already there keeps its lines; only the missing ones are
+/// added at the end. Returns whether the file changed.
+pub fn ensure_gitignore(dir: &Path) -> Result<bool> {
+    let path = dir.join(GITIGNORE);
+    let mut text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(ProjectError::io("read", &path, e)),
+    };
+    let name = |line: &str| {
+        let line = line.trim();
+        line.strip_prefix('/')
+            .unwrap_or(line)
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let present: Vec<String> = text.lines().map(name).collect();
+    let missing: Vec<&str> = IGNORED
+        .into_iter()
+        .filter(|entry| !present.contains(&name(entry)))
+        .collect();
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    if !text.is_empty() {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push('\n');
+    }
+    text.push_str(GITIGNORE_HEADER);
+    for entry in missing {
+        text.push_str(entry);
+        text.push('\n');
+    }
+    std::fs::write(&path, text).map_err(|e| ProjectError::io("write", &path, e))?;
+    Ok(true)
 }
 
 /// The `runner` set for any target in a `.cargo/config.toml`.
@@ -638,6 +689,33 @@ mod tests {
             .unwrap()
             .write(&dest, "esp-gpio", default_modes())
             .unwrap()
+    }
+
+    #[test]
+    fn fetch_writes_a_gitignore_for_ters_folders_and_build_output() {
+        let root = tempfile::tempdir().unwrap();
+        let f = fetch(&Layout::new(root.path()), &scaffold());
+        assert_eq!(
+            std::fs::read_to_string(f.dir.join(GITIGNORE)).unwrap(),
+            format!("{GITIGNORE_HEADER}.ter/\n.runs/\ntarget/\n")
+        );
+        assert!(!f.is_edited().unwrap(), "ter's own file is not an edit");
+    }
+
+    #[test]
+    fn a_scaffolds_gitignore_keeps_its_lines_and_gains_the_missing_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ex = scaffold();
+        ex.files.push(file(GITIGNORE, "debug/\n/target\n*.pdb"));
+        let f = fetch(&Layout::new(root.path()), &ex);
+        assert_eq!(
+            std::fs::read_to_string(f.dir.join(GITIGNORE)).unwrap(),
+            format!("debug/\n/target\n*.pdb\n\n{GITIGNORE_HEADER}.ter/\n.runs/\n")
+        );
+        assert!(!f.is_edited().unwrap());
+        assert!(!ensure_gitignore(&f.dir).unwrap(), "nothing left to add");
+        std::fs::write(f.dir.join(GITIGNORE), "mine\n").unwrap();
+        assert!(f.is_edited().unwrap(), "the learner's change is an edit");
     }
 
     #[test]

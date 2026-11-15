@@ -56,8 +56,14 @@ fn run_generator(args: &[OsString], json: bool) -> Result<(), CliError> {
 pub fn new(args: NewArgs, json: bool) -> Result<(), CliError> {
     let gen_args = args.generator_args();
     run_generator(&gen_args, json)?;
+    let dir = args.out_dir();
+    // The generator's own .gitignore covers cargo; ter adds its folders.
+    if dir.is_dir()
+        && let Err(e) = ter_sdk::project::ensure_gitignore(&dir)
+    {
+        eprintln!("warning: {e}");
+    }
     if json {
-        let dir = args.out_dir();
         print_json(&Generated {
             board: args.board,
             hal: args.hal,

@@ -45,6 +45,16 @@ impl Default for Config {
     }
 }
 
+/// The courses root for this run, from `--root` or `TER_COURSES_ROOT`.
+static COURSES_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Use `root` as the courses root for this run, whatever `config.toml`
+/// says. A relative path is taken from the current folder.
+pub fn set_courses_root(root: &Path) {
+    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let _ = COURSES_ROOT.set(root);
+}
+
 /// The config directory: `TER_CONFIG_DIR` when set, else the platform's.
 pub fn config_dir() -> Result<PathBuf, CliError> {
     if let Some(dir) = std::env::var_os("TER_CONFIG_DIR").filter(|d| !d.is_empty()) {
@@ -57,9 +67,13 @@ pub fn config_dir() -> Result<PathBuf, CliError> {
 
 impl Config {
     /// Load `config.toml` from the config directory; defaults when it does
-    /// not exist. `TER_SITE_URL` overrides `site_url`.
+    /// not exist. `TER_SITE_URL` overrides `site_url`; `--root` or
+    /// `TER_COURSES_ROOT` overrides `courses_root`.
     pub fn load() -> Result<Self, CliError> {
         let mut config = Self::load_from(&config_dir()?.join("config.toml"))?;
+        if let Some(root) = COURSES_ROOT.get() {
+            config.courses_root = root.clone();
+        }
         if let Ok(url) = std::env::var("TER_SITE_URL")
             && !url.is_empty()
         {

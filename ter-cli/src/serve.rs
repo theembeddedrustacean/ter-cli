@@ -166,6 +166,11 @@ fn write_files(dir: &Path, request: &RunRequest) -> Result<Vec<String>, CliError
         if on_disk.as_deref() == Some(file.content.as_bytes()) {
             continue;
         }
+        // ter adds its own lines to .gitignore at fetch, so the page's
+        // copy differs by design; it neither builds nor judges.
+        if file.path == ter_sdk::project::GITIGNORE {
+            continue;
+        }
         if !editable(&file.path) {
             not_written.push(file.path.clone());
             continue;
