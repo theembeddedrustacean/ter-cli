@@ -797,14 +797,20 @@ async fn text_output_shows_the_serial_and_the_partial_pass() {
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success(), "{out}\n{err}");
     assert!(
-        err.contains("1 of 2 checks cannot be seen here (blink-rate)"),
+        err.contains(
+            "This run on your board can't complete the exercise: blink-rate is graded only in simulation (1 of 2 checks). \
+             Your board still shows it working; `ter run --sim` completes it."
+        ),
         "{err}"
     );
     assert!(out.contains("Ran on the board in"), "{out}");
     assert!(out.contains("  | Hello world!"), "{out}");
-    assert!(out.contains("unseen  blink-rate"), "{out}");
+    assert!(out.contains("not graded  blink-rate"), "{out}");
     assert!(
-        out.contains("1 of 2 checks seen on this setup, all passed. Full check: ter run --sim"),
+        out.contains(
+            "1 of 2 checks passed here; blink-rate is graded only in simulation, \
+             so this run can't complete the exercise. To complete it: ter run --sim"
+        ),
         "{out}"
     );
 }
@@ -831,10 +837,10 @@ async fn a_board_pass_that_did_not_complete_the_lesson_points_at_sim() {
         "{out}"
     );
     assert!(
-        out.contains("1 of 2 checks seen on this setup, all passed.\n"),
+        out.contains("so this run can't complete the exercise.\n"),
         "the --sim pointer is said once: {out}"
     );
-    assert!(!out.contains("Full check"), "{out}");
+    assert!(!out.contains("To complete it"), "{out}");
 }
 
 /// Hardware only: the lesson page completes the lesson, not --sim.
@@ -855,12 +861,18 @@ async fn a_hardware_only_board_pass_points_at_the_lesson_page() {
     assert!(o.status.success(), "{out}");
     assert!(
         out.contains(
-            "Passed on your board, but some checks can't be seen without a telemetry board. \
+            "Passed on your board, but some checks are graded only with a telemetry board. \
              Mark the lesson complete on the lesson page to continue."
         ),
         "{out}"
     );
     assert!(!out.contains("--sim"), "{out}");
+    assert!(
+        out.contains(
+            "blink-rate is graded only with a telemetry board, which ter does not support yet"
+        ),
+        "{out}"
+    );
 }
 
 #[cfg(unix)]
@@ -958,7 +970,7 @@ async fn a_uf2_board_is_flashed_through_its_drive_and_heard_on_its_new_port() {
     );
     assert!(err.contains("Copying the program to"), "{err}");
     assert!(out.contains("  | Hello world!"), "{out}");
-    assert!(out.contains("unseen  blink-rate"), "{out}");
+    assert!(out.contains("not graded  blink-rate"), "{out}");
     let run = &posted(&server, "run").await[0]["payload"];
     assert_eq!(run["venue"], "local");
     assert_eq!(run["check_status"], "passed", "{run}");

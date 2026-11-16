@@ -4,8 +4,9 @@
 //! build: which tool flashes it (the scaffold's runner: the target's
 //! `flash.tool`), whether that tool is installed, and which port the board
 //! is on. Any of those missing is `venue_unavailable` with nothing posted.
-//! What the board cannot see is not refused: those checks are named as
-//! unseen after the run (section 6.2 of the design).
+//! What the board cannot grade is not refused: before the build ter says
+//! the run cannot complete the exercise and which run does, and after it
+//! those checks are named as not graded (section 6.2 of the design).
 //!
 //! A UF2 board is flashed through its bootloader's drive, so what has to
 //! be there before the build is the drive: the board in its bootloader.
@@ -245,21 +246,47 @@ fn mount_it(disk: &Path) -> String {
     )
 }
 
-/// The checks the board cannot see, as one line for before the build, or
-/// `None` when it sees them all.
-pub fn unseen_note(file: &CheckFile, provides: &EventKinds) -> Option<String> {
+/// Why the named checks cannot pass on a board or bench: graded only in
+/// simulation, or, for an exercise with no simulation, only with a
+/// telemetry board. "blink is graded only in simulation".
+pub fn graded_only(ids: &[String], sim_allowed: bool) -> String {
+    let verb = if ids.len() == 1 { "is" } else { "are" };
+    let where_ = if sim_allowed {
+        "in simulation"
+    } else {
+        "with a telemetry board, which ter does not support yet"
+    };
+    format!("{} {verb} graded only {where_}", ids.join(", "))
+}
+
+/// Before the build, when `provides` cannot grade every check: says this
+/// run cannot complete the exercise, which checks and why, and what does.
+/// `on` is "your board" or "the bench". `None` when it grades them all.
+pub fn unseen_note(
+    file: &CheckFile,
+    provides: &EventKinds,
+    on: &str,
+    sim_allowed: bool,
+) -> Option<String> {
     let unseen: Vec<String> = unobservable(file, provides)
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    (!unseen.is_empty()).then(|| {
-        format!(
-            "A bare board shows serial only: {} of {} checks cannot be seen here ({}).",
-            unseen.len(),
-            file.checks.len(),
-            unseen.join(", ")
-        )
-    })
+    if unseen.is_empty() {
+        return None;
+    }
+    let mut note = format!(
+        "This run on {on} can't complete the exercise: {} ({} of {} checks).",
+        graded_only(&unseen, sim_allowed),
+        unseen.len(),
+        file.checks.len(),
+    );
+    note.push_str(match (sim_allowed, on) {
+        (true, "your board") => " Your board still shows it working; `ter run --sim` completes it.",
+        (true, _) => " `ter run --sim` completes it.",
+        (false, _) => " Once the rest pass, mark the lesson complete on the lesson page.",
+    });
+    Some(note)
 }
 
 #[cfg(test)]
@@ -332,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_board_names_the_checks_it_cannot_see() {
+    fn a_bare_board_says_it_cannot_complete_a_pin_check() {
         let file = CheckFile::parse(
             "timeout_ms: 3000\nassert:\n  - id: banner\n    serial_contains: hi\n    within_ms: 2000\n  - id: blink\n    pin: user_led\n    toggles_per_s: { min: 1.8, max: 2.2 }\n    window_ms: [600, 2600]\n",
         )
@@ -340,13 +367,27 @@ mod tests {
         let tool = Tool::Espflash { chip: None };
         let provides = Local::provides_on(&tool, PortKind::UsbSerialJtag);
         assert_eq!(
-            unseen_note(&file, &provides).unwrap(),
-            "A bare board shows serial only: 1 of 2 checks cannot be seen here (blink)."
+            unseen_note(&file, &provides, "your board", true).unwrap(),
+            "This run on your board can't complete the exercise: blink is graded only in simulation (1 of 2 checks). \
+             Your board still shows it working; `ter run --sim` completes it."
+        );
+        assert_eq!(
+            unseen_note(&file, &provides, "the bench", true).unwrap(),
+            "This run on the bench can't complete the exercise: blink is graded only in simulation (1 of 2 checks). \
+             `ter run --sim` completes it."
+        );
+        assert_eq!(
+            unseen_note(&file, &provides, "your board", false).unwrap(),
+            "This run on your board can't complete the exercise: blink is graded only with a telemetry board, \
+             which ter does not support yet (1 of 2 checks). Once the rest pass, mark the lesson complete on the lesson page."
         );
         let serial_only = CheckFile::parse(
             "timeout_ms: 3000\nassert:\n  - id: banner\n    serial_contains: hi\n    within_ms: 2000\n",
         )
         .unwrap();
-        assert_eq!(unseen_note(&serial_only, &provides), None);
+        assert_eq!(
+            unseen_note(&serial_only, &provides, "your board", true),
+            None
+        );
     }
 }

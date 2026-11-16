@@ -8,16 +8,13 @@
 
 use std::path::PathBuf;
 
-use ter_check::CheckFile;
 use ter_flash::Tool;
 use ter_remote::bench::{BenchClient, BenchError, BenchInfo, RemoteBench, ToolSpec, fits};
 use ter_sdk::project::TerToml;
-use ter_telemetry::EventKinds;
 
 use crate::bench::{Benches, Link};
 use crate::output::CliError;
 use crate::session::Session;
-use crate::sim::unobservable;
 
 pub struct BenchReady {
     pub link: Link,
@@ -151,22 +148,5 @@ fn spec(tool: &Tool) -> Result<ToolSpec, CliError> {
                 family.chip, family.bootloader
             )));
         }
-    })
-}
-
-/// The checks the bench cannot see, as one line for before the build, or
-/// `None` when it sees them all.
-pub fn unseen_note(file: &CheckFile, provides: &EventKinds) -> Option<String> {
-    let unseen: Vec<String> = unobservable(file, provides)
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
-    (!unseen.is_empty()).then(|| {
-        format!(
-            "This bench shows serial only: {} of {} checks cannot be seen on it ({}).",
-            unseen.len(),
-            file.checks.len(),
-            unseen.join(", ")
-        )
     })
 }

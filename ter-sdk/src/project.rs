@@ -18,7 +18,6 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -287,18 +286,9 @@ impl Scaffold {
                     format!("{:?} is a name ter keeps for itself", f.path),
                 ));
             }
-            let bytes = match f.encoding.as_str() {
-                "utf8" | "" => f.content.clone().into_bytes(),
-                "base64" => base64::engine::general_purpose::STANDARD
-                    .decode(&f.content)
-                    .map_err(|e| ProjectError::authoring(id, format!("{}: {e}", f.path)))?,
-                other => {
-                    return Err(ProjectError::authoring(
-                        id,
-                        format!("{}: unknown encoding {other:?}", f.path),
-                    ));
-                }
-            };
+            let bytes = f
+                .bytes()
+                .map_err(|e| ProjectError::authoring(id, format!("{}: {e}", f.path)))?;
             if path == Path::new(".cargo/config.toml") {
                 runner = find_runner(&String::from_utf8_lossy(&bytes));
             }

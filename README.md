@@ -30,7 +30,7 @@ ter hint                        stuck? get the next hint
 
 ```
 ter login | logout | whoami      pairing and account
-ter ex list | fetch | clean | remove
+ter ex list | fetch | show | clean | remove
 ter run [--hw | --sim | --no-check]
 ter status                       your exercises and their last runs
 ter hint [--llm]                 a hint from the course, or from your own model
@@ -69,6 +69,11 @@ also takes `--json`.
   file or the `TER_COURSES_ROOT` environment variable, or pass
   `--root <dir>` to a command. `ter ex fetch <id> <dir>` puts one
   exercise in a folder of your choice.
+- A board run reads serial only, so it can complete an exercise only
+  when every check is a serial check with no button presses. Pin checks
+  (a blink rate, a pulse width) are graded in simulation: your board
+  still shows the LED, but only `ter run --sim` completes the exercise.
+  `ter ex show <id>` says which run can pass an exercise.
 - A fetched exercise and a `ter new` project get a `.gitignore` that
   covers `.ter/`, `.runs/` and `target/`, so they are ready for your own
   git repository.

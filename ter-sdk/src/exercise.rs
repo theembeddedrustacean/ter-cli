@@ -83,6 +83,20 @@ fn utf8() -> String {
     "utf8".into()
 }
 
+impl ExerciseFile {
+    /// The file's bytes, decoded from its `encoding`.
+    pub fn bytes(&self) -> Result<Vec<u8>, String> {
+        use base64::Engine;
+        match self.encoding.as_str() {
+            "utf8" | "" => Ok(self.content.clone().into_bytes()),
+            "base64" => base64::engine::general_purpose::STANDARD
+                .decode(&self.content)
+                .map_err(|e| e.to_string()),
+            other => Err(format!("unknown encoding {other:?}")),
+        }
+    }
+}
+
 /// Both modes, the site's order: what an exercise allows when nothing says
 /// otherwise.
 pub fn default_modes() -> Vec<String> {

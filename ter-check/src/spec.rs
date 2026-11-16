@@ -148,6 +148,22 @@ impl CheckFile {
         kinds
     }
 
+    /// Whether a bare board, which ter hears through serial only, can grade
+    /// `check`: a serial check in a file with no `setup:`. A pin check can
+    /// still be watched on the board (the LED blinks), but only the
+    /// simulator grades it.
+    pub fn board_grades(&self, check: &Check) -> bool {
+        self.needs(check).iter().all(|k| *k == Kind::Serial)
+    }
+
+    /// Whether only the simulator can pass this file: any check that is not
+    /// serial, or any `setup:`. The lesson page's sentence on where an
+    /// exercise passes comes from the same rule (`check_needs_sim` in the
+    /// curriculum's `tools/ter_sync.py`); change both together.
+    pub fn needs_sim(&self) -> bool {
+        !self.setup.is_empty() || !self.checks.iter().all(|c| self.board_grades(c))
+    }
+
     /// The pins the checks watch, in check order, each once.
     pub fn watched_pins(&self) -> Vec<String> {
         let mut pins: Vec<String> = Vec::new();
@@ -433,6 +449,29 @@ assert:
     serial_contains: \"ready\"
     within_ms: 2000
 ";
+
+    #[test]
+    fn only_serial_checks_without_setup_can_pass_on_a_board() {
+        let serial = CheckFile::parse(
+            "timeout_ms: 2000\nassert:\n  - id: banner\n    serial_contains: \"ready\"\n    within_ms: 2000\n",
+        )
+        .unwrap();
+        assert!(serial.board_grades(&serial.checks[0]));
+        assert!(!serial.needs_sim());
+
+        let button = CheckFile::parse(BUTTON_BLINK).unwrap();
+        assert!(button.needs_sim());
+        // Under a `setup:` even the serial check needs the simulator's press.
+        assert!(button.checks.iter().all(|c| !button.board_grades(c)));
+
+        let pin = CheckFile::parse(
+            "timeout_ms: 2000\nassert:\n  - id: banner\n    serial_contains: \"ready\"\n    within_ms: 2000\n  - id: on\n    pin: user_led\n    is: high\n    between_ms: [100, 200]\n",
+        )
+        .unwrap();
+        assert!(pin.needs_sim());
+        assert!(pin.board_grades(&pin.checks[0]));
+        assert!(!pin.board_grades(&pin.checks[1]));
+    }
 
     #[test]
     fn a_curriculum_check_parses() {

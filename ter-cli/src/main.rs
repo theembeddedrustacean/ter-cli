@@ -330,6 +330,18 @@ enum ExCommand {
         #[arg(long, value_name = "CURRICULUM_PATH")]
         dev: Option<PathBuf>,
     },
+    /// What an exercise checks and which run can pass it: on your board
+    /// (`ter run --hw`), in simulation (`ter run --sim`), or both.
+    ///
+    /// With no argument, the exercise in the current folder; or name a
+    /// folder or an exercise id. A fetched exercise is read offline, from
+    /// its check.yaml as fetched; an id not fetched yet is asked of the
+    /// site once and nothing is written. It grades and runs nothing.
+    Show {
+        /// An exercise id or folder; the one you are in by default.
+        #[arg(value_name = "ID_OR_DIR")]
+        what: Option<String>,
+    },
     /// Delete build output and run recordings; the source stays. With no
     /// argument, the exercise in the current folder.
     Clean {
@@ -542,6 +554,7 @@ async fn ex(command: ExCommand, json: bool) -> Result<(), CliError> {
             };
             exercises::clean(scope, json)
         }
+        ExCommand::Show { what } => exercises::show(what, json).await,
         ExCommand::Remove { id, force } => exercises::remove(&id, force, json),
     }
 }

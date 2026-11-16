@@ -691,3 +691,191 @@ fn fetch_dev_reads_a_curriculum_checkout_without_the_site() {
         "{v}"
     );
 }
+
+const SERIAL_CHECK: &str = "timeout_ms: 2000\nassert:\n  - id: banner\n    serial_contains: \"ready\"\n    within_ms: 2000\n";
+const PIN_CHECK: &str = "timeout_ms: 3000\nassert:\n  - id: banner\n    serial_contains: \"ready\"\n    within_ms: 2000\n  - id: blink-rate\n    pin: user_led\n    toggles_per_s: { min: 1.8, max: 2.2 }\n    window_ms: [600, 2600]\n";
+const SETUP_CHECK: &str = "timeout_ms: 3000\nsetup:\n  - press: user_button\n    at_ms: 500\nassert:\n  - id: pressed\n    serial_contains: \"pressed\"\n    within_ms: 2000\n";
+
+/// The mock site, plus `id` answering with `check` (or no check.yaml) and
+/// `modes`.
+async fn site_with(id: &str, check: Option<&str>, modes: &[&str]) -> MockServer {
+    let site = mock_site().await;
+    let mut files = vec![
+        json!({"path": "Cargo.toml", "content": "[package]\nname = \"exercise\"\n", "encoding": "utf8"}),
+        json!({"path": "src/bin/main.rs", "content": "fn main() {}\n", "encoding": "utf8"}),
+        json!({"path": ".cargo/config.toml", "content": format!("[target.riscv32imc-unknown-none-elf]\nrunner = \"{RUNNER}\"\n"), "encoding": "utf8"}),
+    ];
+    if let Some(c) = check {
+        files.push(json!({"path": "check.yaml", "content": c, "encoding": "utf8"}));
+    }
+    let mut ex = exercise(id, Value::Array(files));
+    ex["modes"] = json!(modes);
+    Mock::given(method("GET"))
+        .and(path(format!("{API}.exercise")))
+        .and(query_param("exercise_id", id))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "message": ex })))
+        .mount(&site)
+        .await;
+    site
+}
+
+#[tokio::test]
+async fn show_by_id_asks_the_site_once_and_writes_nothing() {
+    let id = "serial-only--xiao-esp32c3-nostd";
+    let site = site_with(id, Some(SERIAL_CHECK), &["hardware", "simulation"]).await;
+    let m = Machine::new();
+    let o = m.ter(&site.uri(), &["ex", "show", id]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}\n{}", stderr(&o));
+    assert!(out.starts_with(&format!("Heartbeat ({id})\n")), "{out}");
+    assert!(out.contains("checks  from the site (not fetched)"), "{out}");
+    assert!(
+        out.contains("banner  serial_contains  graded on a board and in simulation"),
+        "{out}"
+    );
+    assert!(
+        out.ends_with(
+            "Passes on your board (`ter run --hw`) or in simulation (`ter run --sim`).\n"
+        ),
+        "{out}"
+    );
+    let (ok, v) = m.json(&site.uri(), &["ex", "show", id]);
+    assert!(ok, "{v}");
+    assert_eq!(v["source"], "site");
+    assert_eq!(v["passes_in"], json!(["hardware", "simulation"]));
+    assert_eq!(v["checks"][0]["board_grades"], true);
+    assert!(m.is_empty(), "show writes nothing");
+    let asked = site
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with(".exercise"))
+        .count();
+    assert_eq!(asked, 2, "one exercise call per show");
+}
+
+#[tokio::test]
+async fn show_says_a_pin_check_is_graded_only_in_simulation() {
+    let id = "pins--xiao-esp32c3-nostd";
+    let site = site_with(id, Some(PIN_CHECK), &["hardware", "simulation"]).await;
+    let m = Machine::new();
+    let o = m.ter(&site.uri(), &["ex", "show", id]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}\n{}", stderr(&o));
+    assert!(
+        out.contains("banner      serial_contains  graded on a board and in simulation"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "blink-rate  toggles_per_s    graded only in simulation; a board shows it, but ter can't grade it there"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.ends_with(
+            "Passes only in simulation: `ter run --sim`. A run on a board can't complete it.\n"
+        ),
+        "{out}"
+    );
+    let (_, v) = m.json(&site.uri(), &["ex", "show", id]);
+    assert_eq!(v["passes_in"], json!(["simulation"]));
+}
+
+#[tokio::test]
+async fn show_says_a_setup_needs_the_simulator_even_for_a_serial_check() {
+    let id = "button--xiao-esp32c3-nostd";
+    let site = site_with(id, Some(SETUP_CHECK), &["hardware", "simulation"]).await;
+    let m = Machine::new();
+    let (ok, v) = m.json(&site.uri(), &["ex", "show", id]);
+    assert!(ok, "{v}");
+    assert_eq!(v["checks"][0]["board_grades"], false);
+    assert!(
+        v["checks"][0]["graded"]
+            .as_str()
+            .unwrap()
+            .contains("only the simulator drives"),
+        "{v}"
+    );
+    assert_eq!(v["passes_in"], json!(["simulation"]));
+}
+
+#[tokio::test]
+async fn show_a_hardware_only_pin_check_points_at_the_lesson_page() {
+    let id = "hw-pins--xiao-esp32c3-nostd";
+    let site = site_with(id, Some(PIN_CHECK), &["hardware"]).await;
+    let m = Machine::new();
+    let o = m.ter(&site.uri(), &["ex", "show", id]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.contains("graded only with a telemetry board, which ter does not support yet"),
+        "{out}"
+    );
+    assert!(out.contains("No ter run can pass it yet"), "{out}");
+    assert!(out.contains("lesson page"), "{out}");
+    assert!(!out.contains("--sim"), "{out}");
+}
+
+#[tokio::test]
+async fn show_reads_a_fetched_exercise_offline_from_its_own_check_yaml() {
+    let id = "serial-only--xiao-esp32c3-nostd";
+    let site = site_with(id, Some(SERIAL_CHECK), &["hardware", "simulation"]).await;
+    let m = Machine::new();
+    let o = m.ter(&site.uri(), &["ex", "fetch", id]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let dir = m.exercise_dir("unlisted", id);
+    // The fetched copy is what show reads, not the site's.
+    std::fs::write(dir.join("check.yaml"), PIN_CHECK).unwrap();
+    let offline = "http://127.0.0.1:9";
+    for (args, cwd) in [
+        (vec!["ex", "show"], dir.clone()),
+        (vec!["ex", "show", id], m.courses.path().to_path_buf()),
+    ] {
+        let o = m.ter_in(offline, &args, &cwd);
+        let out = stdout(&o);
+        assert!(o.status.success(), "{args:?}: {out}\n{}", stderr(&o));
+        assert!(
+            out.contains(&format!(
+                "checks  from {} (the copy fetched; the site's can be newer)",
+                dir.join("check.yaml").display()
+            )),
+            "{out}"
+        );
+        assert!(out.contains(&format!("folder  {}", dir.display())), "{out}");
+        assert!(out.contains("blink-rate"), "{out}");
+        assert!(out.contains("Passes only in simulation"), "{out}");
+    }
+}
+
+#[tokio::test]
+async fn show_with_no_check_yaml_says_there_is_nothing_to_pass() {
+    let id = "free--xiao-esp32c3-nostd";
+    let site = site_with(id, None, &["hardware", "simulation"]).await;
+    let m = Machine::new();
+    let o = m.ter(&site.uri(), &["ex", "show", id]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        stdout(&o).ends_with("No check: nothing to pass.\n"),
+        "{}",
+        stdout(&o)
+    );
+    let (ok, v) = m.json(&site.uri(), &["ex", "show", id]);
+    assert!(ok);
+    assert_eq!(v["has_check"], false);
+    assert_eq!(v["passes_in"], json!([]));
+}
+
+#[tokio::test]
+async fn show_passes_the_sites_refusals_through() {
+    let site = mock_site().await;
+    let m = Machine::new();
+    let o = m.ter(
+        &site.uri(),
+        &["ex", "show", "gpio-button--xiao-esp32c3-nostd"],
+    );
+    assert!(!o.status.success());
+    assert!(stderr(&o).starts_with("error[locked]"), "{}", stderr(&o));
+    assert!(m.is_empty());
+}

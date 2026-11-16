@@ -122,6 +122,7 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         ));
     }
     let venue = venue_for(&mode, args.venue.as_deref().or(ter.venue.as_deref()))?;
+    let sim_allowed = ter.modes.iter().any(|m| m == "simulation");
 
     let check_path = dir.join(CHECK_YAML);
     let plan = if args.no_check {
@@ -179,7 +180,8 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         };
         eprintln!("Building {} ({mode}, {how})", ter.exercise);
         if let Plan::Local(hw) = &plan
-            && let Some(note) = hw::unseen_note(&hw.file, &hw.ready.provides())
+            && let Some(note) =
+                hw::unseen_note(&hw.file, &hw.ready.provides(), "your board", sim_allowed)
         {
             eprintln!("{note}");
         }
@@ -189,7 +191,8 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
             eprintln!("ter hears this board through the USB serial port its program sets up.");
         }
         if let (Plan::Bench(b), Some(bench)) = (&plan, &bench)
-            && let Some(note) = remote::unseen_note(&b.file, &bench.info.provides)
+            && let Some(note) =
+                hw::unseen_note(&b.file, &bench.info.provides, "the bench", sim_allowed)
         {
             eprintln!("{note}");
         }
@@ -331,7 +334,7 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         built_in: build.duration,
         ran_in,
         local: matches!(plan, Plan::Local(_) | Plan::Bench(_)),
-        sim_allowed: ter.modes.iter().any(|m| m == "simulation"),
+        sim_allowed,
     })
 }
 
@@ -466,48 +469,56 @@ fn answer_json(
     out
 }
 
-fn print_verdicts(verdicts: &[CheckVerdict], sim_allowed: bool) {
+/// `point_at_sim`: end the partial line with what completes the exercise
+/// (not when the board-pass line will say it).
+fn print_verdicts(verdicts: &[CheckVerdict], sim_allowed: bool, point_at_sim: bool) {
     let width = verdicts.iter().map(|v| v.id.len()).max().unwrap_or(0);
     for v in verdicts {
         let status = match v.status {
             CheckStatus::Pass => "pass",
             CheckStatus::Fail => "FAIL",
-            CheckStatus::NotObservable => "unseen",
+            CheckStatus::NotObservable => "not graded",
         };
         println!(
-            "  {status:<6}  {:<width$}  expected {}; observed {}",
+            "  {status:<10}  {:<width$}  expected {}; observed {}",
             v.id, v.expected, v.observed
         );
     }
-    if let Some(line) = partial_line(verdicts, sim_allowed) {
+    if let Some(line) = partial_line(verdicts, sim_allowed, point_at_sim) {
         println!("{line}");
     }
 }
 
-/// The line that says a run could not see every check, if it could not.
-fn partial_line(verdicts: &[CheckVerdict], sim_allowed: bool) -> Option<String> {
-    let seen = verdicts
+/// The line that says a run could not grade every check, so it cannot
+/// complete the exercise, if it could not.
+fn partial_line(
+    verdicts: &[CheckVerdict],
+    sim_allowed: bool,
+    point_at_sim: bool,
+) -> Option<String> {
+    let unseen: Vec<String> = verdicts
         .iter()
-        .filter(|v| v.status != CheckStatus::NotObservable)
-        .count();
+        .filter(|v| v.status == CheckStatus::NotObservable)
+        .map(|v| v.id.clone())
+        .collect();
+    let seen = verdicts.len() - unseen.len();
     let all_passed = verdicts.iter().all(|v| v.status != CheckStatus::Fail);
-    let full = if sim_allowed {
-        " Full check: ter run --sim"
-    } else {
-        ""
-    };
-    if seen == verdicts.len() || !all_passed {
-        None
-    } else if seen == 0 {
-        Some(format!(
-            "No check can be seen on this setup, so the run is posted as not run.{full}"
-        ))
-    } else {
-        Some(format!(
-            "{seen} of {} checks seen on this setup, all passed.{full}",
-            verdicts.len()
-        ))
+    if unseen.is_empty() || !all_passed {
+        return None;
     }
+    let why = hw::graded_only(&unseen, sim_allowed);
+    let mut line = if seen == 0 {
+        format!("No check can be graded here, so the run is posted as not run: {why}.")
+    } else {
+        format!(
+            "{seen} of {} checks passed here; {why}, so this run can't complete the exercise.",
+            verdicts.len()
+        )
+    };
+    if sim_allowed && point_at_sim {
+        line.push_str(" To complete it: ter run --sim");
+    }
+    Some(line)
 }
 
 /// The line that says a pass on a board did not complete the lesson, when
@@ -527,7 +538,7 @@ fn board_pass_line(record: &RunRecord, answer: &RunAnswer, sim_allowed: bool) ->
         ))
     } else {
         Some(format!(
-            "Passed on {on}, but some checks can't be seen without a telemetry board. \
+            "Passed on {on}, but some checks are graded only with a telemetry board. \
              Mark the lesson complete on the lesson page to continue."
         ))
     }
@@ -575,7 +586,7 @@ fn print_text(done: &Done) {
                 }
             }
             // The board-pass line points at --sim instead.
-            print_verdicts(verdicts, sim_allowed && board_pass.is_none())
+            print_verdicts(verdicts, sim_allowed, board_pass.is_none())
         }
         Outcome::Infra { .. } | Outcome::BuildFailed { .. } => {}
     }
@@ -644,7 +655,7 @@ mod tests {
         assert_eq!(board_pass_line(&board, &answer(None), true), None);
         assert_eq!(
             board_pass_line(&board, &answer(Some(false)), false).unwrap(),
-            "Passed on your board, but some checks can't be seen without a telemetry board. \
+            "Passed on your board, but some checks are graded only with a telemetry board. \
              Mark the lesson complete on the lesson page to continue."
         );
         assert_eq!(board_pass_line(&board, &answer(Some(true)), false), None);
@@ -655,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_pass_says_so_and_points_at_the_full_check() {
+    fn a_partial_pass_says_it_cannot_complete_the_exercise() {
         let v = |id: &str, status| CheckVerdict {
             id: id.into(),
             status,
@@ -669,22 +680,29 @@ mod tests {
             v("rate", NotObservable),
         ];
         assert_eq!(
-            partial_line(&some, true).unwrap(),
-            "1 of 3 checks seen on this setup, all passed. Full check: ter run --sim"
+            partial_line(&some, true, true).unwrap(),
+            "1 of 3 checks passed here; blink, rate are graded only in simulation, \
+             so this run can't complete the exercise. To complete it: ter run --sim"
         );
         assert_eq!(
-            partial_line(&some, false).unwrap(),
-            "1 of 3 checks seen on this setup, all passed."
+            partial_line(&some, true, false).unwrap(),
+            "1 of 3 checks passed here; blink, rate are graded only in simulation, \
+             so this run can't complete the exercise."
+        );
+        assert_eq!(
+            partial_line(&some, false, true).unwrap(),
+            "1 of 3 checks passed here; blink, rate are graded only with a telemetry board, \
+             which ter does not support yet, so this run can't complete the exercise."
         );
         let none = [v("blink", NotObservable)];
-        assert!(
-            partial_line(&none, true)
-                .unwrap()
-                .starts_with("No check can be seen")
-        );
-        assert_eq!(partial_line(&[v("a", Pass)], true), None);
         assert_eq!(
-            partial_line(&[v("a", Fail), v("b", NotObservable)], true),
+            partial_line(&none, true, true).unwrap(),
+            "No check can be graded here, so the run is posted as not run: \
+             blink is graded only in simulation. To complete it: ter run --sim"
+        );
+        assert_eq!(partial_line(&[v("a", Pass)], true, true), None);
+        assert_eq!(
+            partial_line(&[v("a", Fail), v("b", NotObservable)], true, true),
             None
         );
     }

@@ -367,3 +367,269 @@ mod tests {
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
     }
 }
+
+/// Where `ter ex show` found the exercise.
+enum Shown {
+    /// A fetched folder: read offline, its check.yaml as fetched.
+    Folder {
+        dir: PathBuf,
+        ter: project::TerToml,
+        check: Option<(PathBuf, String)>,
+    },
+    /// Not fetched: one `exercise` call to the site, nothing written.
+    Site {
+        exercise: Exercise,
+        check: Option<String>,
+    },
+}
+
+#[derive(Serialize)]
+struct ShowOut {
+    exercise: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    course: Option<String>,
+    target: String,
+    modes: Vec<String>,
+    /// `folder` or `site`.
+    source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
+    /// The check.yaml read, for a fetched folder: the copy as fetched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_yaml: Option<PathBuf>,
+    has_check: bool,
+    checks: Vec<ShownCheck>,
+    /// The modes a run can pass it in: `hardware`, `simulation`, both or
+    /// neither.
+    passes_in: Vec<&'static str>,
+    summary: String,
+}
+
+#[derive(Serialize)]
+struct ShownCheck {
+    id: String,
+    kind: &'static str,
+    /// Whether a bare board can grade it (serial only, no `setup:`).
+    board_grades: bool,
+    graded: String,
+}
+
+/// `ter ex show [ID_OR_DIR]`: what an exercise checks and which run can
+/// pass it. Grades nothing and runs nothing.
+pub async fn show(what: Option<String>, json: bool) -> Result<(), CliError> {
+    let shown = match what {
+        None => from_folder(here_for("show")?)?,
+        Some(arg) => {
+            let path = PathBuf::from(&arg);
+            if let Some(dir) = path
+                .is_dir()
+                .then(|| project::enclosing_exercise(&path))
+                .flatten()
+            {
+                from_folder(dir)?
+            } else if let Some(dir) = fetched_dir(&arg)? {
+                from_folder(dir)?
+            } else {
+                let session = Session::open()?;
+                let exercise = session
+                    .client
+                    .exercise(&arg)
+                    .await
+                    .map_err(|e| session.forget_dead_token(e.into()))?;
+                let check = exercise
+                    .files
+                    .iter()
+                    .find(|f| f.path == crate::run::CHECK_YAML)
+                    .map(|f| {
+                        f.bytes()
+                            .map(|b| String::from_utf8_lossy(&b).into_owned())
+                            .map_err(|e| {
+                                CliError::new(
+                                    "bad_check",
+                                    format!("{}'s check.yaml: {e}", exercise.exercise_id),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                Shown::Site { exercise, check }
+            }
+        }
+    };
+    let out = describe(shown)?;
+    if json {
+        print_json(&out);
+    } else {
+        print_show(&out);
+    }
+    Ok(())
+}
+
+fn from_folder(dir: PathBuf) -> Result<Shown, CliError> {
+    let ter = project::TerToml::load(&dir)?;
+    let path = dir.join(crate::run::CHECK_YAML);
+    let check = match std::fs::read_to_string(&path) {
+        Ok(text) => Some((path, text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(CliError::new(
+                "io_error",
+                format!("Could not read {}: {e}", path.display()),
+            ));
+        }
+    };
+    Ok(Shown::Folder { dir, ter, check })
+}
+
+fn describe(shown: Shown) -> Result<ShowOut, CliError> {
+    let (mut out, text) = match shown {
+        Shown::Folder { dir, ter, check } => {
+            let (check_yaml, text) = check.unzip();
+            (
+                ShowOut {
+                    exercise: ter.exercise,
+                    title: None,
+                    course: Some(ter.course),
+                    target: ter.target,
+                    modes: ter.modes,
+                    source: "folder",
+                    path: Some(dir),
+                    check_yaml,
+                    has_check: false,
+                    checks: vec![],
+                    passes_in: vec![],
+                    summary: String::new(),
+                },
+                text,
+            )
+        }
+        Shown::Site { exercise, check } => (
+            ShowOut {
+                modes: exercise.modes.clone().unwrap_or_else(default_modes),
+                exercise: exercise.exercise_id,
+                title: Some(exercise.title).filter(|t| !t.is_empty()),
+                course: None,
+                target: exercise.target,
+                source: "site",
+                path: None,
+                check_yaml: None,
+                has_check: false,
+                checks: vec![],
+                passes_in: vec![],
+                summary: String::new(),
+            },
+            check,
+        ),
+    };
+    let hardware = out.modes.iter().any(|m| m == "hardware");
+    let simulation = out.modes.iter().any(|m| m == "simulation");
+    let Some(text) = text else {
+        out.summary = "No check: nothing to pass.".into();
+        return Ok(out);
+    };
+    let where_ = out
+        .check_yaml
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(crate::run::CHECK_YAML));
+    let file =
+        ter_check::CheckFile::parse(&text).map_err(|e| crate::telemetry::bad_check(&where_, e))?;
+    out.has_check = true;
+    out.checks = file
+        .checks
+        .iter()
+        .map(|c| {
+            let board_grades = file.board_grades(c);
+            ShownCheck {
+                id: c.id.clone(),
+                kind: c.kind_name(),
+                board_grades,
+                graded: graded_where(board_grades, c.pin().is_some(), hardware, simulation),
+            }
+        })
+        .collect();
+    let needs_sim = file.needs_sim();
+    if hardware && !needs_sim {
+        out.passes_in.push("hardware");
+    }
+    if simulation {
+        out.passes_in.push("simulation");
+    }
+    out.summary = match (hardware, simulation, needs_sim) {
+        (true, true, false) => {
+            "Passes on your board (`ter run --hw`) or in simulation (`ter run --sim`).".into()
+        }
+        (true, false, false) => "Passes on your board: `ter run --hw`.".into(),
+        (_, true, true) if hardware => {
+            "Passes only in simulation: `ter run --sim`. A run on a board can't complete it.".into()
+        }
+        (_, true, _) => "Passes in simulation: `ter run --sim`.".into(),
+        (_, false, _) => "No ter run can pass it yet: some checks are graded only with a \
+                          telemetry board, which ter does not support yet. Mark the lesson \
+                          complete on the lesson page once the rest pass."
+            .into(),
+    };
+    Ok(out)
+}
+
+/// Where one check is graded, in the exercise's modes, said plainly.
+fn graded_where(board_grades: bool, watches_pin: bool, hardware: bool, simulation: bool) -> String {
+    match (hardware, simulation) {
+        (true, true) if board_grades => "graded on a board and in simulation".into(),
+        (true, true) if watches_pin => {
+            "graded only in simulation; a board shows it, but ter can't grade it there".into()
+        }
+        (true, true) => {
+            "graded only in simulation: it runs under the setup's input, which only the simulator drives".into()
+        }
+        (true, false) if board_grades => "graded on a board".into(),
+        (true, false) => "graded only with a telemetry board, which ter does not support yet".into(),
+        (false, _) => "graded in simulation".into(),
+    }
+}
+
+fn print_show(out: &ShowOut) {
+    match &out.title {
+        Some(title) => println!("{title} ({})", out.exercise),
+        None => println!("{}", out.exercise),
+    }
+    if let Some(path) = &out.path {
+        println!("  folder  {}", path.display());
+    }
+    if let Some(course) = &out.course {
+        println!("  course  {course}");
+    }
+    println!("  target  {}", out.target);
+    println!("  modes   {}", out.modes.join(", "));
+    if out.has_check {
+        match &out.check_yaml {
+            Some(path) => println!(
+                "  checks  from {} (the copy fetched; the site's can be newer)",
+                path.display()
+            ),
+            None => println!("  checks  from the site (not fetched)"),
+        }
+        let width = out.checks.iter().map(|c| c.id.len()).max().unwrap_or(0);
+        let kind_width = out.checks.iter().map(|c| c.kind.len()).max().unwrap_or(0);
+        for c in &out.checks {
+            println!(
+                "    {:<width$}  {:<kind_width$}  {}",
+                c.id, c.kind, c.graded
+            );
+        }
+    }
+    println!("{}", out.summary);
+}
+
+fn here_for(command: &str) -> Result<PathBuf, CliError> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| CliError::new("io_error", format!("No current directory: {e}")))?;
+    project::enclosing_exercise(&cwd).ok_or_else(|| {
+        CliError::new(
+            "not_an_exercise",
+            format!(
+                "This is not an exercise folder. Run it in one, or name one: `ter ex {command} <id>`."
+            ),
+        )
+    })
+}
