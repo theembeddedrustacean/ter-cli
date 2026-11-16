@@ -615,7 +615,9 @@ fn is_empty_dir(path: &Path) -> bool {
 
 /// A path from the site as a relative path with only normal parts, or
 /// `None` for anything that could land outside the exercise folder.
-fn safe_relative(path: &str) -> Option<PathBuf> {
+/// `path` as a relative path inside a folder: `/`-separated, with no root,
+/// no `..` and no `.`. `None` for anything else.
+pub fn safe_relative(path: &str) -> Option<PathBuf> {
     if path.is_empty() || path.contains('\\') {
         return None;
     }
@@ -917,6 +919,31 @@ mod tests {
             std::fs::read(f.dir.join("blob.bin")).unwrap(),
             [0, 1, 2, 255]
         );
+    }
+
+    #[test]
+    fn a_wokwi_chip_is_written_byte_exact_and_counts_as_source() {
+        use base64::Engine;
+        // Every byte value, twice, as a .wasm would carry them.
+        let wasm: Vec<u8> = (0..=255u8).chain((0..=255u8).rev()).collect();
+        let mut ex = scaffold();
+        ex.files.push(ExerciseFile {
+            path: "tca6424.chip.wasm".into(),
+            content: base64::engine::general_purpose::STANDARD.encode(&wasm),
+            encoding: "base64".into(),
+        });
+        ex.files
+            .push(file("tca6424.chip.json", "{\"name\": \"TCA6424\"}\n"));
+        let root = tempfile::tempdir().unwrap();
+        let f = fetch(&Layout::new(root.path()), &ex);
+        assert_eq!(
+            std::fs::read(f.dir.join("tca6424.chip.wasm")).unwrap(),
+            wasm
+        );
+        assert!(!f.is_edited().unwrap(), "a fresh fetch is not an edit");
+        // Like diagram.json, the chip is part of the exercise as fetched.
+        std::fs::write(f.dir.join("tca6424.chip.wasm"), b"other").unwrap();
+        assert!(f.is_edited().unwrap());
     }
 
     #[test]

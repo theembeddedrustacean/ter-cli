@@ -68,6 +68,8 @@ done
 here="$(dirname "$0")"
 [ "$WOKWI_CLI_TOKEN" = "fake-wokwi" ] || { echo "Error: bad token" >&2; exit 1; }
 cp "$dir/diagram.json" "$here/got-diagram.json"
+[ ! -f "$dir/wokwi.toml" ] || cp "$dir/wokwi.toml" "$here/got-wokwi.toml"
+for f in "$dir"/*.chip.*; do [ ! -f "$f" ] || cp "$f" "$here/got-$(basename "$f")"; done
 cp "$scenario" "$here/got-scenario.yaml"
 echo "$timeout" > "$here/got-timeout"
 code="$(cat "$here/exit-code")"
@@ -1280,6 +1282,95 @@ async fn a_simulated_run_is_recorded_judged_and_posted() {
     );
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(o.stdout, std::fs::read(run.join("check.toml")).unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_custom_chip_goes_into_the_run_folder_with_its_wokwi_toml_entry() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        42,
+    );
+    let dir = m.exercise();
+    let mut diagram: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("diagram.json")).unwrap()).unwrap();
+    diagram["parts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type": "chip-fake", "id": "io1", "attrs": {}}));
+    std::fs::write(dir.join("diagram.json"), diagram.to_string()).unwrap();
+    // As the site ships one: the .wasm decoded from base64, every byte
+    // value in it, the .json beside it, and the scaffold's wokwi.toml.
+    let wasm: Vec<u8> = (0..=255u8).rev().cycle().take(1000).collect();
+    std::fs::write(dir.join("fake.chip.wasm"), &wasm).unwrap();
+    std::fs::write(
+        dir.join("fake.chip.json"),
+        r#"{"name":"fake","pins":["A"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("wokwi.toml"),
+        "[wokwi]\nversion = 1\nfirmware = \"target/riscv32imc-unknown-none-elf/debug/exercise\"\n\n[[chip]]\nname = \"fake\"\nbinary = \"fake.chip.wasm\"\n",
+    )
+    .unwrap();
+
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim"]);
+
+    assert!(ok, "{v}");
+    assert_eq!(
+        m.fake_saw("got-wokwi.toml"),
+        "[wokwi]\nversion = 1\nfirmware = \"firmware.elf\"\nelf = \"firmware.elf\"\n\
+         \n[[chip]]\nname = \"fake\"\nbinary = \"fake.chip.wasm\"\n"
+    );
+    let fake = m.fake_wokwi.as_ref().unwrap().path();
+    assert_eq!(
+        std::fs::read(fake.join("got-fake.chip.wasm")).unwrap(),
+        wasm
+    );
+    assert_eq!(
+        m.fake_saw("got-fake.chip.json"),
+        r#"{"name":"fake","pins":["A"]}"#
+    );
+    // The run keeps its wokwi.toml; the chip copies go, as the program does.
+    let run = dir.join(".runs/1");
+    assert!(run.join("wokwi.toml").is_file());
+    assert!(!run.join("fake.chip.wasm").exists() && !run.join("fake.chip.json").exists());
+    assert_eq!(std::fs::read(dir.join("fake.chip.wasm")).unwrap(), wasm);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_circuit_without_its_chip_is_refused_before_the_build() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        42,
+    );
+    let dir = m.exercise();
+    let diagram = std::fs::read_to_string(dir.join("diagram.json"))
+        .unwrap()
+        .replacen(
+            "\"parts\": [",
+            "\"parts\": [{\"type\": \"chip-fake\", \"id\": \"io1\"},",
+            1,
+        );
+    std::fs::write(dir.join("diagram.json"), diagram).unwrap();
+
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim"]);
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "not_observable", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("custom chip fake"),
+        "{v}"
+    );
+    assert!(!dir.join(".runs").exists(), "nothing built, nothing posted");
 }
 
 #[cfg(unix)]

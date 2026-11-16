@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use ter_check::CheckFile;
 use ter_sdk::project::TerToml;
-use ter_telemetry::wokwi::{self, Plan, WiringError};
+use ter_telemetry::wokwi::{self, Chip, Plan, WiringError};
 use ter_telemetry::{EventKinds, Kind};
 
 use crate::output::CliError;
@@ -82,7 +82,7 @@ pub fn plan(dir: &Path, ter: &TerToml, file: &CheckFile) -> Result<Plan, CliErro
             diagram_path.display()
         ))
     })?;
-    wokwi::plan(&diagram, &ter.pins, &watch, &press).map_err(|e| {
+    let mut plan = wokwi::plan(&diagram, &ter.pins, &watch, &press).map_err(|e| {
         let checks = checks_for(file, &e);
         not_observable(format!(
             "Wokwi cannot run these checks as written: {e}{}.",
@@ -92,7 +92,118 @@ pub fn plan(dir: &Path, ter: &TerToml, file: &CheckFile) -> Result<Plan, CliErro
                 format!(" (checks: {})", checks.join(", "))
             }
         ))
-    })
+    })?;
+    plan.chips = chips(dir, ter)?;
+    if let Some(part) = chip_parts(&plan.diagram)
+        .into_iter()
+        .find(|p| !plan.chips.iter().any(|c| c.name == *p))
+    {
+        return Err(not_observable(format!(
+            "diagram.json uses the custom chip {part}, and the exercise has no {part}.chip.wasm or [[chip]] entry for it in wokwi.toml. {}",
+            refetch(ter)
+        )));
+    }
+    Ok(plan)
+}
+
+/// Getting the exercise's files back as fetched.
+fn refetch(ter: &TerToml) -> String {
+    format!(
+        "Keep a copy of your src/, then `ter ex remove --force {0}` and `ter ex fetch {0}`.",
+        ter.exercise
+    )
+}
+
+/// The custom chip names the diagram's parts use: type `chip-<name>`.
+fn chip_parts(diagram: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = diagram["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["type"].as_str()?.strip_prefix("chip-"))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The exercise's Wokwi custom chips: each `[[chip]]` in its `wokwi.toml`,
+/// then every `<name>.chip.wasm` at its root that no entry names. Each
+/// `.wasm` needs its `.json` beside it (`x.chip.wasm`, `x.chip.json`).
+pub fn chips(dir: &Path, ter: &TerToml) -> Result<Vec<Chip>, CliError> {
+    let config_path = dir.join(wokwi::RUN_CONFIG);
+    let entries = match std::fs::read_to_string(&config_path) {
+        Ok(text) => text
+            .parse::<toml::Table>()
+            .map_err(|e| {
+                not_observable(format!(
+                    "Could not read {}: {}",
+                    config_path.display(),
+                    e.message()
+                ))
+            })?
+            .get("chip")
+            .and_then(toml::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let bad_entry = |why: String| {
+        not_observable(format!(
+            "{} has a [[chip]] entry ter cannot use: {why}.",
+            config_path.display()
+        ))
+    };
+    let mut chips: Vec<Chip> = Vec::new();
+    for entry in &entries {
+        let field = |key: &str| entry.get(key).and_then(toml::Value::as_str);
+        let name = field("name")
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| bad_entry("no name".into()))?;
+        let binary = field("binary").ok_or_else(|| bad_entry(format!("{name} has no binary")))?;
+        let binary = ter_sdk::project::safe_relative(binary).ok_or_else(|| {
+            bad_entry(format!(
+                "{name}'s binary {binary:?} is not a path inside the exercise"
+            ))
+        })?;
+        chips.push(Chip {
+            name: name.to_string(),
+            from: dir.join(&binary),
+            binary,
+        });
+    }
+    let mut found: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+        .map_err(|e| not_observable(format!("Could not read {}: {e}", dir.display())))?
+        .filter_map(|e| {
+            let file = e.ok()?.file_name().into_string().ok()?;
+            let name = file.strip_suffix(".chip.wasm")?.to_string();
+            Some((name, PathBuf::from(file)))
+        })
+        .collect();
+    found.sort();
+    for (name, binary) in found {
+        if !name.is_empty() && !chips.iter().any(|c| c.binary == binary || c.name == name) {
+            chips.push(Chip {
+                name,
+                from: dir.join(&binary),
+                binary,
+            });
+        }
+    }
+    for chip in &chips {
+        for file in [chip.from.clone(), Chip::json_for(&chip.from)] {
+            if !file.is_file() {
+                return Err(not_observable(format!(
+                    "The custom chip {} needs {}, which is not there. {}",
+                    chip.name,
+                    file.display(),
+                    refetch(ter)
+                )));
+            }
+        }
+    }
+    Ok(chips)
 }
 
 /// The checks a wiring problem leaves unseen.
@@ -297,5 +408,94 @@ mod tests {
         )
         .unwrap();
         assert!(p.channels.is_empty());
+    }
+
+    const ALARM: &str = r#"{"parts":[{"type":"board-xiao-esp32-c3","id":"xiao"},
+        {"type":"chip-tca6424","id":"io1"}],"connections":[]}"#;
+    const SERIAL: &str =
+        "timeout_ms: 1000\nassert:\n  - id: hi\n    serial_contains: hi\n    within_ms: 500\n";
+
+    /// A fake chip: a `.wasm` of every byte value and its `.json`.
+    fn fake_chip(dir: &Path, wasm: &str) {
+        let wasm = dir.join(wasm);
+        std::fs::create_dir_all(wasm.parent().unwrap()).unwrap();
+        std::fs::write(&wasm, (0..=255u8).collect::<Vec<_>>()).unwrap();
+        std::fs::write(wasm.with_extension("json"), "{}").unwrap();
+    }
+
+    #[test]
+    fn root_chip_files_and_wokwi_toml_entries_are_the_run_chips() {
+        let dir = exercise(Some(ALARM));
+        fake_chip(dir.path(), "tca6424.chip.wasm");
+        fake_chip(dir.path(), "extra.chip.wasm");
+        fake_chip(dir.path(), "dist/chip.wasm");
+        std::fs::write(
+            dir.path().join("wokwi.toml"),
+            "[wokwi]\nversion = 1\nfirmware = \"target/x\"\n\n[[chip]]\nname = \"tca6424\"\nbinary = \"tca6424.chip.wasm\"\n\n[[chip]]\nname = \"nested\"\nbinary = \"dist/chip.wasm\"\n",
+        )
+        .unwrap();
+        let p = plan(dir.path(), &ter(&[]), &file(SERIAL)).unwrap();
+        let got: Vec<(&str, PathBuf)> = p
+            .chips
+            .iter()
+            .map(|c| (c.name.as_str(), c.binary.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("tca6424", PathBuf::from("tca6424.chip.wasm")),
+                ("nested", Path::new("dist").join("chip.wasm")),
+                // At the root with no entry: named after the file.
+                ("extra", PathBuf::from("extra.chip.wasm")),
+            ]
+        );
+        assert_eq!(p.chips[0].from, dir.path().join("tca6424.chip.wasm"));
+    }
+
+    #[test]
+    fn a_root_chip_needs_no_wokwi_toml() {
+        let dir = exercise(Some(ALARM));
+        fake_chip(dir.path(), "tca6424.chip.wasm");
+        let p = plan(dir.path(), &ter(&[]), &file(SERIAL)).unwrap();
+        assert_eq!(p.chips.len(), 1);
+        assert_eq!(p.chips[0].name, "tca6424");
+    }
+
+    #[test]
+    fn a_missing_or_unsafe_chip_is_not_observable() {
+        // The diagram uses a chip the exercise does not have.
+        let dir = exercise(Some(ALARM));
+        let err = plan(dir.path(), &ter(&[]), &file(SERIAL)).unwrap_err();
+        assert_eq!(err.code, "not_observable");
+        assert!(
+            err.message.contains("custom chip tca6424"),
+            "{}",
+            err.message
+        );
+
+        // The .wasm without its .json.
+        fake_chip(dir.path(), "tca6424.chip.wasm");
+        std::fs::remove_file(dir.path().join("tca6424.chip.json")).unwrap();
+        let err = plan(dir.path(), &ter(&[]), &file(SERIAL)).unwrap_err();
+        assert!(err.message.contains("tca6424.chip.json"), "{}", err.message);
+        assert!(err.message.contains("ter ex fetch"), "{}", err.message);
+
+        // A [[chip]] binary outside the exercise.
+        fake_chip(dir.path(), "tca6424.chip.wasm");
+        std::fs::write(
+            dir.path().join("wokwi.toml"),
+            "[[chip]]\nname = \"tca6424\"\nbinary = \"../tca6424.chip.wasm\"\n",
+        )
+        .unwrap();
+        let err = plan(dir.path(), &ter(&[]), &file(SERIAL)).unwrap_err();
+        assert!(err.message.contains("not a path inside"), "{}", err.message);
+    }
+
+    #[test]
+    fn no_chips_no_chip_files() {
+        let dir = exercise(Some(DIAGRAM));
+        std::fs::write(dir.path().join("wokwi.toml"), "[wokwi]\nversion = 1\n").unwrap();
+        let p = plan(dir.path(), &ter(&[]), &file(SERIAL)).unwrap();
+        assert!(p.chips.is_empty());
     }
 }

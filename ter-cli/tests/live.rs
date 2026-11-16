@@ -737,6 +737,70 @@ fn live_sim_solution_passes_and_replays() {
     );
 }
 
+/// The sandbox alarm clock exercise (Sandbox · Embed Test): its circuit
+/// has the tca6424 I/O expander as a Wokwi custom chip, which ships as
+/// `tca6424.chip.json` and `tca6424.chip.wasm` next to diagram.json.
+const LIVE_ALARM_SIM: &str = "sandbox-alarm-sim";
+
+/// The alarm clock circuit runs in Wokwi with its custom chip copied into
+/// the run folder and named in the run's wokwi.toml, and the exercise's
+/// solution passes all three checks. Needs `WOKWI_CLI_TOKEN` only: the
+/// site sends the pin map, and the solution is the TODO's four lines.
+#[test]
+#[ignore = "live site and Wokwi"]
+fn live_sim_runs_a_circuit_with_a_custom_chip() {
+    if !std::env::var("WOKWI_CLI_TOKEN").is_ok_and(|t| !t.is_empty()) {
+        eprintln!("skipped: set WOKWI_CLI_TOKEN");
+        return;
+    }
+    let m = LiveMachine::new();
+    let (ok, v) = m.json(&["ex", "fetch", LIVE_ALARM_SIM], m.courses.path());
+    assert!(ok, "{v}");
+    let dir = std::path::PathBuf::from(v["path"].as_str().unwrap());
+    let wasm = std::fs::read(dir.join("tca6424.chip.wasm")).unwrap();
+    assert!(
+        wasm.starts_with(b"\0asm"),
+        "the .wasm is decoded, not base64"
+    );
+    assert!(dir.join("tca6424.chip.json").is_file());
+
+    let main = dir.join("src/bin/main.rs");
+    let source = std::fs::read_to_string(&main).unwrap();
+    let todo = "        // TODO: count and print a press when the stable state goes from\n        // Released to Pressed\n";
+    assert!(source.contains(todo), "the scaffold changed");
+    std::fs::write(
+        &main,
+        source.replace(
+            todo,
+            "        if previous == Button::Released && stable == Button::Pressed {\n            presses += 1;\n            println!(\"SW5 press {}\", presses);\n        }\n",
+        ),
+    )
+    .unwrap();
+
+    let v = {
+        let _turn = take_turn();
+        m.json(&["run", "--sim"], &dir).1
+    };
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(v["venue"], "wokwi");
+    assert_eq!(v["check_status"], "passed", "{v}");
+    assert_eq!(
+        (&v["checks_seen"], &v["checks_total"]),
+        (&serde_json::json!(3), &serde_json::json!(3))
+    );
+    let run = std::path::Path::new(v["recording"].as_str().unwrap());
+    let config = std::fs::read_to_string(run.join("wokwi.toml")).unwrap();
+    assert!(
+        config.contains("[[chip]]\nname = \"tca6424\"\nbinary = \"tca6424.chip.wasm\""),
+        "{config}"
+    );
+    assert!(!run.join("tca6424.chip.wasm").exists(), "the copy is gone");
+    eprintln!(
+        "posted run {} attempt {}: {}",
+        v["name"], v["site"]["attempt"], v["verdicts"]
+    );
+}
+
 /// Pauses of 300 ms instead of 700: the flashes are right and the rate is
 /// not, so the rate check is the one that fails.
 #[test]

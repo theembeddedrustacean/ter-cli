@@ -49,6 +49,9 @@ pub const SERIAL_LOG: &str = "serial.log";
 pub const OUTPUT_LOG: &str = "wokwi.log";
 pub const ERROR_LOG: &str = "wokwi.err";
 pub const FIRMWARE: &str = "firmware.elf";
+/// The run's own `wokwi.toml`, written only when the circuit has custom
+/// chips: `wokwi-cli` reads `[[chip]]` entries from nowhere else.
+pub const RUN_CONFIG: &str = "wokwi.toml";
 
 /// A Wokwi board part: which of its pins is which GPIO, and its ground.
 struct Board {
@@ -145,6 +148,26 @@ pub struct Channel {
     pub board_pin: String,
 }
 
+/// A Wokwi custom chip the circuit uses: `chip-<name>` parts in the
+/// diagram. `wokwi-cli` loads `binary` and, next to it, the same name with
+/// `.json` for `.wasm` (`x.chip.wasm` and `x.chip.json`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chip {
+    pub name: String,
+    /// Where the `.wasm` goes in the run folder, relative to it, as the
+    /// exercise's `wokwi.toml` names it.
+    pub binary: PathBuf,
+    /// The exercise's `.wasm`; its `.json` is beside it.
+    pub from: PathBuf,
+}
+
+impl Chip {
+    /// The chip's `.json`, beside `wasm` (`wokwi-cli`'s own rule).
+    pub fn json_for(wasm: &Path) -> PathBuf {
+        wasm.with_extension("json")
+    }
+}
+
 /// The run copy of a diagram, and what ter added to it.
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -152,6 +175,30 @@ pub struct Plan {
     pub channels: Vec<Channel>,
     /// Pin name to the id of the pushbutton on it.
     pub buttons: BTreeMap<String, String>,
+    /// The custom chips to copy into the run folder.
+    pub chips: Vec<Chip>,
+}
+
+/// The run's `wokwi.toml`: the program ter copied in, and `chips`.
+pub fn run_config(chips: &[Chip]) -> String {
+    let quote = |s: &str| serde_json::to_string(s).expect("a string serialises");
+    let mut text = format!(
+        "[wokwi]\nversion = 1\nfirmware = {0}\nelf = {0}\n",
+        quote(FIRMWARE)
+    );
+    for chip in chips {
+        let binary: Vec<String> = chip
+            .binary
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        text.push_str(&format!(
+            "\n[[chip]]\nname = {}\nbinary = {}\n",
+            quote(&chip.name),
+            quote(&binary.join("/"))
+        ));
+    }
+    text
 }
 
 /// Wire the analyzer and find the buttons. `watch` are the pins the checks
@@ -259,6 +306,7 @@ pub fn plan(
         diagram,
         channels,
         buttons,
+        chips: Vec::new(),
     })
 }
 
@@ -522,7 +570,26 @@ impl Venue for Wokwi {
         std::fs::copy(elf, self.run_dir.join(FIRMWARE)).map_err(|e| io("copy the program", e))?;
         let diagram = serde_json::to_string_pretty(&self.plan.diagram).expect("diagram serialises");
         std::fs::write(self.run_dir.join(RUN_DIAGRAM), diagram)
-            .map_err(|e| io("write the run's diagram.json", e))
+            .map_err(|e| io("write the run's diagram.json", e))?;
+        if self.plan.chips.is_empty() {
+            return Ok(());
+        }
+        for chip in &self.plan.chips {
+            let to = self.run_dir.join(&chip.binary);
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| io(&format!("create {}", parent.display()), e))?;
+            }
+            for (from, to) in [
+                (chip.from.clone(), to.clone()),
+                (Chip::json_for(&chip.from), Chip::json_for(&to)),
+            ] {
+                std::fs::copy(&from, &to)
+                    .map_err(|e| io(&format!("copy the chip file {}", from.display()), e))?;
+            }
+        }
+        std::fs::write(self.run_dir.join(RUN_CONFIG), run_config(&self.plan.chips))
+            .map_err(|e| io("write the run's wokwi.toml", e))
     }
 
     fn reset(&mut self) -> Result<(), VenueError> {
@@ -567,6 +634,13 @@ impl Venue for Wokwi {
         // The program is in the build cache and its hash in the capture; a
         // copy per run would only fill the disk.
         let _ = std::fs::remove_file(dir.join(FIRMWARE));
+        // The chips are the exercise's own files, named in the run's
+        // wokwi.toml; the copies go the same way.
+        for chip in &self.plan.chips {
+            let wasm = dir.join(&chip.binary);
+            let _ = std::fs::remove_file(Chip::json_for(&wasm));
+            let _ = std::fs::remove_file(wasm);
+        }
 
         match output.status {
             Ended::Exited(0 | TIMEOUT_EXIT) => {}
@@ -964,5 +1038,92 @@ $upscope $end\n$enddefinitions $end\n#0\n0!\n1\"\n0#\n#1000000\n1!\n#1500000\n1!
             ],
             "D2 has no channel, and the repeated high at 1.5 ms is not a change"
         );
+    }
+
+    fn chip(dir: &Path, name: &str, binary: &str) -> Chip {
+        let from = dir.join(binary);
+        std::fs::create_dir_all(from.parent().unwrap()).unwrap();
+        // Every byte value, so a lossy copy would show.
+        std::fs::write(&from, (0..=255u8).collect::<Vec<_>>()).unwrap();
+        std::fs::write(Chip::json_for(&from), format!("{{\"name\":\"{name}\"}}")).unwrap();
+        Chip {
+            name: name.into(),
+            binary: binary.into(),
+            from,
+        }
+    }
+
+    #[test]
+    fn the_run_config_names_the_program_and_each_chip() {
+        let chips = [
+            Chip {
+                name: "tca6424".into(),
+                binary: "tca6424.chip.wasm".into(),
+                from: PathBuf::new(),
+            },
+            Chip {
+                name: "odd \"name\"".into(),
+                binary: Path::new("dist").join("chip.wasm"),
+                from: PathBuf::new(),
+            },
+        ];
+        assert_eq!(
+            run_config(&chips),
+            "[wokwi]\nversion = 1\nfirmware = \"firmware.elf\"\nelf = \"firmware.elf\"\n\
+             \n[[chip]]\nname = \"tca6424\"\nbinary = \"tca6424.chip.wasm\"\n\
+             \n[[chip]]\nname = \"odd \\\"name\\\"\"\nbinary = \"dist/chip.wasm\"\n"
+        );
+    }
+
+    #[test]
+    fn prepare_copies_the_chips_and_writes_wokwi_toml_only_for_them() {
+        let exercise = tempfile::tempdir().unwrap();
+        let elf = exercise.path().join("program.elf");
+        std::fs::write(&elf, b"elf").unwrap();
+        let wokwi = |run_dir: &Path, chips: Vec<Chip>| Wokwi {
+            cli: PathBuf::new(),
+            token: String::new(),
+            run_dir: run_dir.to_path_buf(),
+            plan: Plan {
+                diagram: json!({"parts": []}),
+                channels: Vec::new(),
+                buttons: BTreeMap::new(),
+                chips,
+            },
+            timeout_ms: 1000,
+            capture: Capture::default(),
+        };
+
+        let plain = tempfile::tempdir().unwrap();
+        wokwi(plain.path(), Vec::new()).prepare(&elf).unwrap();
+        assert!(!plain.path().join(RUN_CONFIG).exists());
+
+        let chips = vec![
+            chip(exercise.path(), "tca6424", "tca6424.chip.wasm"),
+            chip(exercise.path(), "other", "dist/chip.wasm"),
+        ];
+        let run = tempfile::tempdir().unwrap();
+        wokwi(run.path(), chips.clone()).prepare(&elf).unwrap();
+        for c in &chips {
+            let wasm = run.path().join(&c.binary);
+            assert_eq!(
+                std::fs::read(&wasm).unwrap(),
+                std::fs::read(&c.from).unwrap()
+            );
+            assert_eq!(
+                std::fs::read(Chip::json_for(&wasm)).unwrap(),
+                std::fs::read(Chip::json_for(&c.from)).unwrap()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(run.path().join(RUN_CONFIG)).unwrap(),
+            run_config(&chips)
+        );
+
+        // A chip whose .json is missing stops the run before Wokwi.
+        std::fs::remove_file(exercise.path().join("dist/chip.json")).unwrap();
+        let again = tempfile::tempdir().unwrap();
+        let err = wokwi(again.path(), chips).prepare(&elf).unwrap_err();
+        assert!(format!("{err:?}").contains("chip.json"), "{err:?}");
     }
 }
