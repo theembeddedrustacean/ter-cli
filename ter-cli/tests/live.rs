@@ -914,9 +914,9 @@ fn bench_a_serial_check_passes_on_the_board_and_in_wokwi() {
     }
 }
 
-/// On a bare board a pin check is named as unseen: env-first-build's blink
-/// makes its run a partial pass, which the site does not count, and
-/// sandbox-hw-only (pin checks only) is posted as not run.
+/// On a bare board env-first-build's banner (its one check, serial only)
+/// is seen inside its 2 s window, timed from ter's reset; sandbox-hw-only
+/// (pin checks only) is named unseen and posted as not run.
 #[test]
 #[ignore = "live site and board"]
 fn bench_pin_checks_are_named_unseen_and_not_counted() {
@@ -933,17 +933,12 @@ fn bench_pin_checks_are_named_unseen_and_not_counted() {
     assert_eq!(v["check_status"], "passed", "{v}");
     assert_eq!(
         (&v["checks_seen"], &v["checks_total"]),
-        (&serde_json::json!(1), &serde_json::json!(2))
+        (&serde_json::json!(1), &serde_json::json!(1))
     );
-    assert_eq!(v["verdicts"][1]["id"], "blink-rate");
-    assert_eq!(v["verdicts"][1]["status"], "not_observable");
-    let deltas = v["site"]["concept_deltas"].as_array().unwrap();
-    assert!(
-        deltas.iter().all(|d| d["before"] == d["after"]),
-        "a partial pass is not counted: {v}"
-    );
+    assert_eq!(v["verdicts"][0]["id"], "banner");
+    assert_eq!(v["verdicts"][0]["status"], "pass", "{v}");
     eprintln!(
-        "partial pass: run {} attempt {}",
+        "banner on the board: run {} attempt {}",
         v["name"], v["site"]["attempt"]
     );
 
