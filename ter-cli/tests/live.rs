@@ -430,6 +430,17 @@ fn take_turn() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// One machine for several `ter` commands: a config dir and a courses root.
+/// A machine signed in as the second test account, when `TER_TOKEN_2`
+/// names one (bws `TER_TOKEN_2`, ter-learner2-test).
+fn second_account() -> Option<LiveMachine> {
+    let token = std::env::var("TER_TOKEN_2")
+        .ok()
+        .filter(|t| !t.is_empty())?;
+    let mut m = LiveMachine::new();
+    m.token = token;
+    Some(m)
+}
+
 struct LiveMachine {
     config: tempfile::TempDir,
     courses: tempfile::TempDir,
@@ -1384,16 +1395,10 @@ fn live_serve_share_registers_heartbeats_shares_and_goes_offline() {
     assert_eq!(v["bench"], bench.name.as_str());
     assert_eq!(v["status"], "available");
     let mut expected = 1;
-    let second = std::env::var("TER_TOKEN_2")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .map(|token| {
-            let mut other = LiveMachine::new();
-            other.token = token;
-            let (ok, v) = other.json(&["connect", &bench.code], other.courses.path());
-            assert!(ok, "{v}");
-            other
-        });
+    let second = second_account().inspect(|other| {
+        let (ok, v) = other.json(&["connect", &bench.code], other.courses.path());
+        assert!(ok, "{v}");
+    });
     if second.is_some() {
         expected = 2;
     } else {
@@ -1542,7 +1547,14 @@ fn bench_a_run_on_a_shared_bench_passes_its_serial_check() {
         return;
     }
     let bench = SharedBench::start(&live_label("board"));
-    let driver = LiveMachine::new();
+    // Another learner's run on the owner's bench, when a second test
+    // account is set; otherwise the owner connects to its own bench.
+    let driver = second_account().unwrap_or_else(|| {
+        eprintln!("second account skipped: the owner drives; set TER_TOKEN_2");
+        LiveMachine::new()
+    });
+    let (ok, me) = driver.json(&["whoami"], driver.courses.path());
+    assert!(ok, "{me}");
     let (ok, v) = driver.json(&["connect", &bench.code], driver.courses.path());
     assert!(ok, "{v}");
     let dir = fetched(&driver, LIVE_SERIAL_ONLY);
@@ -1558,8 +1570,8 @@ fn bench_a_run_on_a_shared_bench_passes_its_serial_check() {
     assert_eq!(v["check_status"], "passed", "{v}");
     assert_eq!(events(&v)[0]["capture"]["venue"], "bench");
     eprintln!(
-        "bench: run {} attempt {}: {}",
-        v["name"], v["site"]["attempt"], v["verdicts"]
+        "bench: run {} attempt {} by {}: {}",
+        v["name"], v["site"]["attempt"], me["user"], v["verdicts"]
     );
 }
 
