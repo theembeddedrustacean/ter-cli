@@ -1,0 +1,5 @@
+# Stable Rust. rustup adds the target on the first build if it is missing;
+# `ter install targets` does it up front.
+[toolchain]
+channel = "stable"
+targets = ["thumbv7em-none-eabihf"]

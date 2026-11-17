@@ -793,6 +793,43 @@ mod tests {
     }
 
     #[test]
+    fn a_nucleo_project_needs_the_hard_float_arm_target_on_stable() {
+        // What `ter new --board nucleo-f401re` writes.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = crate::new::NewArgs {
+            board: "nucleo-f401re".into(),
+            name: "blinky".into(),
+            out: Some(tmp.path().join("blinky")),
+            ..Default::default()
+        };
+        let dir = crate::boards::NUCLEO_F401RE.write(&args).unwrap();
+        let project = read_project(&dir).unwrap();
+        assert_eq!(project.triple, "thumbv7em-none-eabihf");
+        assert_eq!(project.channel.as_deref(), Some("stable"));
+        assert!(!project.build_std && !project.ldproxy);
+
+        let host = Fake::default()
+            .with("rustup")
+            .says(
+                "rustup toolchain list",
+                "stable-x86_64-unknown-linux-gnu (default)\n",
+            )
+            .says(
+                "rustup target list --installed --toolchain stable",
+                "x86_64-unknown-linux-gnu\n",
+            );
+        assert_eq!(
+            commands(&plan(&host, Tool::Targets, Some(&project))),
+            ["rustup target add thumbv7em-none-eabihf --toolchain stable"]
+        );
+        let done = host.says(
+            "rustup target list --installed --toolchain stable",
+            "thumbv7em-none-eabihf\nx86_64-unknown-linux-gnu\n",
+        );
+        assert!(commands(&plan(&done, Tool::Targets, Some(&project))).is_empty());
+    }
+
+    #[test]
     fn a_project_target_is_read_from_its_cargo_config_and_toolchain_file() {
         let dir = project(&[
             (

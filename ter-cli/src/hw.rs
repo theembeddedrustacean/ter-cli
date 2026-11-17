@@ -332,6 +332,26 @@ mod tests {
     }
 
     #[test]
+    fn a_new_nucleo_project_flashes_with_probe_rs_over_the_st_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = ter_gen::new::NewArgs {
+            board: "nucleo-f401re".into(),
+            name: "blinky".into(),
+            out: Some(tmp.path().join("blinky")),
+            ..Default::default()
+        };
+        let dir = ter_gen::boards::NUCLEO_F401RE.write(&args).unwrap();
+        let tool = tool(&dir).unwrap();
+        assert_eq!(
+            tool,
+            Tool::ProbeRs {
+                chip: "STM32F401RETx".into()
+            }
+        );
+        assert_eq!(tool.program(), "probe-rs");
+    }
+
+    #[test]
     fn no_drive_says_how_to_get_one() {
         let rp = Drive {
             path: "/media/omar/RPI-RP2".into(),

@@ -1,0 +1,29 @@
+//! Blinks the Nucleo-F401RE's green LED, LD2 on PA5, once a second.
+
+#![no_std]
+#![no_main]
+
+use cortex_m_rt::entry;
+use panic_halt as _;
+use stm32f4xx_hal::{pac, prelude::*, rcc::Config};
+
+#[entry]
+fn main() -> ! {
+    let dp = pac::Peripherals::take().unwrap();
+
+    // The ST-LINK feeds the chip's HSE input with 8 MHz.
+    let mut rcc = dp.RCC.freeze(Config::hse(8.MHz()));
+
+    let gpioa = dp.GPIOA.split(&mut rcc);
+    let mut led = gpioa.pa5.into_push_pull_output();
+
+    // A delay timed by TIM2.
+    let mut delay = dp.TIM2.delay_ms(&mut rcc);
+
+    loop {
+        led.set_high();
+        delay.delay_ms(500_u32);
+        led.set_low();
+        delay.delay_ms(500_u32);
+    }
+}

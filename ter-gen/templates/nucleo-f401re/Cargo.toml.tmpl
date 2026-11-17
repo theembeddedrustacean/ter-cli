@@ -1,0 +1,35 @@
+# A Nucleo-F401RE project from `ter new`. The crates and versions are the
+# ones the STM32 exercises are built with, so an exercise's main.rs drops
+# into this project unchanged.
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m = "0.7.10"
+cortex-m-rt = "0.7.7"
+panic-halt = "1.0.0"
+# Logging through the debug probe (RTT, defmt).
+rtt-target = "0.6.2"
+defmt = "1.1.1"
+# RTIC 2 for the interrupt-driven programs. rtic-monotonics stays on 2.x:
+# 3.0 moved to fugit 0.6, and stm32f4xx-hal 0.23 is still on fugit 0.3.
+rtic = { version = "2.4.0", features = ["thumbv7-backend"] }
+rtic-monotonics = { version = "2.2.1", features = ["cortex-m-systick"] }
+rtic-sync = "1.6.0"
+# The HAL needs exactly one chip feature.
+stm32f4xx-hal = { version = "0.23.0", features = ["stm32f401"] }
+
+[profile.dev]
+# Unoptimised HAL code is large and slow; level 1 keeps a debug build small.
+opt-level = 1
+
+[profile.release]
+codegen-units = 1
+debug = true        # symbols stay in the ELF, not on the chip
+lto = true
+opt-level = "s"     # flash is the scarce resource
+
+# Its own workspace, so it builds the same wherever it is.
+[workspace]

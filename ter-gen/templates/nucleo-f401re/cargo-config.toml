@@ -1,0 +1,13 @@
+# The STM32F401RE is a Cortex-M4 with a floating point unit: the hard-float
+# ARM target.
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+# `cargo run` and `ter run --hw` flash through the on-board ST-LINK.
+# probe-rs names the chip STM32F401RETx, not by its part number.
+runner = "probe-rs run --chip STM32F401RETx"
+rustflags = [
+  # link.x comes from cortex-m-rt and includes memory.x.
+  "-C", "link-arg=-Tlink.x",
+]

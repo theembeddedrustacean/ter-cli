@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build a project from `ter new` for every board xiao-generate supports.
+# Build a project from `ter new` for every board it lists: xiao-generate's
+# and ter's own (the Nucleo-F401RE).
 #
 #   scripts/new-matrix.sh [--all-hals] [--include-std] [--include-xtensa]
 #                         [--board B] [--keep]
@@ -44,7 +45,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/ter-new-matrix.XXXXXX")
 
 # Boards and HALs are read from the generator, never listed here.
 boards() {
-  "$TER" new --list-boards | awk '/^  xiao-/ {print $1}'
+  "$TER" new --list-boards | awk '/^  (xiao|nucleo)-/ {print $1}'
 }
 hals() {
   # HAL lines are indented two spaces; their detail lines more.

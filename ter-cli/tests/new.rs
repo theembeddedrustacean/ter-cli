@@ -219,3 +219,85 @@ fn board_and_name_are_required_except_for_listings() {
         "xiao-rp2040".into()
     ]));
 }
+
+#[test]
+fn the_nucleo_is_written_by_ter_without_xiao_generate() {
+    let m = Machine::new(false);
+    let out = m.ter(
+        &["--board", "nucleo-f401re", "--name", "blinky", "--json"],
+        0,
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["board"], "nucleo-f401re");
+    assert_eq!(v["hal"], "stm32f4xx-hal");
+    assert_eq!(v["generator"], "ter");
+    assert!(v.get("command").is_none());
+    let project = m.root.path().join("blinky");
+    assert_eq!(PathBuf::from(v["dir"].as_str().unwrap()), project);
+    let config = std::fs::read_to_string(project.join(".cargo/config.toml")).unwrap();
+    assert!(
+        config.contains("runner = \"probe-rs run --chip STM32F401RETx\""),
+        "{config}"
+    );
+    let cargo = std::fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("name = \"blinky\""), "{cargo}");
+    let ignore = std::fs::read_to_string(project.join(".gitignore")).unwrap();
+    assert!(ignore.lines().any(|l| l == "target/"), "{ignore}");
+    assert!(ignore.lines().any(|l| l == ".ter/"), "{ignore}");
+
+    // A second time into the same folder is refused, and changes nothing.
+    let again = m.ter(&["--board", "nucleo-f401re", "--name", "blinky"], 0);
+    assert!(!again.status.success());
+    let err = text(&again.stderr);
+    assert!(err.contains("error[generate_failed]"), "{err}");
+    assert!(err.contains("not empty"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(project.join(".cargo/config.toml")).unwrap(),
+        config
+    );
+}
+
+#[test]
+fn the_nucleo_refuses_what_its_template_does_not_offer() {
+    let m = Machine::new(true);
+    let out = m.ter(&["--board", "nucleo-f401re", "--name", "x", "--async"], 0);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("error[generate_failed]"));
+    assert!(text(&out.stderr).contains("--async"));
+    assert!(!m.root.path().join("x").exists());
+    // xiao-generate was never asked.
+    assert!(m.args().is_empty());
+}
+
+#[test]
+fn the_board_list_has_xiao_generates_boards_then_ters() {
+    let m = Machine::new(true);
+    let out = m.ter(&["--list-boards"], 0);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let listing = text(&out.stdout);
+    let xiao = listing.find("XIAO").expect(&listing);
+    let nucleo = listing.find("nucleo-f401re").expect(&listing);
+    assert!(xiao < nucleo, "{listing}");
+
+    let out = m.ter(&["--list-boards", "--json"], 0);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listing = v["listing"].as_str().unwrap();
+    assert!(listing.contains("XIAO") && listing.contains("nucleo-f401re"));
+
+    // The Nucleo's HALs are ter's answer; xiao-generate is not asked.
+    let before = m.args().len();
+    let out = m.ter(&["--list-hals", "--board", "nucleo-f401re"], 0);
+    assert!(out.status.success());
+    assert!(text(&out.stdout).contains("stm32f4xx-hal"));
+    assert_eq!(m.args().len(), before);
+}
+
+#[test]
+fn without_xiao_generate_the_board_list_still_has_ters_boards() {
+    let m = Machine::new(false);
+    let out = m.ter(&["--list-boards"], 0);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("nucleo-f401re"));
+    assert!(text(&out.stderr).contains("ter install xiao-generate"));
+}

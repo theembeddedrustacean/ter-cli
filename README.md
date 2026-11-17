@@ -78,6 +78,10 @@ also takes `--json`.
   (a blink rate, a pulse width) are graded in simulation: your board
   still shows the LED, but only `ter run --sim` completes the exercise.
   `ter ex show <id>` says which run can pass an exercise.
+- `ter new --list-boards` lists the boards. The XIAO boards are generated
+  by xiao-generate (`ter install xiao-generate`). The Nucleo-F401RE is
+  ter's own template: a blinky that flashes over the board's ST-LINK with
+  probe-rs (`ter install targets probe-rs` in the project folder).
 - A fetched exercise and a `ter new` project get a `.gitignore` that
   covers `.ter/`, `.runs/` and `target/`, so they are ready for your own
   git repository.
