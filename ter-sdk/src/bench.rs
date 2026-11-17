@@ -79,6 +79,36 @@ pub struct Connected {
     /// one.
     #[serde(default)]
     pub url: Option<String>,
+    /// The code the bench takes runs under, while this account is
+    /// connected and the owner shares; `None` from a site that does not
+    /// send it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_code: Option<String>,
+}
+
+/// One bench in this account's Using list, as `bench_using` gives it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Using {
+    pub name: String,
+    pub label: String,
+    pub board: String,
+    pub owner_name: String,
+    /// Whether the bench is this account's own.
+    #[serde(default)]
+    pub own: bool,
+    /// `available`, `busy` or `offline`.
+    pub status: String,
+    #[serde(default)]
+    pub sharing: bool,
+    /// Whether this account is connected to it now.
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Set only while this account is connected and the owner shares; a
+    /// new code each time sharing is turned on again.
+    #[serde(default)]
+    pub share_code: Option<String>,
 }
 
 /// The `{ok, bench}` answer of disconnect, forget and remove.
@@ -116,6 +146,32 @@ mod tests {
         assert_eq!(normalise_code("GZTS-252"), None);
         assert_eq!(normalise_code("1234-ABCD"), None);
         assert_eq!(normalise_code("ÉZTS-2520"), None);
+    }
+
+    #[test]
+    fn using_rows_carry_the_code_only_while_connected_and_shared() {
+        #[derive(Deserialize)]
+        struct Answer {
+            benches: Vec<Using>,
+        }
+        let a: Answer = serde_json::from_str(
+            r#"{"ok": true, "benches": [
+                {"name": "b1", "label": "Desk", "board": "xiao-esp32c3", "owner_name": "Owner",
+                 "own": false, "status": "available", "sharing": true, "connected": true,
+                 "url": "http://h:1", "share_code": "GZTS-2520"},
+                {"name": "b2", "label": "Lab", "board": "xiao-esp32c3", "owner_name": "Ana",
+                 "own": false, "status": "offline", "sharing": false, "connected": false,
+                 "url": null, "share_code": null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(a.benches[0].share_code.as_deref(), Some("GZTS-2520"));
+        assert_eq!(a.benches[1].share_code, None);
+        let c: Connected = serde_json::from_str(
+            r#"{"ok": true, "bench": "b1", "label": "Desk", "board": "xiao-esp32c3",
+                "owner_name": "Owner", "status": "available"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.share_code, None, "an older site sends no code");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use ter_flash::Tool;
 use ter_remote::bench::{BenchClient, BenchError, BenchInfo, RemoteBench, ToolSpec, fits};
+use ter_sdk::bench::Using;
 use ter_sdk::project::TerToml;
 
 use crate::bench::{Benches, Link};
@@ -76,25 +77,47 @@ pub async fn ready(
     let tool = spec(tool)?;
     let site = session.client.site_url().to_string();
     let mut benches = Benches::load()?;
-    let mut link = match want.bench.as_deref() {
-        None => benches.current(&site, user).cloned().ok_or_else(|| {
-            unavailable(
-                "You are not connected to a bench. Ask its owner for the share code and run `ter connect <code>`.",
-            )
-        })?,
+    let saved = match want.bench.as_deref() {
+        None => benches.current(&site, user).cloned(),
         Some(asked) => benches
             .connected
             .iter()
             .find(|l| l.site == site && l.user == user && (l.bench == asked || l.label == asked))
-            .cloned()
-            .ok_or_else(|| {
-                CliError::new(
-                    "unknown_bench",
-                    format!(
-                        "ter on this machine is not connected to the bench {asked}. Ask its owner for the share code and run `ter connect <code>` here once."
-                    ),
-                )
-            })?,
+            .cloned(),
+    };
+    // Not on this machine (connected on the Devices page, say): the site
+    // knows the bench and, while this account is connected, its code.
+    let mut link = match saved {
+        Some(link) => link,
+        None => {
+            let using = using(session).await?;
+            let row = match want.bench.as_deref() {
+                Some(asked) => using
+                    .iter()
+                    .find(|u| !u.own && (u.name == asked || u.label == asked)),
+                None => using
+                    .iter()
+                    .filter(|u| !u.own && u.connected)
+                    .find(|u| u.share_code.is_some())
+                    .or_else(|| using.iter().find(|u| !u.own && u.connected)),
+            };
+            match (row, want.bench.as_deref()) {
+                (Some(row), _) => from_row(session, user, row)?,
+                (None, Some(asked)) => {
+                    return Err(CliError::new(
+                        "unknown_bench",
+                        format!(
+                            "{asked} is not in your list of benches. Enter its share code on the Devices page, or run `ter connect <code>`."
+                        ),
+                    ));
+                }
+                (None, None) => {
+                    return Err(unavailable(
+                        "You are not connected to a bench. Ask its owner for the share code and enter it on the Devices page, or run `ter connect <code>`.",
+                    ));
+                }
+            }
+        }
     };
     let connected = session
         .client
@@ -106,7 +129,7 @@ pub async fn ready(
                 link.owner_name, link.label
             )),
             "not_found" => unavailable(format!(
-                "{} is no longer in your list of benches. Run `ter connect <code>` again.",
+                "{} is no longer in your list of benches. Enter its share code on the Devices page, or run `ter connect <code>`.",
                 link.label
             )),
             _ => session.forget_dead_token(e.into()),
@@ -114,16 +137,49 @@ pub async fn ready(
     if connected.url.is_some() {
         link.url = connected.url.clone();
     }
+    if let Some(code) = connected.share_code.clone() {
+        link.code = code;
+    }
     benches.connect(link.clone());
     benches.save()?;
-    let url = link.url.clone().ok_or_else(|| {
+    let mut url = link.url.clone().ok_or_else(|| {
         unavailable(format!(
             "{}'s bench {} has no address yet: its owner has not started `ter serve --share`.",
             link.owner_name, link.label
         ))
     })?;
 
-    let client = BenchClient::new(&url, &link.code, user).map_err(from_bench)?;
+    let mut client = BenchClient::new(&url, &link.code, user).map_err(from_bench)?;
+    // A code the bench refuses is an old one: the owner shared again under
+    // a new code. Ask the site for the current one, once.
+    match client.info().await {
+        Err(e) if matches!(e.code.as_str(), "share_code_refused" | "not_sharing") => {
+            let fresh = using(session)
+                .await?
+                .into_iter()
+                .find(|u| u.name == link.bench);
+            match fresh {
+                Some(row) if row.share_code.is_some() => {
+                    let row = from_row(session, user, &row)?;
+                    if row.code == link.code {
+                        return Err(from_bench(e));
+                    }
+                    link.code = row.code;
+                    if let Some(u) = row.url {
+                        link.url = Some(u.clone());
+                        url = u;
+                    }
+                    benches.connect(link.clone());
+                    benches.save()?;
+                    client = BenchClient::new(&url, &link.code, user).map_err(from_bench)?;
+                }
+                Some(row) => return Err(from_row(session, user, &row).unwrap_err()),
+                // An older site: what the bench said stands.
+                None => return Err(from_bench(e)),
+            }
+        }
+        _ => {}
+    }
     let asked_at = Instant::now();
     let info = loop {
         let info = client.info().await.map_err(|e| {
@@ -176,6 +232,46 @@ pub async fn ready(
         info,
         client,
         tool,
+    })
+}
+
+/// This account's Using list from the site; empty from a site that does
+/// not have `bench_using` yet.
+async fn using(session: &Session) -> Result<Vec<Using>, CliError> {
+    match session.client.bench_using().await {
+        Ok(rows) => Ok(rows),
+        Err(e) if e.code() == "not_on_site" => Ok(Vec::new()),
+        Err(e) => Err(session.forget_dead_token(e.into())),
+    }
+}
+
+/// A Using row as a saved link, or why it cannot be driven now: the site
+/// gives the code only while this account is connected and the owner
+/// shares.
+fn from_row(session: &Session, user: &str, row: &Using) -> Result<Link, CliError> {
+    let Some(code) = row.share_code.clone() else {
+        let why = if !row.connected {
+            format!(
+                "You are not connected to {}'s bench {} now. Enter its share code on the Devices page again.",
+                row.owner_name, row.label
+            )
+        } else {
+            format!(
+                "{} stopped sharing {}. Ask them to share it again.",
+                row.owner_name, row.label
+            )
+        };
+        return Err(unavailable(why));
+    };
+    Ok(Link {
+        site: session.client.site_url().to_string(),
+        user: user.to_string(),
+        bench: row.name.clone(),
+        code,
+        label: row.label.clone(),
+        board: row.board.clone(),
+        owner_name: row.owner_name.clone(),
+        url: row.url.clone(),
     })
 }
 

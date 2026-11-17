@@ -523,6 +523,18 @@ async fn site(min_version: &str, run_answer: ResponseTemplate) -> MockServer {
         })))
         .mount(&server)
         .await;
+    // A site without bench_using answers as Frappe does for a function it
+    // lacks; tests that need it mount their own with a higher priority.
+    Mock::given(method("GET"))
+        .and(path(format!("{API}.bench_using")))
+        .respond_with(ResponseTemplate::new(417).set_body_json(json!({
+            "exc_type": "ValidationError",
+            "_server_messages": json!([json!({"message":
+                "Failed to get method for command ter_courses.api.bench_using with module 'ter_courses.api' has no attribute 'bench_using'"
+            }).to_string()]).to_string()
+        })))
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("{API}.enrollments")))
         .respond_with(ok(json!({"courses": [{
@@ -2180,8 +2192,17 @@ async fn health_lists_the_venues_a_page_can_ask_for() {
 /// page names, if anything.
 #[cfg(unix)]
 async fn page_run_on_a_shared_bench(bench: Option<&str>) {
+    page_run_connected_with(bench, Some(CODE)).await;
+}
+
+/// As [`page_run_on_a_shared_bench`], with the driver having run `ter
+/// connect <code>` with `typed` first, or (`None`) connected only on the
+/// Devices page. The site's `bench_using` gives the current code.
+#[cfg(unix)]
+async fn page_run_connected_with(bench: Option<&str>, typed: Option<&str>) -> MockServer {
     let bench_port = free_port();
     let server = bench_site(bench_port, 30).await;
+    mount_using(&server, &[using_row(bench_port, true, true)]).await;
     let (owner, board) = owner_with_board(&["Hello world!\r\n"]);
     let _owner_serve = owner.serve_with(
         &server.uri(),
@@ -2200,8 +2221,10 @@ async fn page_run_on_a_shared_bench(bench: Option<&str>) {
         0,
         "/dev/ter-not-used",
     );
-    let (ok, v) = driver.json_in(&server.uri(), &["connect", CODE], driver.courses.path());
-    assert!(ok, "{v}");
+    if let Some(typed) = typed {
+        let (ok, v) = driver.json_in(&server.uri(), &["connect", typed], driver.courses.path());
+        assert!(ok, "{v}");
+    }
     let served = driver.serve(&server.uri());
 
     let mut body = json!({"exercise_id": EXERCISE, "mode": "hardware", "venue": "bench"});
@@ -2222,6 +2245,146 @@ async fn page_run_on_a_shared_bench(bench: Option<&str>) {
         "the owner's board was flashed"
     );
     assert!(!owner.exercise().join(".runs").exists());
+    let saved = std::fs::read_to_string(driver.config.path().join("benches.json")).unwrap();
+    assert!(saved.contains(CODE), "the current code is kept: {saved}");
+    server
+}
+
+/// `bench_using`'s answer: the one bench, connected and shared as asked.
+fn using_row(bench_port: u16, connected: bool, sharing: bool) -> Value {
+    json!({"name": BENCH, "label": "Desk", "board": "xiao-esp32c3", "owner_name": "Owner",
+           "own": false, "status": "available", "sharing": sharing, "connected": connected,
+           "url": format!("http://127.0.0.1:{bench_port}"),
+           "share_code": if connected && sharing { json!(CODE) } else { json!(null) }})
+}
+
+async fn mount_using(server: &MockServer, rows: &[Value]) {
+    Mock::given(method("GET"))
+        .and(path(format!("{API}.bench_using")))
+        .and(header("authorization", "Bearer good-token"))
+        .respond_with(ok(json!({"ok": true, "benches": rows})))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+async fn asked(server: &MockServer, function: &str) -> usize {
+    let wanted = format!("{API}.{function}");
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == wanted)
+        .count()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bench_connected_only_on_the_devices_page_is_found_through_the_site() {
+    for named in [Some(BENCH), None] {
+        let server = page_run_connected_with(named, None).await;
+        assert_eq!(asked(&server, "bench_using").await, 1, "{named:?}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_old_code_is_renewed_from_the_site_once_and_the_run_goes_on() {
+    // Saved under the code the owner shared before; the bench refuses it.
+    let server = page_run_connected_with(Some(BENCH), Some("OLDC-1111")).await;
+    assert_eq!(asked(&server, "bench_using").await, 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_code_in_the_reconnect_answer_is_used_without_asking_again() {
+    let bench = fake_bench("xiao-esp32c3", &["serial", "reset"], None).await;
+    let (server, driver, served) = {
+        let port = bench.address().port();
+        let server = bench_site(port, 30).await;
+        let driver = Machine::with_exercise(GOOD, &["hardware"]).on_board(
+            BANNER_AND_BLINK,
+            0,
+            "/dev/ter-not-used",
+        );
+        let (fine, v) = driver.json_in(
+            &server.uri(),
+            &["connect", "OLDC-1111"],
+            driver.courses.path(),
+        );
+        assert!(fine, "{v}");
+        Mock::given(method("POST"))
+            .and(path(format!("{API}.bench_reconnect")))
+            .respond_with(ok(json!({"ok": true, "bench": BENCH, "label": "Desk",
+                "board": "xiao-esp32c3", "owner_name": "Owner", "status": "available",
+                "url": format!("http://127.0.0.1:{port}"), "share_code": CODE})))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let served = driver.serve(&server.uri());
+        (server, driver, served)
+    };
+    let (status, _, v) = served.run(serde_json::from_str(BENCH_RUN).unwrap()).await;
+    // fake_bench answers only the current code; its /bench/run is not
+    // there, so the run is posted not_run after the build.
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["venue"], "bench", "{v}");
+    assert_eq!(asked(&server, "bench_using").await, 0);
+    let saved = std::fs::read_to_string(driver.config.path().join("benches.json")).unwrap();
+    assert!(
+        saved.contains(CODE) && !saved.contains("OLDC-1111"),
+        "{saved}"
+    );
+}
+
+#[tokio::test]
+async fn the_code_in_the_connect_answer_is_the_one_kept() {
+    let server = bench_site(free_port(), 30).await;
+    Mock::given(method("POST"))
+        .and(path(format!("{API}.bench_connect")))
+        .respond_with(ok(json!({"ok": true, "bench": BENCH, "label": "Desk",
+            "board": "xiao-esp32c3", "owner_name": "Owner", "status": "available",
+            "url": null, "share_code": CODE})))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let m = Machine::with_exercise(GOOD, &["hardware"]);
+    let (ok, v) = m.json_in(&server.uri(), &["connect", "gzts 2520"], m.courses.path());
+    assert!(ok, "{v}");
+    let saved = std::fs::read_to_string(m.config.path().join("benches.json")).unwrap();
+    assert!(saved.contains(CODE), "{saved}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bench_the_site_gives_no_code_for_says_why() {
+    for (connected, sharing, says) in [
+        (
+            false,
+            true,
+            "You are not connected to Owner's bench Desk now",
+        ),
+        (true, false, "Owner stopped sharing Desk"),
+    ] {
+        let port = free_port();
+        let server = bench_site(port, 30).await;
+        mount_using(&server, &[using_row(port, connected, sharing)]).await;
+        let driver = Machine::with_exercise(GOOD, &["hardware"]).on_board(
+            BANNER_AND_BLINK,
+            0,
+            "/dev/ter-not-used",
+        );
+        let served = driver.serve(&server.uri());
+        let mut body: Value = serde_json::from_str(BENCH_RUN).unwrap();
+        body["bench"] = json!(BENCH);
+        let (status, _, v) = served.run(body).await;
+        assert_eq!(status, 503, "{v}");
+        assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains(says), "{msg}");
+        assert!(posted(&server, "run").await.is_empty());
+    }
 }
 
 #[cfg(unix)]

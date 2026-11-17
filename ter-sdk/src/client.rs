@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
-use crate::bench::{Connected, Done, Heartbeat, Mine, Registered, Shared, Unshared};
+use crate::bench::{Connected, Done, Heartbeat, Mine, Registered, Shared, Unshared, Using};
 use crate::exercise::{Exercise, ExerciseRef};
 use crate::pairing::{PairStart, PollStatus};
 use crate::run::{HintAnswer, HintExchange, HintFile, RunAnswer, RunRecord};
@@ -213,6 +213,18 @@ impl Client {
     pub async fn bench_connect(&self, code: &str) -> Result<Connected, Error> {
         self.post("bench_connect", &serde_json::json!({ "code": code }))
             .await
+    }
+
+    /// The benches in this account's Using list, each with its share code
+    /// while this account is connected and the owner shares.
+    pub async fn bench_using(&self) -> Result<Vec<Using>, Error> {
+        #[derive(Deserialize)]
+        struct Answer {
+            #[serde(default)]
+            benches: Vec<Using>,
+        }
+        let a: Answer = self.get("bench_using", &[]).await?;
+        Ok(a.benches)
     }
 
     /// Connect again to a bench already in this account's list.

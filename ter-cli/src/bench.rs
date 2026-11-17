@@ -346,7 +346,8 @@ pub fn link(session: &Session, user: &str, code: &str, c: &Connected) -> Link {
         site: session.client.site_url().to_string(),
         user: user.to_string(),
         bench: c.bench.clone(),
-        code: code.to_string(),
+        // The site's own copy of the code when it sends one.
+        code: c.share_code.clone().unwrap_or_else(|| code.to_string()),
         label: c.label.clone(),
         board: c.board.clone(),
         owner_name: c.owner_name.clone(),

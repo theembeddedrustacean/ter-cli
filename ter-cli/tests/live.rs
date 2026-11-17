@@ -1583,6 +1583,57 @@ fn bench_a_run_on_a_shared_bench_passes_its_serial_check() {
 #[test]
 #[ignore = "live site"]
 fn bench_the_pages_run_button_runs_on_a_shared_bench() {
+    page_bench_run(false);
+}
+
+/// As above, with the second account connected only on the Devices page
+/// (`bench_connect` from the site's own client, nothing in benches.json):
+/// ter finds the bench and its code through `bench_using`. Skips while the
+/// site lacks `bench_using`.
+#[test]
+#[ignore = "live site"]
+fn bench_a_bench_connected_on_the_devices_page_runs_from_the_page() {
+    if !bench_using_on_site() {
+        return;
+    }
+    page_bench_run(true);
+}
+
+/// Whether the site has `bench_using` yet (older sites do not).
+fn bench_using_on_site() -> bool {
+    match block_on(live_client().bench_using()) {
+        Ok(_) => true,
+        Err(e) if e.code() == "not_on_site" => {
+            eprintln!("skipped: the site has no bench_using yet");
+            false
+        }
+        Err(e) => panic!("bench_using: {e}"),
+    }
+}
+
+/// `bench_using` answers this account's Using list; a code only on rows
+/// connected and shared.
+#[test]
+#[ignore = "live site"]
+fn live_bench_using_gives_codes_only_while_connected_and_shared() {
+    if !bench_using_on_site() {
+        return;
+    }
+    let rows = block_on(live_client().bench_using()).unwrap();
+    for r in &rows {
+        assert_eq!(
+            r.share_code.is_some(),
+            r.connected && r.sharing,
+            "{}: connected {}, sharing {}",
+            r.name,
+            r.connected,
+            r.sharing
+        );
+    }
+    eprintln!("bench_using: {} benches", rows.len());
+}
+
+fn page_bench_run(on_devices_page: bool) {
     use std::io::BufRead;
     if !bench_ready() {
         return;
@@ -1594,8 +1645,16 @@ fn bench_the_pages_run_button_runs_on_a_shared_bench() {
     let bench = SharedBench::start(&live_label("page"));
     let (ok, me) = driver.json(&["whoami"], driver.courses.path());
     assert!(ok, "{me}");
-    let (ok, v) = driver.json(&["connect", &bench.code], driver.courses.path());
-    assert!(ok, "{v}");
+    if on_devices_page {
+        let site =
+            ter_sdk::Client::new(SITE, Some(driver.token.clone()), env!("CARGO_PKG_VERSION"))
+                .unwrap();
+        block_on(site.bench_connect(&bench.code)).unwrap();
+        assert!(!driver.config.path().join("benches.json").exists());
+    } else {
+        let (ok, v) = driver.json(&["connect", &bench.code], driver.courses.path());
+        assert!(ok, "{v}");
+    }
     // The page sends no files: ter runs the fetched folder, fetching it
     // first when it is not there. Leave it unfetched.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ter"))
