@@ -54,6 +54,13 @@ pub struct RunRequest {
     /// `simulation` when the page does not say: the editor is the
     /// simulation path.
     pub mode: String,
+    /// Where a hardware run goes: `local` (this machine's board) or
+    /// `bench` (a shared bench this account connected to). `None` is the
+    /// exercise's own venue, as before the field existed.
+    pub venue: Option<String>,
+    /// The bench to run on (its `name` on the Devices list) when `venue`
+    /// is `bench`; `None` is the bench this account connected to last.
+    pub bench: Option<String>,
     /// The page's signed-in user, when the page sends it.
     pub user: Option<String>,
 }
@@ -79,7 +86,7 @@ impl ServeError {
 
     pub fn status(&self) -> StatusCode {
         match self.code.as_str() {
-            "bad_request" | "mode_not_allowed" | "not_observable" | "bad_check" => {
+            "bad_request" | "mode_not_allowed" | "not_observable" | "bad_check" | "wrong_board" => {
                 StatusCode::BAD_REQUEST
             }
             "no_token" | "not_paired" | "token_invalid" | "token_revoked" | "token_expired" => {
@@ -88,12 +95,12 @@ impl ServeError {
             "wrong_account" | "not_enrolled" | "locked" | "origin_refused" | "host_refused" => {
                 StatusCode::FORBIDDEN
             }
-            "not_found" => StatusCode::NOT_FOUND,
+            "not_found" | "unknown_bench" => StatusCode::NOT_FOUND,
             "unsupported_media_type" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "timeout" => StatusCode::GATEWAY_TIMEOUT,
-            "busy" => StatusCode::CONFLICT,
+            "busy" | "bench_busy" => StatusCode::CONFLICT,
             "outdated" => StatusCode::UPGRADE_REQUIRED,
-            "venue_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+            "venue_unavailable" | "bench_offline" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -158,8 +165,37 @@ impl RunRequest {
                 .collect::<Result<_, ServeError>>()?,
             Some(_) => return Err(ServeError::bad_request("files must be a list.")),
         };
+        let text = |k: &str| match obj.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.trim().to_string())),
+            Some(_) => Err(ServeError::bad_request(format!("{k} must be a string."))),
+        };
+        let bench = text("bench")?;
+        let venue = match text("venue")? {
+            None if bench.is_some() => Some("bench".to_string()),
+            None => None,
+            Some(v) if v == "local" || v == "bench" => Some(v),
+            Some(other) => {
+                return Err(ServeError::bad_request(format!(
+                    "venue must be \"local\" or \"bench\", not {other:?}."
+                )));
+            }
+        };
+        if bench.is_some() && venue.as_deref() == Some("local") {
+            return Err(ServeError::bad_request(
+                "bench names a shared bench; it goes with venue \"bench\", not \"local\".",
+            ));
+        }
         let mode = match obj.get("mode") {
+            // A venue is a place to run hardware.
+            None | Some(Value::Null) if venue.is_some() => "hardware".to_string(),
             None | Some(Value::Null) => "simulation".to_string(),
+            Some(Value::String(m)) if m == "simulation" && venue.is_some() => {
+                return Err(ServeError::bad_request(
+                    "venue goes with mode \"hardware\": a simulation runs in Wokwi.",
+                ));
+            }
             Some(Value::String(m)) if m == "simulation" || m == "hardware" => m.clone(),
             Some(other) => {
                 return Err(ServeError::bad_request(format!(
@@ -167,16 +203,13 @@ impl RunRequest {
                 )));
             }
         };
-        let user = match obj.get("user") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(u)) if u.trim().is_empty() => None,
-            Some(Value::String(u)) => Some(u.trim().to_string()),
-            Some(_) => return Err(ServeError::bad_request("user must be a string.")),
-        };
+        let user = text("user")?;
         Ok(Self {
             exercise_id,
             files,
             mode,
+            venue,
+            bench,
             user,
         })
     }
@@ -647,6 +680,60 @@ mod tests {
         assert!(ok.files.is_empty());
         let blank_user = RunRequest::parse(br#"{"exercise_id": "a", "user": ""}"#).unwrap();
         assert_eq!(blank_user.user, None);
+        assert_eq!(blank_user.venue, None, "no venue is today's behaviour");
+        assert_eq!(blank_user.bench, None);
+    }
+
+    #[test]
+    fn a_venue_and_a_bench_are_read_and_checked() {
+        let parse = |body: &str| RunRequest::parse(body.as_bytes());
+        let bad = |body: &str| parse(body).unwrap_err().message;
+
+        let r = parse(r#"{"exercise_id": "a", "mode": "hardware", "venue": "bench"}"#).unwrap();
+        assert_eq!(
+            (r.mode.as_str(), r.venue.as_deref(), r.bench),
+            ("hardware", Some("bench"), None)
+        );
+        let r = parse(
+            r#"{"exercise_id": "a", "mode": "hardware", "venue": "bench", "bench": " b-1 "}"#,
+        )
+        .unwrap();
+        assert_eq!(r.bench.as_deref(), Some("b-1"));
+        let r = parse(r#"{"exercise_id": "a", "mode": "hardware", "venue": "local"}"#).unwrap();
+        assert_eq!(r.venue.as_deref(), Some("local"));
+        // A venue or a bench alone means hardware; a bench alone, the bench.
+        let r = parse(r#"{"exercise_id": "a", "venue": "local"}"#).unwrap();
+        assert_eq!(r.mode, "hardware");
+        let r = parse(r#"{"exercise_id": "a", "bench": "b-1"}"#).unwrap();
+        assert_eq!(
+            (r.mode.as_str(), r.venue.as_deref()),
+            ("hardware", Some("bench"))
+        );
+        let r = parse(r#"{"exercise_id": "a", "venue": null, "bench": ""}"#).unwrap();
+        assert_eq!(
+            (r.mode.as_str(), r.venue, r.bench),
+            ("simulation", None, None)
+        );
+
+        assert!(bad(r#"{"exercise_id": "a", "venue": "wokwi"}"#).contains("venue must be"));
+        assert!(bad(r#"{"exercise_id": "a", "venue": 1}"#).contains("venue must be a string"));
+        assert!(bad(r#"{"exercise_id": "a", "bench": 1}"#).contains("bench must be a string"));
+        assert!(
+            bad(r#"{"exercise_id": "a", "mode": "simulation", "venue": "bench"}"#)
+                .contains("hardware")
+        );
+        assert!(bad(r#"{"exercise_id": "a", "venue": "local", "bench": "b-1"}"#).contains("bench"));
+    }
+
+    #[test]
+    fn bench_errors_have_their_statuses() {
+        let status = |code: &str| ServeError::new(code, "m").status();
+        assert_eq!(status("bench_busy"), StatusCode::CONFLICT);
+        assert_eq!(status("bench_offline"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status("wrong_board"), StatusCode::BAD_REQUEST);
+        assert_eq!(status("unknown_bench"), StatusCode::NOT_FOUND);
+        assert_eq!(status("not_observable"), StatusCode::BAD_REQUEST);
+        assert_eq!(status("timeout"), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! else is driving. Any of that failing posts nothing.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ter_flash::Tool;
 use ter_remote::bench::{BenchClient, BenchError, BenchInfo, RemoteBench, ToolSpec, fits};
@@ -42,30 +43,59 @@ fn unavailable(message: impl Into<String>) -> CliError {
 }
 
 fn from_bench(e: BenchError) -> CliError {
-    let code = if e.code == "bench_offline" {
-        "bench_offline"
-    } else {
-        "venue_unavailable"
+    let code = match e.code.as_str() {
+        "bench_offline" | "bench_busy" | "wrong_board" => e.code.as_str(),
+        _ => "venue_unavailable",
     };
     CliError::new(code, e.message)
 }
 
-/// The bench this account connected to last, ready for a run of `ter`'s
-/// exercise flashed with `tool`.
+/// How often a busy bench is asked again while a run waits for it.
+const BUSY_POLL: Duration = Duration::from_secs(2);
+
+/// Which bench, and how long to wait for it when someone else is driving.
+#[derive(Debug, Clone, Default)]
+pub struct Want {
+    /// The bench's name (as the Devices list gives it) or label; `None`
+    /// is the one this account connected to last.
+    pub bench: Option<String>,
+    /// How long to wait while another driver holds the bench before
+    /// answering `bench_busy`; zero answers at once.
+    pub wait: Duration,
+}
+
+/// The bench `want` names (or the one this account connected to last),
+/// ready for a run of `ter`'s exercise flashed with `tool`.
 pub async fn ready(
     session: &Session,
     user: &str,
     ter: &TerToml,
     tool: &Tool,
+    want: &Want,
 ) -> Result<BenchReady, CliError> {
     let tool = spec(tool)?;
     let site = session.client.site_url().to_string();
     let mut benches = Benches::load()?;
-    let mut link = benches.current(&site, user).cloned().ok_or_else(|| {
-        unavailable(
-            "You are not connected to a bench. Ask its owner for the share code and run `ter connect <code>`.",
-        )
-    })?;
+    let mut link = match want.bench.as_deref() {
+        None => benches.current(&site, user).cloned().ok_or_else(|| {
+            unavailable(
+                "You are not connected to a bench. Ask its owner for the share code and run `ter connect <code>`.",
+            )
+        })?,
+        Some(asked) => benches
+            .connected
+            .iter()
+            .find(|l| l.site == site && l.user == user && (l.bench == asked || l.label == asked))
+            .cloned()
+            .ok_or_else(|| {
+                CliError::new(
+                    "unknown_bench",
+                    format!(
+                        "ter on this machine is not connected to the bench {asked}. Ask its owner for the share code and run `ter connect <code>` here once."
+                    ),
+                )
+            })?,
+    };
     let connected = session
         .client
         .bench_reconnect(&link.bench)
@@ -94,28 +124,46 @@ pub async fn ready(
     })?;
 
     let client = BenchClient::new(&url, &link.code, user).map_err(from_bench)?;
-    let info = client.info().await.map_err(|e| {
-        let mut err = from_bench(e);
-        if err.code == "bench_offline" {
-            err.message = format!(
-                "{}'s bench {} is offline: {}",
-                link.owner_name, link.label, err.message
-            );
+    let asked_at = Instant::now();
+    let info = loop {
+        let info = client.info().await.map_err(|e| {
+            let mut err = from_bench(e);
+            if err.code == "bench_offline" {
+                err.message = format!(
+                    "{}'s bench {} is offline: {}",
+                    link.owner_name, link.label, err.message
+                );
+            }
+            err
+        })?;
+        if !fits(&info.board, &ter.target) {
+            return Err(CliError::new(
+                "wrong_board",
+                format!(
+                    "{} is a {}, and {} is for {}.",
+                    link.label, info.board, ter.exercise, ter.target
+                ),
+            ));
         }
-        err
-    })?;
-    if !fits(&info.board, &ter.target) {
-        return Err(unavailable(format!(
-            "{} is a {}, and {} is for {}.",
-            link.label, info.board, ter.exercise, ter.target
-        )));
-    }
-    if let Some(driver) = info.driver.as_deref().filter(|d| *d != user) {
-        return Err(unavailable(format!(
-            "{driver} is using {} now. Try again in a few minutes.",
-            link.label
-        )));
-    }
+        let Some(driver) = info.driver.clone().filter(|d| d != user) else {
+            break info;
+        };
+        if asked_at.elapsed() + BUSY_POLL > want.wait {
+            let waited = if want.wait.is_zero() {
+                String::new()
+            } else {
+                format!(" (waited {} s)", asked_at.elapsed().as_secs())
+            };
+            return Err(CliError::new(
+                "bench_busy",
+                format!(
+                    "{driver} is using {} now{waited}. Try again in a few minutes.",
+                    link.label
+                ),
+            ));
+        }
+        tokio::time::sleep(BUSY_POLL).await;
+    };
     if info.provides.is_empty() {
         return Err(unavailable(format!(
             "{}'s bench {} has no board plugged in right now.",

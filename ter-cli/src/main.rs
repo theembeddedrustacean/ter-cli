@@ -415,6 +415,7 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
                     dir,
                     mode,
                     venue,
+                    bench: Default::default(),
                     no_check,
                 },
                 json,

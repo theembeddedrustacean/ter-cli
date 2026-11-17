@@ -8,6 +8,12 @@
 //! failed build or check is still a posted run, so it answers 200; only a
 //! run that was not posted is an error status.
 //!
+//! A hardware run may name its venue: `local` (this machine's board) or
+//! `bench` (a shared bench this account connected to with `ter connect`,
+//! the newest unless the page names one). A bench run goes through the
+//! same bench client as `ter run --hw --venue bench`, and waits a little
+//! while someone else is driving before answering `bench_busy`.
+//!
 //! One run at a time: a second request waits for the first, since both
 //! would build in the same course cache.
 
@@ -22,6 +28,7 @@ use ter_remote::serve::{RunFuture, RunRequest, ServeError, Service, editable};
 use crate::config::Config;
 use crate::exercises;
 use crate::output::CliError;
+use crate::remote;
 use crate::run::{self, CHECK_YAML, RunArgs};
 use crate::session::Session;
 use crate::share;
@@ -31,6 +38,13 @@ use crate::share;
 pub const BUILD_ALLOWANCE: Duration = Duration::from_secs(600);
 /// A board's flash, on top of its capture.
 const FLASH_ALLOWANCE: Duration = Duration::from_secs(180);
+/// How long a page's bench run waits while someone else drives the bench.
+pub const BENCH_QUEUE: Duration = Duration::from_secs(30);
+/// A bench run's trip to the owner's machine and back, on top of the
+/// flash and the capture.
+const BENCH_ALLOWANCE: Duration = Duration::from_secs(60);
+/// The places a page's run can go, as `/health` lists them.
+pub const VENUES: [&str; 3] = ["simulation", "local", "bench"];
 
 struct Inner {
     /// Held for the whole of a run, past a timeout answer too.
@@ -51,7 +65,7 @@ impl From<CliError> for ServeFailure {
 impl Service for Serve {
     fn health(&self) -> Value {
         let posts = Session::open().is_ok_and(|s| s.token_source != "none");
-        json!({"version": env!("CARGO_PKG_VERSION"), "posts_to_site": posts})
+        json!({"version": env!("CARGO_PKG_VERSION"), "posts_to_site": posts, "venues": VENUES})
     }
 
     fn run(&self, request: RunRequest) -> RunFuture {
@@ -92,17 +106,27 @@ async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFa
         }
     };
     let not_written = write_files(&dir, &request)?;
-    let limit = limit(&dir, &request.mode);
+    let venue = request.venue.clone();
+    let limit = limit(&dir, &request.mode, venue.as_deref());
     let mode: &'static str = if request.mode == "hardware" {
         "hardware"
     } else {
         "simulation"
     };
+    let on = match (&venue, &request.bench) {
+        (Some(v), Some(b)) => format!(", {v} {b}"),
+        (Some(v), None) => format!(", {v}"),
+        _ => String::new(),
+    };
     eprintln!(
-        "Running {} ({mode}) in {}",
+        "Running {} ({mode}{on}) in {}",
         request.exercise_id,
         dir.display()
     );
+    let bench = remote::Want {
+        bench: request.bench.clone(),
+        wait: bench_queue(),
+    };
 
     // The run goes on in its own task, holding the turn, so a timeout
     // answers the page without leaving a second build to start under it.
@@ -111,7 +135,8 @@ async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFa
             RunArgs {
                 dir: Some(dir),
                 mode: Some(mode),
-                venue: None,
+                venue,
+                bench,
                 no_check: false,
             },
             true,
@@ -198,17 +223,29 @@ fn write_files(dir: &Path, request: &RunRequest) -> Result<Vec<String>, CliError
     Ok(not_written)
 }
 
+/// How long a bench run waits for another driver: [`BENCH_QUEUE`], or
+/// `TER_BENCH_QUEUE_SECS` when set (tests set it short).
+fn bench_queue() -> Duration {
+    std::env::var("TER_BENCH_QUEUE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .map_or(BENCH_QUEUE, Duration::from_secs)
+}
+
 /// The most a run may take: the build, then the venue's own budget for
-/// the check's `timeout_ms`.
-fn limit(dir: &Path, mode: &str) -> Duration {
+/// the check's `timeout_ms`. A bench run also has its queue and the trip
+/// to the owner's machine.
+fn limit(dir: &Path, mode: &str, venue: Option<&str>) -> Duration {
     let timeout_ms = std::fs::read_to_string(dir.join(CHECK_YAML))
         .ok()
         .and_then(|t| CheckFile::parse(&t).ok())
         .map_or(0, |f| f.timeout_ms);
-    let run = if mode == "hardware" {
-        FLASH_ALLOWANCE + run::board_budget(timeout_ms)
-    } else {
+    let run = if mode != "hardware" {
         run::wokwi_budget(timeout_ms)
+    } else if venue == Some("bench") {
+        bench_queue() + BENCH_ALLOWANCE + FLASH_ALLOWANCE + run::board_budget(timeout_ms)
+    } else {
+        FLASH_ALLOWANCE + run::board_budget(timeout_ms)
     };
     BUILD_ALLOWANCE + run
 }
@@ -335,6 +372,8 @@ mod tests {
                 })
                 .collect(),
             mode: "simulation".into(),
+            venue: None,
+            bench: None,
             user: None,
         }
     }
@@ -382,7 +421,7 @@ mod tests {
     fn the_limit_is_the_build_plus_the_venues_budget() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            limit(dir.path(), "simulation"),
+            limit(dir.path(), "simulation", None),
             BUILD_ALLOWANCE + run::wokwi_budget(0)
         );
         std::fs::write(
@@ -391,12 +430,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            limit(dir.path(), "simulation"),
+            limit(dir.path(), "simulation", None),
             BUILD_ALLOWANCE + Duration::from_secs(120 + 140)
         );
         assert_eq!(
-            limit(dir.path(), "hardware"),
+            limit(dir.path(), "hardware", None),
             BUILD_ALLOWANCE + FLASH_ALLOWANCE + Duration::from_secs(12)
+        );
+        assert_eq!(
+            limit(dir.path(), "hardware", Some("local")),
+            limit(dir.path(), "hardware", None)
+        );
+        assert_eq!(
+            limit(dir.path(), "hardware", Some("bench")),
+            limit(dir.path(), "hardware", None) + bench_queue() + BENCH_ALLOWANCE,
+            "a bench run gets longer"
         );
     }
 }

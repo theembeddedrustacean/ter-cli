@@ -33,6 +33,9 @@ pub struct RunArgs {
     pub mode: Option<&'static str>,
     /// `--venue`: where to run within the mode, instead of ter.toml's.
     pub venue: Option<String>,
+    /// Which shared bench, when the venue is `bench`, and how long to
+    /// wait for it.
+    pub bench: remote::Want,
     pub no_check: bool,
 }
 
@@ -159,7 +162,24 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         .map_err(|e| session.forget_dead_token(e.into()))?;
     let user = client.ping().await.map_err(CliError::from)?.user.clone();
     let bench = match &plan {
-        Plan::Bench(b) => Some(remote::ready(&session, &user, &ter, &b.ready).await?),
+        Plan::Bench(b) => {
+            let bench = remote::ready(&session, &user, &ter, &b.ready, &args.bench).await?;
+            // Someone else's board is not spent on a run it cannot judge.
+            let unseen = sim::unobservable(&b.file, &bench.info.provides);
+            if !b.file.checks.is_empty() && unseen.len() == b.file.checks.len() {
+                let ids: Vec<String> = unseen.into_iter().map(|(id, _)| id).collect();
+                return Err(CliError::new(
+                    "not_observable",
+                    format!(
+                        "{}'s bench {} cannot see any of this exercise's checks: {}.",
+                        bench.link.owner_name,
+                        bench.link.label,
+                        hw::graded_only(&ids, sim_allowed)
+                    ),
+                ));
+            }
+            Some(bench)
+        }
         _ => None,
     };
 

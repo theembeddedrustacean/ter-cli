@@ -284,7 +284,9 @@ impl Machine {
             .env("TER_TOKEN", "good-token")
             .env_remove("WOKWI_CLI_TOKEN")
             .env_remove("TER_PORT")
-            .env_remove("TER_UF2_DRIVE");
+            .env_remove("TER_UF2_DRIVE")
+            // A page's bench run waits this long for a busy bench.
+            .env("TER_BENCH_QUEUE_SECS", "3");
         if let Some(port) = &self.port {
             cmd.env("TER_PORT", port);
         }
@@ -2122,4 +2124,311 @@ async fn a_run_on_a_bench_needs_a_connection_first() {
             .contains("ter connect"),
         "{v}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_runs_the_fetched_folder_when_the_page_sends_no_files() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        42,
+    );
+    let before = std::fs::read_to_string(m.exercise().join("src/main.rs")).unwrap();
+    let served = m.serve(&server.uri());
+
+    // The Run button without the editor: no files at all, then null, then
+    // an empty list.
+    for body in [
+        json!({"exercise_id": EXERCISE}),
+        json!({"exercise_id": EXERCISE, "files": null}),
+        json!({"exercise_id": EXERCISE, "files": []}),
+    ] {
+        let (status, _, v) = served.run(body.clone()).await;
+        assert_eq!(status, 200, "{body}: {v}");
+        assert_eq!(v["check_status"], "passed", "{v}");
+        assert!(v.get("not_written").is_none(), "{v}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(m.exercise().join("src/main.rs")).unwrap(),
+        before,
+        "the folder's own source ran, untouched"
+    );
+    assert_eq!(posted(&server, "run").await.len(), 3);
+}
+
+#[tokio::test]
+async fn health_lists_the_venues_a_page_can_ask_for() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware"]);
+    let served = m.serve(&server.uri());
+    let health: Value = reqwest::Client::new()
+        .get(format!("{}/health", served.url))
+        .header("origin", PAGE)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["venues"], json!(["simulation", "local", "bench"]));
+}
+
+/// A page run on a real shared bench: the owner's `ter serve --share`
+/// flashes its board, the driver's `ter serve` posts. `bench` is what the
+/// page names, if anything.
+#[cfg(unix)]
+async fn page_run_on_a_shared_bench(bench: Option<&str>) {
+    let bench_port = free_port();
+    let server = bench_site(bench_port, 30).await;
+    let (owner, board) = owner_with_board(&["Hello world!\r\n"]);
+    let _owner_serve = owner.serve_with(
+        &server.uri(),
+        &[
+            "--share",
+            "--board",
+            "xiao-esp32c3",
+            "--label",
+            "Desk",
+            "--bench-port",
+            &bench_port.to_string(),
+        ],
+    );
+    let driver = Machine::with_exercise(GOOD, &["hardware", "simulation"]).on_board(
+        BANNER_AND_BLINK,
+        0,
+        "/dev/ter-not-used",
+    );
+    let (ok, v) = driver.json_in(&server.uri(), &["connect", CODE], driver.courses.path());
+    assert!(ok, "{v}");
+    let served = driver.serve(&server.uri());
+
+    let mut body = json!({"exercise_id": EXERCISE, "mode": "hardware", "venue": "bench"});
+    if let Some(b) = bench {
+        body["bench"] = json!(b);
+    }
+    let (status, _, v) = served.run(body).await;
+    board.thread.join().unwrap();
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["mode"], "hardware");
+    assert_eq!(v["venue"], "bench", "{v}");
+    assert_eq!(v["check_status"], "passed", "{v}");
+    let run = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(run["mode"], "hardware");
+    assert_eq!(run["venue"], "bench");
+    assert!(
+        owner.espflash_saw().contains("--chip esp32c3"),
+        "the owner's board was flashed"
+    );
+    assert!(!owner.exercise().join(".runs").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_runs_on_the_newest_bench_when_the_page_names_none() {
+    page_run_on_a_shared_bench(None).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_runs_on_the_bench_the_page_names() {
+    page_run_on_a_shared_bench(Some(BENCH)).await;
+}
+
+/// The owner's bench socket, played by a mock: `GET /bench` says `board`,
+/// what it sees and who drives it.
+async fn fake_bench(board: &str, provides: &[&str], driver: Option<&str>) -> MockServer {
+    let bench = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/bench"))
+        .and(header("x-ter-share-code", CODE))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bench_info(board, provides, driver)))
+        .mount(&bench)
+        .await;
+    bench
+}
+
+fn bench_info(board: &str, provides: &[&str], driver: Option<&str>) -> Value {
+    json!({"service": "ter-bench", "version": "0.1.2", "board": board, "label": "Desk",
+           "provides": provides, "driver": driver})
+}
+
+/// A driver connected to the bench at `bench`, with its `ter serve`.
+#[cfg(unix)]
+async fn driver_of(bench: &MockServer, check: &str) -> (MockServer, Machine, Served) {
+    let port = bench.address().port();
+    let server = bench_site(port, 30).await;
+    let driver = Machine::with_exercise(GOOD, &["hardware", "simulation"]).on_board(
+        check,
+        0,
+        "/dev/ter-not-used",
+    );
+    let (ok, v) = driver.json_in(&server.uri(), &["connect", CODE], driver.courses.path());
+    assert!(ok, "{v}");
+    let served = driver.serve(&server.uri());
+    (server, driver, served)
+}
+
+const BENCH_RUN: &str = r#"{"exercise_id": "gpio-blinky--xiao-esp32c3-nostd",
+    "mode": "hardware", "venue": "bench"}"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_refuses_a_bench_this_machine_is_not_connected_to() {
+    let bench = fake_bench("xiao-esp32c3", &["serial", "reset"], None).await;
+    let (server, driver, served) = driver_of(&bench, BANNER_AND_BLINK).await;
+    let mut body: Value = serde_json::from_str(BENCH_RUN).unwrap();
+    body["bench"] = json!("b-9999");
+    let (status, _, v) = served.run(body).await;
+    assert_eq!(status, 404, "{v}");
+    assert_eq!(v["error"]["code"], "unknown_bench", "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("b-9999") && msg.contains("ter connect"),
+        "{msg}"
+    );
+    assert!(posted(&server, "run").await.is_empty());
+    assert!(!driver.exercise().join(".runs").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_waits_for_a_busy_bench_then_answers_bench_busy() {
+    let bench = fake_bench(
+        "xiao-esp32c3",
+        &["serial", "reset"],
+        Some("ana@example.com"),
+    )
+    .await;
+    let (server, driver, served) = driver_of(&bench, BANNER_AND_BLINK).await;
+    let t = std::time::Instant::now();
+    let (status, _, v) = served.run(serde_json::from_str(BENCH_RUN).unwrap()).await;
+    assert_eq!(status, 409, "{v}");
+    assert_eq!(v["error"]["code"], "bench_busy", "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("ana@example.com is using Desk"), "{msg}");
+    assert!(
+        t.elapsed() >= std::time::Duration::from_secs(2),
+        "it waited"
+    );
+    let asked = bench
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/bench")
+        .count();
+    assert!(asked >= 2, "asked again while waiting: {asked}");
+    assert!(posted(&server, "run").await.is_empty());
+    assert!(!driver.exercise().join(".runs").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bench_freed_while_the_page_waits_takes_the_run() {
+    let bench = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/bench"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bench_info(
+            "xiao-esp32c3",
+            &["serial", "reset"],
+            Some("ana@example.com"),
+        )))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&bench)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/bench"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bench_info(
+            "xiao-esp32c3",
+            &["serial", "reset"],
+            None,
+        )))
+        .mount(&bench)
+        .await;
+    // The flash then fails on the owner's side: still the bench's run.
+    Mock::given(method("POST"))
+        .and(path("/bench/run"))
+        .respond_with(ResponseTemplate::new(502).set_body_json(json!({"error": {
+            "code": "flash_failed", "message": "espflash could not connect", "output": ""}})))
+        .mount(&bench)
+        .await;
+    let (server, _driver, served) = driver_of(&bench, BANNER_AND_BLINK).await;
+    let (status, _, v) = served.run(serde_json::from_str(BENCH_RUN).unwrap()).await;
+    assert_eq!(status, 200, "a posted run: {v}");
+    assert_eq!(v["venue"], "bench", "{v}");
+    assert_eq!(v["check_status"], "not_run", "{v}");
+    let run = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(run["venue"], "bench");
+    assert_eq!(run["mode"], "hardware");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_answers_bench_offline_when_the_bench_does_not_answer() {
+    let server = bench_site(free_port(), 30).await;
+    let driver = Machine::with_exercise(GOOD, &["hardware"]).on_board(
+        BANNER_AND_BLINK,
+        0,
+        "/dev/ter-not-used",
+    );
+    let (ok, v) = driver.json_in(&server.uri(), &["connect", CODE], driver.courses.path());
+    assert!(ok, "{v}");
+    let served = driver.serve(&server.uri());
+    let (status, _, v) = served.run(serde_json::from_str(BENCH_RUN).unwrap()).await;
+    assert_eq!(status, 503, "{v}");
+    assert_eq!(v["error"]["code"], "bench_offline", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Owner's bench Desk is offline"),
+        "{v}"
+    );
+    assert!(posted(&server, "run").await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_refuses_a_bench_with_another_board() {
+    let bench = fake_bench("xiao-esp32c6", &["serial", "reset"], None).await;
+    let (server, _driver, served) = driver_of(&bench, BANNER_AND_BLINK).await;
+    let (status, _, v) = served.run(serde_json::from_str(BENCH_RUN).unwrap()).await;
+    assert_eq!(status, 400, "{v}");
+    assert_eq!(v["error"]["code"], "wrong_board", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("xiao-esp32c6"),
+        "{v}"
+    );
+    assert!(posted(&server, "run").await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bench_that_can_see_none_of_the_checks_is_not_used() {
+    let pins_only = "\
+timeout_ms: 5500
+assert:
+  - id: heartbeat-rate
+    pin: user_led
+    toggles_per_s: { min: 3.6, max: 4.4 }
+    window_ms: [900, 4900]
+";
+    let bench = fake_bench("xiao-esp32c3", &["serial", "reset"], None).await;
+    let (server, driver, served) = driver_of(&bench, pins_only).await;
+    let (status, _, v) = served.run(serde_json::from_str(BENCH_RUN).unwrap()).await;
+    assert_eq!(status, 400, "{v}");
+    assert_eq!(v["error"]["code"], "not_observable", "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("heartbeat-rate is graded only in simulation"),
+        "{msg}"
+    );
+    assert!(posted(&server, "run").await.is_empty());
+    assert!(!driver.exercise().join(".runs").exists());
 }

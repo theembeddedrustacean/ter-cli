@@ -1575,6 +1575,104 @@ fn bench_a_run_on_a_shared_bench_passes_its_serial_check() {
     );
 }
 
+/// The lesson page's Run button on a shared bench (B14): TER Smoke Test
+/// shares the XIAO with `ter serve --share`; the second test account
+/// (`TER_TOKEN_2`) connects, then its own `ter serve` takes a `/run` with
+/// no files, mode hardware, venue bench and the bench's name, as the page
+/// sends it. The run is posted as the second account with venue bench.
+#[test]
+#[ignore = "live site"]
+fn bench_the_pages_run_button_runs_on_a_shared_bench() {
+    use std::io::BufRead;
+    if !bench_ready() {
+        return;
+    }
+    let Some(driver) = second_account() else {
+        eprintln!("skipped: set TER_TOKEN_2 (the page run must cross accounts)");
+        return;
+    };
+    let bench = SharedBench::start(&live_label("page"));
+    let (ok, me) = driver.json(&["whoami"], driver.courses.path());
+    assert!(ok, "{me}");
+    let (ok, v) = driver.json(&["connect", &bench.code], driver.courses.path());
+    assert!(ok, "{v}");
+    // The page sends no files: ter runs the fetched folder, fetching it
+    // first when it is not there. Leave it unfetched.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["serve", "--port", "0"])
+        .current_dir(driver.courses.path())
+        .env("TER_CONFIG_DIR", driver.config.path())
+        .env("TER_TOKEN", &driver.token)
+        .env("TER_KEYCHAIN", "off")
+        .env_remove("TER_SITE_URL")
+        .env_remove("TER_PORT")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    stdout.read_line(&mut line).unwrap();
+    assert!(
+        !line.contains(&driver.token),
+        "the token must never be printed"
+    );
+    let url = line
+        .strip_prefix("ter serve on ")
+        .and_then(|l| l.split(',').next())
+        .unwrap()
+        .to_string();
+
+    let (health, status, v): (Value, u16, Value) = {
+        let _turn = take_turn();
+        block_on(async {
+            let page = reqwest::Client::new();
+            let health = page
+                .get(format!("{url}/health"))
+                .header("origin", "https://learn.theembeddedrustacean.com")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let r = page
+                .post(format!("{url}/run"))
+                .header("origin", "https://learn.theembeddedrustacean.com")
+                .json(&serde_json::json!({
+                    "exercise_id": LIVE_SERIAL_ONLY,
+                    "mode": "hardware",
+                    "venue": "bench",
+                    "bench": bench.name,
+                    "user": me["user"],
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = r.status().as_u16();
+            (health, status, r.json().await.unwrap())
+        })
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        health["venues"],
+        serde_json::json!(["simulation", "local", "bench"])
+    );
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(
+        (&v["mode"], &v["venue"]),
+        (&"hardware".into(), &"bench".into()),
+        "{v}"
+    );
+    assert_eq!(v["check_status"], "passed", "{v}");
+    assert_eq!(events(&v)[0]["capture"]["venue"], "bench");
+    eprintln!(
+        "page bench run {} attempt {} by {} on {}: {}",
+        v["name"], v["site"]["attempt"], me["user"], bench.name, v["verdicts"]
+    );
+}
+
 /// Layer 3 hints from real providers, on keys held only on this machine:
 /// `TER_LIVE_LLM=openai,anthropic,gemini` with each provider's key in its
 /// usual variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`).
