@@ -26,6 +26,10 @@ ter run --hw                    or flash your board and check it
 ter hint                        stuck? get the next hint
 ```
 
+`ter run --sim` runs in [Wokwi](https://wokwi.com) on your own Wokwi
+account; a free account works. `ter install wokwi-cli` asks for a CI
+token, which you create at <https://wokwi.com/dashboard/ci>.
+
 ## Commands
 
 ```

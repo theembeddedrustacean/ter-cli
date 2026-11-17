@@ -21,7 +21,7 @@ pub const WOKWI_CLI: &str = "wokwi-cli";
 /// Where Wokwi's own installer puts `wokwi-cli`, under the home folder.
 pub const WOKWI_HOME_BIN: &str = ".wokwi/bin";
 pub const TOKEN_ENV: &str = "WOKWI_CLI_TOKEN";
-pub const TOKEN_PAGE: &str = "https://wokwi.com/dashboard/ci";
+pub use ter_telemetry::wokwi::TOKEN_PAGE;
 
 /// A simulated run, ready to go once the program is built.
 pub struct Ready {

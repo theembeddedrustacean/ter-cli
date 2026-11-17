@@ -52,8 +52,10 @@ const UFERRIS: &str = r#"{
 
 /// Plays `wokwi-cli`'s part: prints the scenario's step markers around the
 /// program's serial output, writes the serial log and the VCD, and exits
-/// 42, its code for a run that reached `--timeout`. It keeps what it was
-/// given, for the test to look at.
+/// 42, its code for a run that reached `--timeout`. Any other exit code in
+/// `exit-code` fails the run early with `stderr`'s text, as wokwi-cli does
+/// when Wokwi refuses the token or the minutes are used up. It keeps what
+/// it was given, for the test to look at.
 const FAKE_WOKWI_CLI: &str = r#"#!/bin/sh
 dir="$1"; shift
 while [ $# -gt 0 ]; do
@@ -74,7 +76,7 @@ cp "$scenario" "$here/got-scenario.yaml"
 echo "$timeout" > "$here/got-timeout"
 code="$(cat "$here/exit-code")"
 if [ "$code" != 42 ]; then
-  echo "API Error: You have used up your monthly simulation minutes" >&2
+  cat "$here/stderr" >&2
   exit "$code"
 fi
 printf '[ter-clock] Executing step: @0
@@ -328,6 +330,11 @@ impl Machine {
             .join(vcd);
         std::fs::copy(fixture, fake.path().join("fixture.vcd")).unwrap();
         std::fs::write(fake.path().join("exit-code"), exit_code.to_string()).unwrap();
+        std::fs::write(
+            fake.path().join("stderr"),
+            "Error: the simulation crashed\n",
+        )
+        .unwrap();
         self.fake_wokwi = Some(fake);
         self
     }
@@ -1411,26 +1418,79 @@ async fn a_wrong_program_fails_the_right_check() {
     assert!(err.contains("error[check_failed]"), "{err}");
 }
 
+/// A simulated run whose fake `wokwi-cli` stops with exit code 1 and
+/// prints `stderr`, as wokwi-cli does when Wokwi turns the account away.
 #[cfg(unix)]
-#[tokio::test]
-async fn a_wokwi_quota_failure_is_posted_as_not_run() {
+async fn wokwi_fails(stderr: &str) -> (serde_json::Value, serde_json::Value) {
     let server = site("0.1.0", run_answer()).await;
     let m = Machine::with_exercise(GOOD, &["simulation"]).simulated(
         HEARTBEAT_CHECK,
         "heartbeat.vcd",
         1,
     );
+    std::fs::write(m.fake_wokwi.as_ref().unwrap().path().join("stderr"), stderr).unwrap();
 
     let (ok, v) = m.json(&server.uri(), &["run"]);
 
     assert!(!ok);
     assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
-    let p = &posted(&server, "run").await[0]["payload"];
+    let p = posted(&server, "run").await[0]["payload"].clone();
     assert_eq!(p["check_status"], "not_run", "never failed");
     assert!(p.get("first_failure").is_none());
     let tail = p["transcript_tail"].as_str().unwrap();
     assert_eq!(tail.lines().next(), Some("venue_unavailable"));
-    assert!(tail.contains("monthly simulation minutes"), "{tail}");
+    assert!(
+        tail.contains(stderr.trim()),
+        "wokwi-cli's own words kept: {tail}"
+    );
+    (v, p)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn used_up_wokwi_minutes_say_so_and_are_posted_as_not_run() {
+    let (v, p) =
+        wokwi_fails("API Error: You have used up your Free plan monthly CI minute quota\n").await;
+
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("used up its simulation minutes"), "{msg}");
+    assert!(msg.contains("https://wokwi.com/pricing"), "{msg}");
+    assert!(msg.contains("posted as not run"), "{msg}");
+    assert!(!msg.contains("token"), "{msg}");
+    let tail = p["transcript_tail"].as_str().unwrap();
+    assert!(tail.contains("used up its simulation minutes"), "{tail}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_wokwi_token_says_so_and_is_posted_as_not_run() {
+    let (v, p) = wokwi_fails("API Error: Unauthorized\n").await;
+
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("refused your token"), "{msg}");
+    assert!(msg.contains("https://wokwi.com/dashboard/ci"), "{msg}");
+    assert!(msg.contains("ter install wokwi-cli"), "{msg}");
+    assert!(!msg.contains("pricing"), "{msg}");
+    assert!(
+        !msg.contains("fake-wokwi"),
+        "the token itself never shows: {msg}"
+    );
+    let tail = p["transcript_tail"].as_str().unwrap();
+    assert!(tail.contains("refused your token"), "{tail}");
+    assert!(!tail.contains("fake-wokwi"), "{tail}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn any_other_wokwi_failure_quotes_wokwi_cli() {
+    let (v, _) = wokwi_fails("Error: the simulation crashed\n").await;
+
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("exit code 1: Error: the simulation crashed"),
+        "{msg}"
+    );
+    assert!(!msg.contains("token") && !msg.contains("minutes"), "{msg}");
 }
 
 #[cfg(unix)]

@@ -15,6 +15,11 @@
 //! scenario advances the simulation in fixed steps, and each step prints a
 //! marker naming its simulated time, so bytes that come between two markers
 //! were sent between those two times. They are recorded with that span.
+//!
+//! Account: the learner's token can be refused, or their account's
+//! simulation minutes used up. ter says nothing about Wokwi plans before a
+//! run; when `wokwi-cli` reports either, the run's error says what happened
+//! and how to fix it. Both stay venue failures, posted as `not_run`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
@@ -40,6 +45,10 @@ const SCENARIO: &str = "ter-clock";
 /// `wokwi-cli`'s exit code when the simulation reached `--timeout`: how a
 /// full-length run ends.
 const TIMEOUT_EXIT: i32 = 42;
+/// Where a learner creates a Wokwi CI token.
+pub const TOKEN_PAGE: &str = "https://wokwi.com/dashboard/ci";
+/// Where a learner adds simulation minutes to their Wokwi account.
+pub const PRICING_PAGE: &str = "https://wokwi.com/pricing";
 
 pub const RUN_DIAGRAM: &str = "diagram.json";
 pub const SCENARIO_FILE: &str = "scenario.yaml";
@@ -647,6 +656,9 @@ impl Venue for Wokwi {
             Ended::Exited(code) => {
                 let said = String::from_utf8_lossy(&output.stderr);
                 let said = said.trim();
+                if let Some(problem) = AccountProblem::from_stderr(said) {
+                    return Err(self.failure(problem.explain()));
+                }
                 return Err(self.failure(format!(
                     "wokwi-cli stopped with exit code {code}{}",
                     if said.is_empty() {
@@ -693,6 +705,44 @@ impl Venue for Wokwi {
 
     fn recover(&mut self) -> Recovery {
         Recovery::NotNeeded
+    }
+}
+
+/// Why Wokwi would not simulate for the learner's account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountProblem {
+    /// The token is wrong, expired or revoked: `wokwi-cli` prints
+    /// `API Error: Unauthorized` and exits 1.
+    TokenRefused,
+    /// The account's simulation minutes for the rolling 30 days are used
+    /// up: `API Error: You have used up your Free plan monthly CI minute
+    /// quota` (the plan's name changes with the plan).
+    MinutesUsedUp,
+}
+
+impl AccountProblem {
+    /// Read what `wokwi-cli` printed on stderr when it stopped early.
+    pub fn from_stderr(stderr: &str) -> Option<Self> {
+        let said = stderr.to_ascii_lowercase();
+        if said.contains("quota") || said.contains("used up your") {
+            Some(Self::MinutesUsedUp)
+        } else if said.contains("unauthorized") || said.contains(": 401") {
+            Some(Self::TokenRefused)
+        } else {
+            None
+        }
+    }
+
+    /// One line: what happened and how to fix it.
+    pub fn explain(self) -> String {
+        match self {
+            Self::TokenRefused => format!(
+                "Wokwi refused your token: it is wrong, expired or revoked. Create a new CI token at {TOKEN_PAGE} and store it with `ter install wokwi-cli --token-stdin` (if you set WOKWI_CLI_TOKEN, put the new token there instead)."
+            ),
+            Self::MinutesUsedUp => format!(
+                "Your Wokwi account has used up its simulation minutes for the last 30 days. Minutes come back as older runs fall out of the 30 days; to get more now, add a Wokwi plan at {PRICING_PAGE}."
+            ),
+        }
     }
 }
 
@@ -1125,5 +1175,52 @@ $upscope $end\n$enddefinitions $end\n#0\n0!\n1\"\n0#\n#1000000\n1!\n#1500000\n1!
         let again = tempfile::tempdir().unwrap();
         let err = wokwi(again.path(), chips).prepare(&elf).unwrap_err();
         assert!(format!("{err:?}").contains("chip.json"), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+
+    #[test]
+    fn wokwi_cli_s_own_lines_are_recognised() {
+        // As wokwi-cli 0.27.1 printed them (token: checked live, 2026-11-17).
+        assert_eq!(
+            AccountProblem::from_stderr("API Error: Unauthorized"),
+            Some(AccountProblem::TokenRefused)
+        );
+        assert_eq!(
+            AccountProblem::from_stderr(
+                "API Error: You have used up your Free plan monthly CI minute quota"
+            ),
+            Some(AccountProblem::MinutesUsedUp)
+        );
+        assert_eq!(
+            AccountProblem::from_stderr(
+                "Error connecting to wss://wokwi.com/api/ws/beta: 401 Unauthorized"
+            ),
+            Some(AccountProblem::TokenRefused)
+        );
+        assert_eq!(
+            AccountProblem::from_stderr("API Error: Connection timed out after 5 minutes"),
+            None
+        );
+        assert_eq!(AccountProblem::from_stderr(""), None);
+    }
+
+    #[test]
+    fn each_problem_names_its_cause_and_its_fix_on_one_line() {
+        let token = AccountProblem::TokenRefused.explain();
+        assert!(token.contains("refused your token"), "{token}");
+        assert!(token.contains(TOKEN_PAGE), "{token}");
+        let minutes = AccountProblem::MinutesUsedUp.explain();
+        assert!(
+            minutes.contains("used up its simulation minutes"),
+            "{minutes}"
+        );
+        assert!(minutes.contains(PRICING_PAGE), "{minutes}");
+        for line in [token, minutes] {
+            assert_eq!(line.lines().count(), 1, "{line}");
+        }
     }
 }
