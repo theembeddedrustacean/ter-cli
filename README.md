@@ -44,6 +44,7 @@ ter new --board <board>          a new project for a board
 ter serve                        lets the lesson page's Run button use this machine
 ter serve --share | ter connect  share an ESP32-C3 as a bench, or use one
 ter venues                       the boards and tools ter can see
+ter doctor                       what is missing or wrong here, and the fix
 ter self-update                  how to update ter
 ```
 
@@ -85,6 +86,11 @@ also takes `--json`.
 - A fetched exercise and a `ter new` project get a `.gitignore` that
   covers `.ter/`, `.runs/` and `target/`, so they are ready for your own
   git repository.
+
+- Something not working? Run `ter doctor` in the exercise folder. It
+  checks ter, your account, Rust, the tools, your board and (on Linux)
+  whether you may use its port, and prints the fix for each problem. It
+  only looks: nothing is installed, built or flashed.
 
 Settings live in `~/.config/ter/config.toml`, and every key is optional.
 

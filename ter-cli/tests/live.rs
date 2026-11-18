@@ -1869,3 +1869,103 @@ fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+fn doctor_check<'a>(report: &'a Value, id: &str) -> &'a Value {
+    report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["id"] == id)
+        .unwrap_or_else(|| panic!("no check {id} in {report}"))
+}
+
+/// `ter doctor` asks the live site once: it knows the account and where
+/// this ter stands against the site's versions.
+#[test]
+#[ignore = "live site"]
+fn live_doctor_knows_the_account_and_the_version() {
+    let m = LiveMachine::new();
+    let (_, v) = m.json(&["doctor"], m.courses.path());
+    assert_eq!(v["context"]["kind"], "none", "{v}");
+    assert_eq!(doctor_check(&v, "site.reach")["status"], "ok", "{v}");
+    let token = doctor_check(&v, "account.token");
+    assert_eq!(token["status"], "ok", "{v}");
+    let found = token["found"].as_str().unwrap();
+    assert!(
+        found.contains('@') && found.ends_with("from TER_TOKEN"),
+        "{found}"
+    );
+    let version = doctor_check(&v, "ter.version")["status"].as_str().unwrap();
+    assert!(matches!(version, "ok" | "warn"), "{v}");
+    assert_eq!(doctor_check(&v, "account.premium")["status"], "ok", "{v}");
+    assert_eq!(doctor_check(&v, "courses.root")["status"], "ok", "{v}");
+}
+
+#[test]
+#[ignore = "live site"]
+fn live_doctor_reports_a_token_the_site_refuses() {
+    let (ok, v) = ter_json("not-a-real-token", &["doctor"]);
+    assert!(!ok);
+    let token = doctor_check(&v, "account.token");
+    assert_eq!(token["status"], "fail", "{v}");
+    assert_eq!(token["found"], "from TER_TOKEN, refused by the site");
+    assert_eq!(doctor_check(&v, "site.reach")["status"], "ok", "{v}");
+    assert_eq!(doctor_check(&v, "ter.version")["status"], "skip", "{v}");
+}
+
+/// In a fetched ESP32-C3 exercise, with the board on USB, doctor finds
+/// the run ready on the board and in simulation.
+#[test]
+#[ignore = "live site and board"]
+fn bench_doctor_finds_a_fetched_exercise_ready_on_the_board_and_in_wokwi() {
+    if !bench_ready() {
+        return;
+    }
+    let m = LiveMachine::new();
+    let dir = fetched(&m, LIVE_SERIAL_ONLY);
+    let set_mode = |mode: &str| {
+        let path = dir.join("ter.toml");
+        let text: String = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                if l.starts_with("mode =") {
+                    format!("mode = \"{mode}\"\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        std::fs::write(&path, text).unwrap();
+    };
+
+    set_mode("hardware");
+    let (ok, v) = m.json(&["doctor"], &dir);
+    assert!(ok, "{v}");
+    assert_eq!(v["context"]["kind"], "exercise");
+    assert_eq!(v["context"]["venue"], "local");
+    for id in [
+        "rust.targets",
+        "tool.espflash",
+        "usb.boards",
+        "linux.serial",
+        "exercise.venue",
+    ] {
+        assert_eq!(doctor_check(&v, id)["status"], "ok", "{id}: {v}");
+    }
+    assert_eq!(
+        doctor_check(&v, "exercise.venue")["found"],
+        "hardware on your board, flashed with espflash"
+    );
+
+    if wokwi_ready().is_none() {
+        return;
+    }
+    set_mode("simulation");
+    let (ok, v) = m.json(&["doctor"], &dir);
+    assert!(ok, "{v}");
+    assert_eq!(v["context"]["venue"], "wokwi");
+    for id in ["tool.wokwi-cli", "wokwi.token", "exercise.venue"] {
+        assert_eq!(doctor_check(&v, id)["status"], "ok", "{id}: {v}");
+    }
+}

@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 mod bench;
 mod build;
 mod config;
+mod doctor;
 mod exercises;
 mod hint;
 mod hw;
@@ -23,6 +24,7 @@ mod session;
 mod share;
 mod sim;
 mod status;
+mod survey;
 mod telemetry;
 mod token_store;
 mod venues;
@@ -60,6 +62,21 @@ enum Command {
     },
     /// Remove this machine's device token.
     Logout,
+    /// Say what is missing or wrong on this machine, and how to fix it.
+    ///
+    /// Only looks: nothing is installed, built or flashed. In an exercise
+    /// or project folder it judges for that folder's run.
+    Doctor {
+        /// The folder to judge for; the one you are in by default.
+        dir: Option<PathBuf>,
+        /// Do not ask TER Learn anything.
+        #[arg(long)]
+        offline: bool,
+        /// Also compare the tools with the versions a curriculum checkout
+        /// is checked with.
+        #[arg(long, value_name = "CURRICULUM_PATH")]
+        dev: Option<PathBuf>,
+    },
     /// Show the account this machine is paired with, its courses and versions.
     Whoami,
     /// Exercises: list, fetch, clean and remove.
@@ -397,6 +414,9 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
             login::login(&session, json, !no_browser).await
         }
         Command::Logout => login::logout(&Session::open()?, json),
+        Command::Doctor { dir, offline, dev } => {
+            doctor::run(doctor::Args { dir, offline, dev }, json).await
+        }
         Command::Ex { command } => ex(command, json).await,
         Command::Run {
             dir,

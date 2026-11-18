@@ -75,7 +75,7 @@ struct Checked<R> {
 }
 
 /// The default venue of each mode, and the ones this ter can run.
-fn venue_for(mode: &str, asked: Option<&str>) -> Result<&'static str, CliError> {
+pub fn venue_for(mode: &str, asked: Option<&str>) -> Result<&'static str, CliError> {
     let (default, known): (&str, &[&'static str]) = match mode {
         "simulation" => ("wokwi", &["wokwi"]),
         _ => ("local", &["local", "bench"]),

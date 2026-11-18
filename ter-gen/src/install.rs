@@ -29,12 +29,12 @@ pub enum Tool {
     XiaoGenerate,
 }
 
-/// A cargo-installed tool: its program, its crate and the oldest major
-/// version ter works with.
+/// A cargo-installed tool: its program, its crate and the oldest version
+/// ter works with, if it matters.
 struct CargoTool {
     program: &'static str,
     krate: &'static str,
-    min_major: u64,
+    min_version: Option<&'static str>,
 }
 
 // ter flashes with `espflash flash --non-interactive --after no-reset`,
@@ -42,44 +42,50 @@ struct CargoTool {
 const ESPFLASH: CargoTool = CargoTool {
     program: "espflash",
     krate: "espflash",
-    min_major: 4,
+    min_version: Some("4.0.0"),
 };
 
 const PROBE_RS: CargoTool = CargoTool {
     program: "probe-rs",
     krate: "probe-rs-tools",
-    min_major: 0,
+    min_version: None,
 };
 
 const ELF2UF2_RS: CargoTool = CargoTool {
     program: "elf2uf2-rs",
     krate: "elf2uf2-rs",
-    min_major: 0,
+    min_version: None,
 };
 
 const UF2DEPLOY: CargoTool = CargoTool {
     program: "uf2deploy",
     krate: "uf2deploy",
-    min_major: 0,
+    min_version: None,
 };
 
+// xiao-generate 0.1.0 writes an older esp-hal stack than the exercises
+// are built with.
 const XIAO_GENERATE: CargoTool = CargoTool {
     program: "xiao-generate",
     krate: "xiao-generate",
-    min_major: 0,
+    min_version: Some("0.1.1"),
 };
 
 const LDPROXY: CargoTool = CargoTool {
     program: "ldproxy",
     krate: "ldproxy",
-    min_major: 0,
+    min_version: None,
 };
 
 const ESPUP: CargoTool = CargoTool {
     program: "espup",
     krate: "espup",
-    min_major: 0,
+    min_version: None,
 };
+
+/// Why a tool that is not there at all is installed: [`State::Install`]'s
+/// `why`. Any other `why` is about the one that is there (too old).
+pub const NOT_INSTALLED: &str = "not installed";
 
 /// A command to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,22 +277,19 @@ fn cargo_tool(probe: &impl Probe, tool: &CargoTool) -> Item {
         }
     };
     let state = match probe.find(tool.program) {
-        None => install("not installed".into(), false),
+        None => install(NOT_INSTALLED.into(), false),
         Some(path) => {
             let version = probe
                 .output(&path, &["--version"])
                 .and_then(|out| version(&out))
                 .or_else(|| installed_version(probe, tool.krate));
-            match version {
-                Some((v, major)) if major < tool.min_major => install(
-                    format!(
-                        "{} {v} is too old: ter needs {} or newer",
-                        tool.program, tool.min_major
-                    ),
+            match (version, tool.min_version) {
+                (Some(v), Some(min)) if !at_least(&v, min) => install(
+                    format!("{} {v} is too old: ter needs {min} or newer", tool.program),
                     true,
                 ),
-                Some((v, _)) => State::Present(format!("{v}, {}", path.display())),
-                None => State::Present(path.display().to_string()),
+                (Some(v), _) => State::Present(format!("{v}, {}", path.display())),
+                (None, _) => State::Present(path.display().to_string()),
             }
         }
     };
@@ -296,20 +299,68 @@ fn cargo_tool(probe: &impl Probe, tool: &CargoTool) -> Item {
     }
 }
 
-/// The version a `--version` line names (`espflash 4.6.0`), and its major.
-fn version(out: &str) -> Option<(String, u64)> {
+/// The version a `--version` line names (`espflash 4.6.0`).
+fn version(out: &str) -> Option<String> {
     let word = out
         .split_whitespace()
         .map(|w| w.trim_start_matches('v'))
         .find(|w| w.starts_with(|c: char| c.is_ascii_digit()) && w.contains('.'))?;
-    let major = word.split('.').next()?.parse().ok()?;
-    Some((word.to_string(), major))
+    numbers(word).map(|_| word.to_string())
+}
+
+/// `major.minor.patch` as numbers; a part that is left out is 0, and
+/// anything after the patch number (`-rc.1`, `+build`) is ignored.
+fn numbers(version: &str) -> Option<[u64; 3]> {
+    let mut parts = version.trim().trim_start_matches('v').splitn(3, '.');
+    let mut out = [0; 3];
+    for (i, slot) in out.iter_mut().enumerate() {
+        match parts.next() {
+            Some(part) => {
+                let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+                *slot = digits.parse().ok()?;
+            }
+            None if i == 0 => return None,
+            None => {}
+        }
+    }
+    Some(out)
+}
+
+/// Whether `found` is `minimum` or newer. A version ter cannot read is
+/// not called too old.
+pub fn at_least(found: &str, minimum: &str) -> bool {
+    match (numbers(found), numbers(minimum)) {
+        (Some(f), Some(m)) => f >= m,
+        _ => true,
+    }
+}
+
+/// Whether two versions name the same release (`0.1.1` and `v0.1.1`).
+pub fn same_version(a: &str, b: &str) -> bool {
+    matches!((numbers(a), numbers(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// The installed version of a cargo tool, when it is there and says.
+pub fn installed(probe: &impl Probe, tool: Tool) -> Option<String> {
+    let tool = match tool {
+        Tool::Espflash => &ESPFLASH,
+        Tool::ProbeRs => &PROBE_RS,
+        Tool::Elf2uf2Rs => &ELF2UF2_RS,
+        Tool::Uf2deploy => &UF2DEPLOY,
+        Tool::XiaoGenerate => &XIAO_GENERATE,
+        Tool::Targets => return None,
+    };
+    let path = probe.find(tool.program)?;
+    probe
+        .output(&path, &["--version"])
+        .and_then(|out| version(&out))
+        .or_else(|| installed_version(probe, tool.krate))
 }
 
 /// The version cargo recorded when it installed `krate`, for tools with no
 /// working `--version` (ldproxy 0.3.5 panics on it). `cargo install --list`
 /// names each crate on a line of its own: `ldproxy v0.3.5:`.
-fn installed_version(probe: &impl Probe, krate: &str) -> Option<(String, u64)> {
+fn installed_version(probe: &impl Probe, krate: &str) -> Option<String> {
     let cargo = probe.find("cargo")?;
     let list = probe.output(&cargo, &["install", "--list"])?;
     list.lines()
@@ -584,7 +635,7 @@ mod tests {
         let State::Install { why, run } = &items[0].state else {
             panic!("{items:?}")
         };
-        assert_eq!(why, "espflash 3.3.0 is too old: ter needs 4 or newer");
+        assert_eq!(why, "espflash 3.3.0 is too old: ter needs 4.0.0 or newer");
         assert_eq!(
             run[0].to_string(),
             "cargo install espflash --locked --force"
@@ -633,13 +684,62 @@ mod tests {
 
     #[test]
     fn versions_are_read_off_the_version_line() {
-        assert_eq!(version("espflash 4.6.0"), Some(("4.6.0".into(), 4)));
+        assert_eq!(version("espflash 4.6.0"), Some("4.6.0".into()));
         assert_eq!(
             version("probe-rs 0.32.0 (git commit: abc)"),
-            Some(("0.32.0".into(), 0))
+            Some("0.32.0".into())
         );
-        assert_eq!(version("wokwi-cli v0.27.1"), Some(("0.27.1".into(), 0)));
+        assert_eq!(version("wokwi-cli v0.27.1"), Some("0.27.1".into()));
         assert_eq!(version("nothing here"), None);
+    }
+
+    #[test]
+    fn the_floor_is_a_whole_version_not_a_major() {
+        assert!(!at_least("0.1.0", "0.1.1"));
+        assert!(at_least("0.1.1", "0.1.1"));
+        assert!(at_least("0.1.2", "0.1.1"));
+        assert!(at_least("v0.1.10", "0.1.9"));
+        assert!(!at_least("3.9.9", "4.0.0"));
+        assert!(at_least("4.5", "4.5.0"));
+        assert!(at_least("1.0.0-rc.1", "1.0.0"), "the tag is ignored");
+        assert!(at_least("unknown", "0.1.1"), "unreadable is not too old");
+        assert!(same_version("v0.1.1", "0.1.1") && !same_version("0.1.2", "0.1.1"));
+    }
+
+    #[test]
+    fn an_xiao_generate_below_the_floor_is_replaced_and_newer_ones_are_kept() {
+        let with = |v: &str| {
+            Fake::default()
+                .with("xiao-generate")
+                .says("xiao-generate --version", &format!("xiao-generate {v}\n"))
+        };
+        let old = with("0.1.0");
+        let items = plan(&old, Tool::XiaoGenerate, None);
+        let State::Install { why, run } = &items[0].state else {
+            panic!("{items:?}")
+        };
+        assert_eq!(
+            why,
+            "xiao-generate 0.1.0 is too old: ter needs 0.1.1 or newer"
+        );
+        assert_eq!(
+            run[0].to_string(),
+            "cargo install xiao-generate --locked --force"
+        );
+        assert_eq!(
+            installed(&old, Tool::XiaoGenerate).as_deref(),
+            Some("0.1.0")
+        );
+        for v in ["0.1.1", "0.1.2", "0.2.0"] {
+            assert!(
+                matches!(
+                    plan(&with(v), Tool::XiaoGenerate, None)[0].state,
+                    State::Present(_)
+                ),
+                "{v}"
+            );
+        }
+        assert_eq!(installed(&Fake::default(), Tool::XiaoGenerate), None);
     }
 
     #[test]

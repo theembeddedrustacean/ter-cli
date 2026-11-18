@@ -7,27 +7,30 @@ use ter_telemetry::local::Local;
 use ter_telemetry::wokwi::Wokwi;
 use ter_telemetry::{EventKinds, Kind};
 
-use crate::hw::{PORT_ENV, UF2_DRIVE_ENV};
+use crate::hw::PORT_ENV;
 use crate::output::{CliError, print_json};
-use crate::sim;
+use crate::survey::{Survey, survey};
 
 fn kinds(k: &EventKinds) -> Vec<String> {
     k.iter().map(Kind::to_string).collect()
 }
 
 pub fn run(json: bool) -> Result<(), CliError> {
-    let tools: Vec<(&str, Option<String>)> = ["espflash", "probe-rs"]
+    let Survey {
+        tools,
+        ports,
+        port_env,
+        drives,
+        unmounted,
+        wokwi_cli,
+        wokwi_token,
+    } = survey();
+    let tools: Vec<(&str, Option<String>)> = tools
         .into_iter()
-        .map(|t| {
-            (
-                t,
-                ter_flash::find_program(t).map(|p| p.display().to_string()),
-            )
-        })
+        .map(|(t, p)| (t, p.map(|p| p.display().to_string())))
         .collect();
-    let boards: Vec<Value> = ter_flash::port::list()
+    let boards: Vec<Value> = ports
         .into_iter()
-        .filter(|p| p.kind != PortKind::Other)
         .map(|p| {
             // What a bare board on this port shows, flashed by its tool.
             let tool = if p.kind == PortKind::Probe {
@@ -46,17 +49,8 @@ pub fn run(json: bool) -> Result<(), CliError> {
             })
         })
         .collect();
-    let port_env = std::env::var(PORT_ENV)
-        .ok()
-        .filter(|p| !p.trim().is_empty());
     // A UF2 board in its bootloader shows a drive, not a port; ter flashes
     // it itself.
-    let named_drive = std::env::var(UF2_DRIVE_ENV)
-        .ok()
-        .filter(|p| !p.trim().is_empty())
-        .and_then(|p| ter_flash::drive::Drive::at(std::path::Path::new(p.trim())));
-    let mut drives = ter_flash::drive::mounted();
-    drives.extend(named_drive.filter(|d| !drives.iter().any(|m| m.path == d.path)));
     let uf2_provides: EventKinds = Local::provides_on(
         &Tool::Uf2 {
             family: &ter_flash::uf2::RP2040,
@@ -74,16 +68,13 @@ pub fn run(json: bool) -> Result<(), CliError> {
             })
         })
         .collect();
-    let unmounted: Vec<String> = ter_flash::drive::unmounted()
-        .iter()
-        .map(|d| d.display().to_string())
-        .collect();
+    let unmounted: Vec<String> = unmounted.iter().map(|d| d.display().to_string()).collect();
     let local_ready = (tools.iter().any(|(_, p)| p.is_some())
         && (!boards.is_empty() || port_env.is_some()))
         || !uf2_drives.is_empty();
 
-    let wokwi_cli = sim::find_cli().map(|p| p.display().to_string());
-    let wokwi_token = matches!(sim::token(), Ok(Some(_)));
+    let wokwi_cli = wokwi_cli.map(|p| p.display().to_string());
+    let wokwi_token = wokwi_token.is_some();
     let wokwi_provides: EventKinds = Wokwi::PROVIDES.into();
 
     let answer = json!({

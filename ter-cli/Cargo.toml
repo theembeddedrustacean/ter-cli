@@ -19,6 +19,7 @@ clap.workspace = true
 directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_norway.workspace = true
 sha2.workspace = true
 ter-check.workspace = true
 ter-sdk.workspace = true
@@ -36,6 +37,10 @@ tempfile.workspace = true
 
 # The system keychain on each platform. Where none is reachable the token
 # goes to a mode 600 file instead.
+# Whether this login may use a device node, asked without opening it.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
