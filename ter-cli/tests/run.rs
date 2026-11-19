@@ -198,6 +198,10 @@ impl Machine {
         )
         .unwrap();
         std::fs::write(dir.join("src/main.rs"), main_rs).unwrap();
+        // An exercise that allows simulation is fetched with its circuit.
+        if modes.contains(&"simulation") {
+            std::fs::write(dir.join("diagram.json"), UFERRIS).unwrap();
+        }
         let sha = ter_sdk::project::source_sha256(&dir).unwrap();
         let modes: Vec<String> = modes.iter().map(|s| format!("{s:?}")).collect();
         std::fs::write(
@@ -836,6 +840,58 @@ async fn text_output_shows_the_serial_and_the_partial_pass() {
         ),
         "{out}"
     );
+}
+
+/// Modes that allow simulation, fetched with no circuit: nothing points
+/// at a simulation run, and asking for one is refused before the build.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_exercise_with_no_circuit_is_not_sent_to_simulation() {
+    let answer = ok(json!({"name": "r-0001", "attempt": 3, "lesson_completed": false}));
+    let server = site("0.1.0", answer).await;
+    let mut m = Machine::with_exercise(GOOD, &["hardware", "simulation"]);
+    std::fs::remove_file(m.exercise().join("diagram.json")).unwrap();
+    m = m.on_board(BANNER_AND_BLINK, 0, "");
+    let board = Board::start(flashed(&m), &["Hello world!\r\n"], false);
+    m.port = Some(board.port.clone());
+
+    let o = m.ter_in(&server.uri(), &["run", "--hw"], &m.exercise());
+    board.thread.join().unwrap();
+
+    let out = String::from_utf8_lossy(&o.stdout);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{out}\n{err}");
+    assert!(
+        err.contains("This run on your board can't complete the exercise"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("--sim") && !out.contains("--sim"),
+        "{out}\n{err}"
+    );
+    assert!(!out.contains("in simulation"), "{out}");
+    assert!(out.contains("lesson page"), "{out}");
+
+    let runs = std::fs::read_dir(m.exercise().join(".runs"))
+        .unwrap()
+        .count();
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim"]);
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "not_observable", "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("has no Wokwi circuit (diagram.json is not in its folder)"),
+        "{msg}"
+    );
+    assert!(msg.contains("`ter run --hw`"), "{msg}");
+    assert_eq!(
+        std::fs::read_dir(m.exercise().join(".runs"))
+            .unwrap()
+            .count(),
+        runs,
+        "refused before the build"
+    );
+    assert_eq!(posted(&server, "run").await.len(), 1, "only the board run");
 }
 
 /// The site says a pass on the learner's board did not complete the

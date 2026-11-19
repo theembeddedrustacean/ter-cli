@@ -699,6 +699,16 @@ const SETUP_CHECK: &str = "timeout_ms: 3000\nsetup:\n  - press: user_button\n   
 /// The mock site, plus `id` answering with `check` (or no check.yaml) and
 /// `modes`.
 async fn site_with(id: &str, check: Option<&str>, modes: &[&str]) -> MockServer {
+    // An exercise that allows simulation comes with its circuit.
+    site_with_circuit(id, check, modes, modes.contains(&"simulation")).await
+}
+
+async fn site_with_circuit(
+    id: &str,
+    check: Option<&str>,
+    modes: &[&str],
+    circuit: bool,
+) -> MockServer {
     let site = mock_site().await;
     let mut files = vec![
         json!({"path": "Cargo.toml", "content": "[package]\nname = \"exercise\"\n", "encoding": "utf8"}),
@@ -707,6 +717,11 @@ async fn site_with(id: &str, check: Option<&str>, modes: &[&str]) -> MockServer 
     ];
     if let Some(c) = check {
         files.push(json!({"path": "check.yaml", "content": c, "encoding": "utf8"}));
+    }
+    if circuit {
+        files.push(
+            json!({"path": "diagram.json", "content": "{\"parts\":[]}\n", "encoding": "utf8"}),
+        );
     }
     let mut ex = exercise(id, Value::Array(files));
     ex["modes"] = json!(modes);
@@ -847,6 +862,74 @@ async fn show_reads_a_fetched_exercise_offline_from_its_own_check_yaml() {
         assert!(out.contains("blink-rate"), "{out}");
         assert!(out.contains("Passes only in simulation"), "{out}");
     }
+}
+
+/// Modes that allow simulation, but no circuit came with the exercise:
+/// show does not offer the simulation run, by id or in the fetched folder.
+#[tokio::test]
+async fn show_does_not_offer_simulation_without_a_circuit() {
+    let id = "serial-only--xiao-esp32c3-nostd";
+    let site = site_with_circuit(id, Some(SERIAL_CHECK), &["hardware", "simulation"], false).await;
+    let m = Machine::new();
+    let o = m.ter(&site.uri(), &["ex", "fetch", id]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let dir = m.exercise_dir("unlisted", id);
+    for (uri, args, cwd, source) in [
+        (
+            site.uri(),
+            vec!["ex", "show", id],
+            m.config.path().to_path_buf(),
+            "folder",
+        ),
+        (
+            "http://127.0.0.1:9".to_string(),
+            vec!["ex", "show"],
+            dir.clone(),
+            "folder",
+        ),
+    ] {
+        let o = m.ter_in(&uri, &args, &cwd);
+        let out = stdout(&o);
+        assert!(o.status.success(), "{args:?}: {out}\n{}", stderr(&o));
+        assert!(
+            out.contains("banner  serial_contains  graded on a board\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                "Passes on your board: `ter run --hw`. Its modes allow simulation, but it has \
+                 no Wokwi circuit (diagram.json), so `ter run --sim` can't run it.\n"
+            ),
+            "{out}"
+        );
+        let mut json_args = args.clone();
+        json_args.push("--json");
+        let o = m.ter_in(&uri, &json_args, &cwd);
+        let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert_eq!(v["source"], source);
+        assert_eq!(v["modes"], json!(["hardware", "simulation"]));
+        assert_eq!(v["passes_in"], json!(["hardware"]));
+    }
+    // Not fetched: the site's file list says the same.
+    let other = Machine::new();
+    let (ok, v) = other.json(&site.uri(), &["ex", "show", id]);
+    assert!(ok, "{v}");
+    assert_eq!(v["source"], "site");
+    assert_eq!(v["passes_in"], json!(["hardware"]));
+    assert!(
+        v["summary"].as_str().unwrap().contains("no Wokwi circuit"),
+        "{v}"
+    );
+
+    // Pin checks with no circuit: no run passes it, and nothing says --sim does.
+    let pins = "pins--xiao-esp32c3-nostd";
+    let site = site_with_circuit(pins, Some(PIN_CHECK), &["hardware", "simulation"], false).await;
+    let o = other.ter(&site.uri(), &["ex", "show", pins]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("No ter run can pass it yet"), "{out}");
+    assert!(!out.contains("Passes"), "{out}");
+    assert!(!out.contains("graded only in simulation"), "{out}");
 }
 
 #[tokio::test]

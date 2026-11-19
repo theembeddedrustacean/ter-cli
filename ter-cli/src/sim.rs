@@ -52,6 +52,9 @@ fn not_observable(message: String) -> CliError {
 /// Wire the circuit for `file`'s checks: the run copy of the exercise's
 /// `diagram.json` with a logic analyzer on the checked pins.
 pub fn plan(dir: &Path, ter: &TerToml, file: &CheckFile) -> Result<Plan, CliError> {
+    if !has_circuit(dir) {
+        return Err(no_circuit(ter));
+    }
     let provides: EventKinds = wokwi::Wokwi::PROVIDES.into();
     if let Some((id, missing)) = unobservable(file, &provides).into_iter().next() {
         let kinds: Vec<String> = missing.iter().map(ToString::to_string).collect();
@@ -112,6 +115,33 @@ fn refetch(ter: &TerToml) -> String {
         "Keep a copy of your src/, then `ter ex remove --force {0}` and `ter ex fetch {0}`.",
         ter.exercise
     )
+}
+
+/// Whether the exercise folder has a circuit for the simulator.
+pub fn has_circuit(dir: &Path) -> bool {
+    dir.join(wokwi::RUN_DIAGRAM).is_file()
+}
+
+/// Whether ter offers a simulation run of the exercise in `dir`: its
+/// modes allow one and it has a circuit. Modes that allow simulation for
+/// an exercise fetched without a circuit do not send anyone to a run that
+/// cannot start.
+pub fn offered(dir: &Path, modes: &[String]) -> bool {
+    modes.iter().any(|m| m == "simulation") && has_circuit(dir)
+}
+
+/// Why an exercise with no circuit does not run in simulation, and what
+/// runs it instead.
+fn no_circuit(ter: &TerToml) -> CliError {
+    let mut message = format!(
+        "{} has no Wokwi circuit ({} is not in its folder), so it cannot run in simulation.",
+        ter.exercise,
+        wokwi::RUN_DIAGRAM
+    );
+    if ter.modes.iter().any(|m| m == "hardware") {
+        message.push_str(" Run it on your board: `ter run --hw`.");
+    }
+    not_observable(message)
 }
 
 /// The custom chip names the diagram's parts use: type `chip-<name>`.
@@ -355,7 +385,15 @@ mod tests {
             &file(PRESS),
         )
         .unwrap_err();
-        assert!(err.message.contains("No Wokwi circuit"), "{}", err.message);
+        assert!(
+            err.message.contains("has no Wokwi circuit"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("ter run --hw"), "{}", err.message);
+        assert!(!offered(bare.path(), &ter(&[]).modes));
+        assert!(offered(dir.path(), &ter(&[]).modes));
+        assert!(!offered(dir.path(), &["hardware".to_string()]));
 
         let err = plan(
             dir.path(),

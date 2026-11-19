@@ -125,7 +125,8 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         ));
     }
     let venue = venue_for(&mode, args.venue.as_deref().or(ter.venue.as_deref()))?;
-    let sim_allowed = ter.modes.iter().any(|m| m == "simulation");
+    // What ter points at as the run that completes the exercise.
+    let sim_allowed = sim::offered(&dir, &ter.modes);
 
     let check_path = dir.join(CHECK_YAML);
     let plan = if args.no_check {

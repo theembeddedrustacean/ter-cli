@@ -483,6 +483,14 @@ fn from_folder(dir: PathBuf) -> Result<Shown, CliError> {
 }
 
 fn describe(shown: Shown) -> Result<ShowOut, CliError> {
+    // A simulation run needs the exercise's circuit, whatever its modes say.
+    let circuit = match &shown {
+        Shown::Folder { dir, .. } => crate::sim::has_circuit(dir),
+        Shown::Site { exercise, .. } => exercise
+            .files
+            .iter()
+            .any(|f| f.path == ter_telemetry::wokwi::RUN_DIAGRAM),
+    };
     let (mut out, text) = match shown {
         Shown::Folder { dir, ter, check } => {
             let (check_yaml, text) = check.unzip();
@@ -523,7 +531,8 @@ fn describe(shown: Shown) -> Result<ShowOut, CliError> {
         ),
     };
     let hardware = out.modes.iter().any(|m| m == "hardware");
-    let simulation = out.modes.iter().any(|m| m == "simulation");
+    let sim_mode = out.modes.iter().any(|m| m == "simulation");
+    let simulation = sim_mode && circuit;
     let Some(text) = text else {
         out.summary = "No check: nothing to pass.".into();
         return Ok(out);
@@ -564,11 +573,18 @@ fn describe(shown: Shown) -> Result<ShowOut, CliError> {
             "Passes only in simulation: `ter run --sim`. A run on a board can't complete it.".into()
         }
         (_, true, _) => "Passes in simulation: `ter run --sim`.".into(),
+        (false, false, _) => "No ter run can pass it.".into(),
         (_, false, _) => "No ter run can pass it yet: some checks are graded only with a \
                           telemetry board, which ter does not support yet. Mark the lesson \
                           complete on the lesson page once the rest pass."
             .into(),
     };
+    if sim_mode && !circuit {
+        out.summary.push_str(&format!(
+            " Its modes allow simulation, but it has no Wokwi circuit ({}), so `ter run --sim` can't run it.",
+            ter_telemetry::wokwi::RUN_DIAGRAM
+        ));
+    }
     Ok(out)
 }
 
