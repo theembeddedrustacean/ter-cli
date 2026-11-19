@@ -28,7 +28,7 @@ use ter_remote::heartbeat::{Change, Schedule};
 use ter_remote::policy::Limits;
 use ter_sdk::Client;
 use ter_telemetry::local::Local;
-use ter_telemetry::{EventKinds, Kind, Venue};
+use ter_telemetry::{EventKinds, Venue};
 
 use crate::bench::{Benches, Served};
 use crate::output::CliError;
@@ -102,18 +102,9 @@ impl Board for BenchBoard {
         &self.label
     }
 
-    /// What the board on USB shows now; nothing when none is plugged in.
+    /// What the bench's board shows now; nothing when it is not plugged in.
     fn provides(&self) -> EventKinds {
-        let tool = Tool::Espflash { chip: None };
-        match crate::hw::port(&tool) {
-            Ok(port) => Local::provides_on(&tool, port.kind),
-            Err(_) => match crate::hw::port(&Tool::ProbeRs {
-                chip: String::new(),
-            }) {
-                Ok(_) => [Kind::Serial].into(),
-                Err(_) => EventKinds::new(),
-            },
-        }
+        shown(crate::hw::port(&FLASHER).ok().as_ref())
     }
 
     fn run(&self, run: BenchRun, elf: Vec<u8>) -> BoardFuture {
@@ -133,6 +124,17 @@ impl Board for BenchBoard {
                 })?
         })
     }
+}
+
+/// What flashes every board in [`SHAREABLE`].
+const FLASHER: Tool = Tool::Espflash { chip: None };
+
+/// What a bench shows with `port` as its board's. Another board on this
+/// machine's USB (a debug probe, say) is not the bench's: a run would only
+/// find that out after its build.
+fn shown(port: Option<&Port>) -> EventKinds {
+    port.map(|p| Local::provides_on(&FLASHER, p.kind))
+        .unwrap_or_default()
 }
 
 /// The flasher a run asks for. A shared bench is an ESP32-C3, so anything
@@ -443,5 +445,41 @@ pub fn default_bench_port(serve_port: u16) -> u16 {
         0
     } else {
         serve_port.wrapping_add(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ter_flash::PortKind;
+    use ter_telemetry::Kind;
+
+    fn port(path: &str, kind: PortKind) -> Port {
+        Port {
+            path: path.into(),
+            kind,
+            ..Port::default()
+        }
+    }
+
+    fn bench_shows(ports: Vec<Port>) -> EventKinds {
+        shown(crate::hw::one_of(&FLASHER, ports).ok().as_ref())
+    }
+
+    #[test]
+    fn a_bench_shows_what_its_own_board_shows() {
+        let esp = port("/dev/ttyACM0", PortKind::UsbSerialJtag);
+        let probe = port("/dev/ttyACM3", PortKind::Probe);
+        let both: EventKinds = [Kind::Serial, Kind::Reset].into();
+        assert_eq!(bench_shows(vec![esp.clone()]), both);
+        assert_eq!(bench_shows(vec![esp, probe]), both);
+    }
+
+    #[test]
+    fn another_board_on_usb_is_not_the_benchs() {
+        let probe = port("/dev/ttyACM3", PortKind::Probe);
+        let other = port("/dev/ttyACM1", PortKind::Other);
+        assert!(bench_shows(vec![]).is_empty());
+        assert!(bench_shows(vec![probe, other]).is_empty());
     }
 }

@@ -126,10 +126,12 @@ pub fn port(tool: &Tool) -> Result<Port, CliError> {
         }
         return Ok(Port::named(path));
     }
-    let boards: Vec<Port> = ter_flash::port::list()
-        .into_iter()
-        .filter(|p| tool.wants(p.kind))
-        .collect();
+    one_of(tool, ter_flash::port::list())
+}
+
+/// The one port among `ports` with a board this tool can flash.
+pub fn one_of(tool: &Tool, ports: Vec<Port>) -> Result<Port, CliError> {
+    let boards: Vec<Port> = ports.into_iter().filter(|p| tool.wants(p.kind)).collect();
     match boards.len() {
         0 => Err(unavailable(format!(
             "No board found on USB for {}. Plug it in with a data cable (`ter venues` lists what ter sees), or name its port with {PORT_ENV}.",
