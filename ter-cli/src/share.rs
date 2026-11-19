@@ -20,7 +20,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ter_flash::{Port, Tool};
+use ter_flash::{Port, PortKind, Tool};
 use ter_remote::bench::{
     BenchAnswer, BenchError, BenchRun, Board, BoardFuture, Owner, SharedOwner,
 };
@@ -104,7 +104,7 @@ impl Board for BenchBoard {
 
     /// What the bench's board shows now; nothing when it is not plugged in.
     fn provides(&self) -> EventKinds {
-        shown(crate::hw::port(&FLASHER).ok().as_ref())
+        shown(bench_port().ok().as_ref())
     }
 
     fn run(&self, run: BenchRun, elf: Vec<u8>) -> BoardFuture {
@@ -128,6 +128,34 @@ impl Board for BenchBoard {
 
 /// What flashes every board in [`SHAREABLE`].
 const FLASHER: Tool = Tool::Espflash { chip: None };
+
+/// The port of the bench's board: `TER_PORT` when it names one, else the
+/// one board on USB the bench's flasher takes.
+fn bench_port() -> Result<Port, CliError> {
+    match crate::hw::named() {
+        Some(named) => own(named?),
+        None => crate::hw::one_of(&FLASHER, ter_flash::port::list()),
+    }
+}
+
+/// A named port as the bench's board's, unless ter knows it as another
+/// kind of board's (a debug probe's). A port ter does not know (a bridge
+/// chip it has no id for) is trusted, as on a local run; a known wrong one
+/// is not, because a driver's run would only find out after its build.
+fn own(named: Port) -> Result<Port, CliError> {
+    if FLASHER.wants(named.kind) || named.kind == PortKind::Other {
+        return Ok(named);
+    }
+    Err(CliError::new(
+        "venue_unavailable",
+        format!(
+            "{0} is {1}, a debug probe's port, and a bench's board is flashed with {2}, which does not take it. Name the ESP32-C3's port, or unset {0} and ter finds it.",
+            crate::hw::PORT_ENV,
+            named.path,
+            FLASHER.program(),
+        ),
+    ))
+}
 
 /// What a bench shows with `port` as its board's. Another board on this
 /// machine's USB (a debug probe, say) is not the bench's: a run would only
@@ -175,7 +203,7 @@ fn flash_and_capture(run: BenchRun, elf: Vec<u8>) -> Result<BenchAnswer, BenchEr
             tool.program()
         ))
     })?;
-    let port: Port = crate::hw::port(&tool).map_err(|e| unavailable(e.message))?;
+    let port: Port = bench_port().map_err(|e| unavailable(e.message))?;
     let dir = tempfile::tempdir().map_err(|e| unavailable(e.to_string()))?;
     let elf_path = dir.path().join("firmware.elf");
     std::fs::write(&elf_path, &elf).map_err(|e| unavailable(e.to_string()))?;
@@ -305,9 +333,10 @@ pub async fn start(
         label: registered.label.clone(),
         turn,
     });
-    if board.provides().is_empty() {
+    if let Err(e) = bench_port() {
         eprintln!(
-            "No board is plugged in yet; runs on this bench fail until one is (`ter venues` shows what ter sees)."
+            "{} Runs on this bench are refused until its board is there.",
+            e.message
         );
     }
     tokio::spawn({
@@ -481,5 +510,31 @@ mod tests {
         let other = port("/dev/ttyACM1", PortKind::Other);
         assert!(bench_shows(vec![]).is_empty());
         assert!(bench_shows(vec![probe, other]).is_empty());
+    }
+
+    #[test]
+    fn a_named_port_is_the_benchs_unless_it_is_another_boards() {
+        let esp = port("/dev/ttyACM0", PortKind::UsbSerialJtag);
+        let bridge = port("/dev/ttyUSB0", PortKind::UsbUart);
+        let unknown = port("/dev/ttyUSB7", PortKind::Other);
+        assert_eq!(own(esp.clone()).unwrap().path, esp.path);
+        assert_eq!(own(bridge.clone()).unwrap().path, bridge.path);
+        assert_eq!(own(unknown.clone()).unwrap().path, unknown.path);
+        assert!(!shown(own(esp).ok().as_ref()).is_empty());
+    }
+
+    #[test]
+    fn a_named_probe_port_is_refused_by_name_and_shows_nothing() {
+        let probe = port("/dev/ttyACM3", PortKind::Probe);
+        let err = own(probe.clone()).unwrap_err();
+        assert_eq!(err.code, "venue_unavailable");
+        assert!(
+            err.message
+                .contains("TER_PORT is /dev/ttyACM3, a debug probe's port"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("espflash"), "{}", err.message);
+        assert!(shown(own(probe).ok().as_ref()).is_empty());
     }
 }

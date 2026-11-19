@@ -1219,9 +1219,19 @@ struct SharedBench {
 
 impl SharedBench {
     fn start(label: &str) -> Self {
+        Self::start_on(label, None)
+    }
+
+    /// With `port` named as the bench's board's; else ter finds the board.
+    fn start_on(label: &str, port: Option<&str>) -> Self {
         use std::io::BufRead;
         let m = LiveMachine::new();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ter"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ter"));
+        command.env_remove("TER_PORT");
+        if let Some(port) = port {
+            command.env("TER_PORT", port);
+        }
+        let mut child = command
             .args(["serve", "--port", "0", "--json", "--share"])
             .args([
                 "--board",
@@ -1236,7 +1246,6 @@ impl SharedBench {
             .env("TER_TOKEN", &m.token)
             .env("TER_KEYCHAIN", "off")
             .env_remove("TER_SITE_URL")
-            .env_remove("TER_PORT")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1480,22 +1489,36 @@ fn live_a_bench_without_a_board_refuses_before_the_build() {
         eprintln!("skipped: a board is plugged in (TER_BENCH=1)");
         return;
     }
-    let bench = SharedBench::start(&live_label("no board"));
-    let driver = LiveMachine::new();
-    let (ok, v) = driver.json(&["connect", &bench.code], driver.courses.path());
-    assert!(ok, "{v}");
-    let dir = fetched(&driver, LIVE_SERIAL_ONLY);
-    let (ok, v) = driver.json(&["run", "--hw", "--venue", "bench"], &dir);
-    assert!(!ok);
-    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("no board plugged in"),
-        "the bench answered with the share code: {v}"
-    );
-    assert!(!dir.join(".runs").exists(), "nothing built, nothing posted");
+    // Also with a debug probe's port named as the bench's board, when
+    // TER_PORT names one on this machine: it is not the bench's board.
+    let probe = std::env::var("TER_PORT").ok().filter(|p| !p.is_empty());
+    for port in [None, probe.as_deref()]
+        .into_iter()
+        .take(1 + probe.iter().len())
+    {
+        let bench = SharedBench::start_on(&live_label("no board"), port);
+        if let Some(port) = port {
+            bench.wait_said(
+                &format!("TER_PORT is {port}, a debug probe's port"),
+                std::time::Duration::from_secs(10),
+            );
+        }
+        let driver = LiveMachine::new();
+        let (ok, v) = driver.json(&["connect", &bench.code], driver.courses.path());
+        assert!(ok, "{v}");
+        let dir = fetched(&driver, LIVE_SERIAL_ONLY);
+        let (ok, v) = driver.json(&["run", "--hw", "--venue", "bench"], &dir);
+        assert!(!ok);
+        assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no board plugged in"),
+            "the bench answered with the share code: {v}"
+        );
+        assert!(!dir.join(".runs").exists(), "nothing built, nothing posted");
+    }
 }
 
 /// The seeded bench (owner: the test account, code GZTS-2520) has never

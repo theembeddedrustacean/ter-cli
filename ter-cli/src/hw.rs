@@ -117,16 +117,24 @@ fn named_port() -> Option<Port> {
 
 /// `TER_PORT`, else the one board on USB this tool can flash.
 pub fn port(tool: &Tool) -> Result<Port, CliError> {
-    if let Some(named) = named_port() {
-        let path = named.path.as_str();
-        if !ter_flash::port::present(path) {
-            return Err(unavailable(format!(
-                "{PORT_ENV} is {path}, and there is no such port. Is the board plugged in?"
-            )));
-        }
-        return Ok(Port::named(path));
+    match named() {
+        Some(named) => named,
+        None => one_of(tool, ter_flash::port::list()),
     }
-    one_of(tool, ter_flash::port::list())
+}
+
+/// The port `TER_PORT` names, when it is set: what is on it, or that
+/// there is no such port.
+pub fn named() -> Option<Result<Port, CliError>> {
+    let named = named_port()?;
+    let path = named.path.as_str();
+    Some(if ter_flash::port::present(path) {
+        Ok(Port::named(path))
+    } else {
+        Err(unavailable(format!(
+            "{PORT_ENV} is {path}, and there is no such port. Is the board plugged in?"
+        )))
+    })
 }
 
 /// The one port among `ports` with a board this tool can flash.
