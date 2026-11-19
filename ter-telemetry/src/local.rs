@@ -10,7 +10,9 @@
 //! the port's control lines, so the first byte the program prints is in
 //! the capture and times are from the real reset. Where ter cannot reset
 //! through the port (a probe, a port it does not know) the tool resets the
-//! board and a `Reset` is synthesised when the capture starts.
+//! board and a `Reset` is synthesised when the capture starts. A probe's
+//! serial port can still hold what the program before this one printed, so
+//! ter empties the port before it asks the tool to reset.
 //!
 //! A UF2 board has no flashing tool and, while its bootloader runs, no
 //! serial port: ter copies the program to the bootloader's drive, waits for
@@ -41,6 +43,11 @@ const READ_TIMEOUT: Duration = Duration::from_millis(20);
 /// full-speed device every millisecond. A chunk read at `t` is recorded as
 /// sent somewhere in the slack before it.
 pub const USB_SLACK_US: u64 = 2_000;
+/// How long ter reads and throws away what a port holds before a tool
+/// resets the board: a probe's serial port keeps the last few hundred
+/// bytes the previous program printed and hands them over once the port
+/// is opened.
+pub const STALE_WINDOW: Duration = Duration::from_millis(100);
 /// Longest a flash may take before it counts as failed.
 pub const FLASH_LIMIT: Duration = Duration::from_secs(180);
 /// The UF2 file ter made, in the run folder.
@@ -321,6 +328,20 @@ fn ter_resets(tool: &Tool, kind: PortKind) -> bool {
     matches!(tool, Tool::Espflash { .. }) && kind.resets()
 }
 
+/// Read and drop what `link` holds: everything that comes within `window`,
+/// then whatever is still coming, for at most as long again.
+fn discard_stale(link: &mut dyn Link, window: Duration) -> io::Result<()> {
+    let start = Instant::now();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = link.read(&mut buf)?;
+        let spent = start.elapsed();
+        if spent >= window * 2 || (spent >= window && n == 0) {
+            return Ok(());
+        }
+    }
+}
+
 fn micros(d: Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
@@ -403,8 +424,20 @@ impl Venue for Local {
         } else {
             // The capture starts before the tool resets the board, so
             // nothing the program prints is missed; times run from here.
+            let reset_args = self.tool.reset_args();
+            if reset_args.is_some() {
+                // The program has not started yet, so whatever the port
+                // holds is not its output.
+                discard_stale(link.as_mut(), STALE_WINDOW).map_err(|e| {
+                    self.gone_or(
+                        VenueFailure::Unavailable,
+                        format!("Could not read {}: {e}", self.port.path),
+                        String::new(),
+                    )
+                })?;
+            }
             self.origin = Some(Instant::now());
-            if let Some(args) = self.tool.reset_args() {
+            if let Some(args) = reset_args {
                 let ran = run_tool(&self.program, &args, Duration::from_secs(60)).map_err(|e| {
                     VenueError::unavailable(
                         format!("Could not run {}: {e}", self.program.display()),
@@ -631,6 +664,29 @@ mod tests {
         assert_eq!(*resets.lock().unwrap(), 0, "ter did not reset it");
         assert_eq!(rec.events[0], Event::reset(0), "synthesised");
         assert_eq!(rec.serial_text(), "hi\n");
+    }
+
+    #[test]
+    fn what_the_port_held_before_a_tool_reset_is_not_the_programs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // The port hands over the last program's output when it is opened;
+        // the new program prints after the tool's reset.
+        let (mut v, resets) = venue(
+            &dir,
+            PortKind::Other,
+            vec![(0, b"old\n"), (10, b"old\n"), (200, b"new\n")],
+            None,
+        );
+        v.tool = Tool::ProbeRs {
+            chip: "STM32F401RETx".into(),
+        };
+        v.reset().unwrap();
+        let rec = v.run(&[], Duration::from_secs(10)).unwrap();
+        assert_eq!(*resets.lock().unwrap(), 0, "the tool reset it");
+        assert_eq!(rec.events[0], Event::reset(0), "synthesised");
+        assert_eq!(rec.serial_text(), "new\n");
+        assert_eq!(std::fs::read(dir.join(SERIAL_LOG)).unwrap(), b"new\n");
     }
 
     #[test]
