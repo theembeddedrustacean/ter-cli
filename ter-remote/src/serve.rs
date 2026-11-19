@@ -51,9 +51,10 @@ pub struct PageFile {
 pub struct RunRequest {
     pub exercise_id: String,
     pub files: Vec<PageFile>,
-    /// `simulation` when the page does not say: the editor is the
-    /// simulation path.
-    pub mode: String,
+    /// `simulation` or `hardware`. `None` when the page does not say: the
+    /// service then runs a simulation where the exercise has one (the
+    /// editor is the simulation path), else on the board.
+    pub mode: Option<String>,
     /// Where a hardware run goes: `local` (this machine's board) or
     /// `bench` (a shared bench this account connected to). `None` is the
     /// exercise's own venue, as before the field existed.
@@ -189,14 +190,14 @@ impl RunRequest {
         }
         let mode = match obj.get("mode") {
             // A venue is a place to run hardware.
-            None | Some(Value::Null) if venue.is_some() => "hardware".to_string(),
-            None | Some(Value::Null) => "simulation".to_string(),
+            None | Some(Value::Null) if venue.is_some() => Some("hardware".to_string()),
+            None | Some(Value::Null) => None,
             Some(Value::String(m)) if m == "simulation" && venue.is_some() => {
                 return Err(ServeError::bad_request(
                     "venue goes with mode \"hardware\": a simulation runs in Wokwi.",
                 ));
             }
-            Some(Value::String(m)) if m == "simulation" || m == "hardware" => m.clone(),
+            Some(Value::String(m)) if m == "simulation" || m == "hardware" => Some(m.clone()),
             Some(other) => {
                 return Err(ServeError::bad_request(format!(
                     "mode must be \"simulation\" or \"hardware\", not {other}."
@@ -624,13 +625,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_request_reaches_the_service_with_simulation_by_default() {
+    async fn the_request_reaches_the_service_with_no_mode_when_the_page_gives_none() {
         let (app, fake) = app(Ok(json!({})));
         let (status, _, _) = send(&app, req("POST", "/run", Some(SITE), BODY)).await;
         assert_eq!(status, StatusCode::OK);
         let asked = fake.asked.lock().unwrap();
         assert_eq!(asked[0].exercise_id, "gpio-blinky--xiao-esp32c3-nostd");
-        assert_eq!(asked[0].mode, "simulation");
+        assert_eq!(asked[0].mode, None);
         assert_eq!(asked[0].user, None);
         assert_eq!(asked[0].files[0].path, "src/bin/main.rs");
     }
@@ -675,7 +676,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.exercise_id, "a");
-        assert_eq!(ok.mode, "hardware");
+        assert_eq!(ok.mode.as_deref(), Some("hardware"));
         assert_eq!(ok.user.as_deref(), Some("me@example.com"));
         assert!(ok.files.is_empty());
         let blank_user = RunRequest::parse(br#"{"exercise_id": "a", "user": ""}"#).unwrap();
@@ -691,7 +692,7 @@ mod tests {
 
         let r = parse(r#"{"exercise_id": "a", "mode": "hardware", "venue": "bench"}"#).unwrap();
         assert_eq!(
-            (r.mode.as_str(), r.venue.as_deref(), r.bench),
+            (r.mode.as_deref().unwrap(), r.venue.as_deref(), r.bench),
             ("hardware", Some("bench"), None)
         );
         let r = parse(
@@ -703,16 +704,17 @@ mod tests {
         assert_eq!(r.venue.as_deref(), Some("local"));
         // A venue or a bench alone means hardware; a bench alone, the bench.
         let r = parse(r#"{"exercise_id": "a", "venue": "local"}"#).unwrap();
-        assert_eq!(r.mode, "hardware");
+        assert_eq!(r.mode.as_deref(), Some("hardware"));
         let r = parse(r#"{"exercise_id": "a", "bench": "b-1"}"#).unwrap();
         assert_eq!(
-            (r.mode.as_str(), r.venue.as_deref()),
+            (r.mode.as_deref().unwrap(), r.venue.as_deref()),
             ("hardware", Some("bench"))
         );
         let r = parse(r#"{"exercise_id": "a", "venue": null, "bench": ""}"#).unwrap();
         assert_eq!(
-            (r.mode.as_str(), r.venue, r.bench),
-            ("simulation", None, None)
+            (r.mode, r.venue, r.bench),
+            (None, None, None),
+            "no mode named: the service picks the exercise's"
         );
 
         assert!(bad(r#"{"exercise_id": "a", "venue": "wokwi"}"#).contains("venue must be"));

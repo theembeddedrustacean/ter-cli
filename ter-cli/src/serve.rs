@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use ter_check::CheckFile;
 use ter_remote::serve::{RunFuture, RunRequest, ServeError, Service, editable};
+use ter_sdk::project::TerToml;
 
 use crate::config::Config;
 use crate::exercises;
@@ -107,12 +108,8 @@ async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFa
     };
     let not_written = write_files(&dir, &request)?;
     let venue = request.venue.clone();
-    let limit = limit(&dir, &request.mode, venue.as_deref());
-    let mode: &'static str = if request.mode == "hardware" {
-        "hardware"
-    } else {
-        "simulation"
-    };
+    let mode = mode_for(&dir, request.mode.as_deref());
+    let limit = limit(&dir, mode, venue.as_deref());
     let on = match (&venue, &request.bench) {
         (Some(v), Some(b)) => format!(", {v} {b}"),
         (Some(v), None) => format!(", {v}"),
@@ -235,6 +232,25 @@ fn bench_queue() -> Duration {
 /// The most a run may take: the build, then the venue's own budget for
 /// the check's `timeout_ms`. A bench run also has its queue and the trip
 /// to the owner's machine.
+/// The mode of a page's run. A page that names none gets a simulation
+/// where the exercise has one (the editor's Run button is the simulation
+/// path), and a run on the board where the board is all it allows.
+fn mode_for(dir: &Path, asked: Option<&str>) -> &'static str {
+    match asked {
+        Some("hardware") => "hardware",
+        Some(_) => "simulation",
+        None => match TerToml::load(dir) {
+            Ok(ter)
+                if !crate::sim::offered(dir, &ter.modes)
+                    && ter.modes.iter().any(|m| m == "hardware") =>
+            {
+                "hardware"
+            }
+            _ => "simulation",
+        },
+    }
+}
+
 fn limit(dir: &Path, mode: &str, venue: Option<&str>) -> Duration {
     let timeout_ms = std::fs::read_to_string(dir.join(CHECK_YAML))
         .ok()
@@ -371,7 +387,7 @@ mod tests {
                     content: c.to_string(),
                 })
                 .collect(),
-            mode: "simulation".into(),
+            mode: Some("simulation".into()),
             venue: None,
             bench: None,
             user: None,
@@ -415,6 +431,42 @@ mod tests {
         let err = write_files(dir.path(), &request(&[("src/main.rs", "x")])).unwrap_err();
         assert_eq!(err.code, "bad_request");
         assert!(!outside.path().join("main.rs").exists());
+    }
+
+    #[test]
+    fn a_page_that_names_no_mode_gets_the_run_the_exercise_has() {
+        let exercise = |modes: &str, circuit: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("ter.toml"),
+                format!(
+                    "exercise = \"e\"\ncourse = \"c\"\ntarget = \"t\"\nmodes = [{modes}]\n\
+                     mode = \"hardware\"\nfetched_sha256 = \"\"\n"
+                ),
+            )
+            .unwrap();
+            if circuit {
+                std::fs::write(dir.path().join("diagram.json"), "{}").unwrap();
+            }
+            dir
+        };
+        // The editor's Run button: a simulation wherever there is one,
+        // whichever mode the exercise lists first.
+        let both = exercise("\"hardware\", \"simulation\"", true);
+        assert_eq!(mode_for(both.path(), None), "simulation");
+        let sim = exercise("\"simulation\"", true);
+        assert_eq!(mode_for(sim.path(), None), "simulation");
+        // The board is all the exercise allows, or all it can run on.
+        let hw = exercise("\"hardware\"", false);
+        assert_eq!(mode_for(hw.path(), None), "hardware");
+        let no_circuit = exercise("\"hardware\", \"simulation\"", false);
+        assert_eq!(mode_for(no_circuit.path(), None), "hardware");
+        // What the page names is what runs.
+        assert_eq!(mode_for(hw.path(), Some("simulation")), "simulation");
+        assert_eq!(mode_for(both.path(), Some("hardware")), "hardware");
+        // Not an exercise folder: the run itself says so.
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(mode_for(bare.path(), None), "simulation");
     }
 
     #[test]

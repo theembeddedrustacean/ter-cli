@@ -2226,6 +2226,29 @@ async fn serve_runs_the_fetched_folder_when_the_page_sends_no_files() {
     assert_eq!(posted(&server, "run").await.len(), 3);
 }
 
+/// A page that names no mode and no venue, for an exercise that only
+/// runs on a board: it runs on this machine's board, not in a simulation
+/// the exercise does not allow.
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_runs_a_hardware_only_exercise_on_the_board_when_the_page_names_no_mode() {
+    let server = site("0.1.0", run_answer()).await;
+    let mut m = Machine::with_exercise(GOOD, &["hardware"]);
+    m = m.on_board(BANNER_AND_BLINK, 0, "");
+    let board = Board::start(flashed(&m), &["Hello world!\r\n"], false);
+    m.port = Some(board.port.clone());
+    let served = m.serve(&server.uri());
+
+    let (status, _, v) = served.run(json!({"exercise_id": EXERCISE})).await;
+    board.thread.join().unwrap();
+
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["mode"], "hardware", "{v}");
+    assert_eq!(v["venue"], "local", "{v}");
+    let run = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(run["mode"], "hardware", "{run}");
+}
+
 #[tokio::test]
 async fn health_lists_the_venues_a_page_can_ask_for() {
     let server = site("0.1.0", run_answer()).await;
