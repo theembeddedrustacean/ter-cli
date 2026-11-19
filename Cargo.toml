@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -20,11 +20,11 @@ repository = "https://github.com/theembeddedrustacean/ter-cli"
 homepage = "https://github.com/theembeddedrustacean/ter-cli"
 
 [workspace.dependencies]
-ter-sdk = { path = "ter-sdk", version = "0.1.3" }
-ter-check = { path = "ter-check", version = "0.1.3" }
-ter-telemetry = { path = "ter-telemetry", version = "0.1.3" }
-ter-flash = { path = "ter-flash", version = "0.1.3" }
-ter-gen = { path = "ter-gen", version = "0.1.3" }
+ter-sdk = { path = "ter-sdk", version = "0.1.4" }
+ter-check = { path = "ter-check", version = "0.1.4" }
+ter-telemetry = { path = "ter-telemetry", version = "0.1.4" }
+ter-flash = { path = "ter-flash", version = "0.1.4" }
+ter-gen = { path = "ter-gen", version = "0.1.4" }
 base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
 directories = "6"
