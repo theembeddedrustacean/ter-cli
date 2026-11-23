@@ -29,16 +29,21 @@ ter hint                        stuck? get the next hint
 account; a free account works. `ter install wokwi-cli` asks for a CI
 token, which you create at <https://wokwi.com/dashboard/ci>.
 
+An exercise that comes with a sim86 board can also run on sim86:
+`ter run --sim sim86`. `ter install sim86` sets it up; it needs Python 3.9
+or newer and your own sim86 account. `ter ex show` lists the simulators
+that can run an exercise.
+
 ## Commands
 
 ```
 ter login | logout | whoami      pairing and account
 ter ex list | fetch | show | clean | remove
-ter run [--hw | --sim | --no-check]
+ter run [--hw | --sim [sim86] | --no-check]
 ter status                       your exercises and their last runs
 ter hint [--llm]                 a hint from the course, or from your own model
 ter llm setup                    choose that model and store your key
-ter install <tool>               the toolchain, flashing tools and the simulator
+ter install <tool>               the toolchain, flashing tools and the simulators
 ter new --board <board>          a new project for a board
 ter serve                        lets the lesson page's Run button use this machine
 ter serve --share | ter connect  share an ESP32-C3 as a bench, or use one

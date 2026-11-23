@@ -1992,3 +1992,179 @@ fn bench_doctor_finds_a_fetched_exercise_ready_on_the_board_and_in_wokwi() {
         assert_eq!(doctor_check(&v, id)["status"], "ok", "{id}: {v}");
     }
 }
+
+/// The learner's own sim86 key and a folder with sim86 boards and built
+/// programs to run on them (`TER_SIM86_PILOT`: `boards/uferris-c3.json`,
+/// `boards/nucleo-d13.json`, their `.pins.json`, and `elf/` with the
+/// gpio-blinky and stm32-gpio-button-toggle solutions). The sim86 test
+/// skips without both.
+fn sim86_ready() -> Option<std::path::PathBuf> {
+    let has_key = std::env::var("SIM86_API_KEY").is_ok_and(|k| !k.is_empty());
+    match (has_key, std::env::var("TER_SIM86_PILOT")) {
+        (true, Ok(pilot)) if !pilot.is_empty() => Some(pilot.into()),
+        _ => {
+            eprintln!("skipped: set SIM86_API_KEY and TER_SIM86_PILOT");
+            None
+        }
+    }
+}
+
+/// `ter install sim86` into a tools folder of the test's own, then the
+/// venue itself on sim86: the heartbeat on the XIAO ESP32-C3 board passes
+/// its two pin checks from a recording that holds the first edge, and a
+/// press planned at 1000 ms turns the Nucleo's LED on at 1000 ms. With
+/// `TER_SIM86_PWM_ELF` (an ESP32-C3 program that toggles the LED 4000
+/// times 500 us apart, then 20000 times 50 us apart), every one of those
+/// 24000 edges is in the recording. Every run is stopped by the helper.
+#[test]
+#[ignore = "live sim86"]
+fn live_sim86_records_from_the_first_edge_and_judges_the_pilot_boards() {
+    use ter_telemetry::sim86::{self, Helper, Image, Sim86};
+    use ter_telemetry::{Capture, EventKind, Level, Venue};
+
+    let Some(pilot) = sim86_ready() else {
+        return;
+    };
+    let tools = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["install", "sim86", "--json"])
+        .env("TER_TOOLS_DIR", tools.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["tools"][0]["key"], "accepted", "{v}");
+    assert!(v["tools"][0]["credits"].as_i64().unwrap() > 0, "{v}");
+    let home = tools.path().join("sim86");
+    let helper = Helper {
+        python: home.join("venv/bin/python"),
+        script: home.join(sim86::HELPER_FILE),
+        key: None,
+    };
+    let espflash = ter_flash::find_program("espflash").expect("espflash makes the ESP image");
+
+    let venue = |board: &str, watch: &[&str], press: &[&str], image: Image, timeout_ms: u64| {
+        let board_file = pilot.join("boards").join(format!("{board}.json"));
+        let read = |p: std::path::PathBuf| std::fs::read_to_string(&p).unwrap();
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let plan = sim86::plan(
+            &read(board_file.clone()),
+            &read(pilot.join("boards").join(format!("{board}.pins.json"))),
+            &names(watch),
+            &names(press),
+        )
+        .unwrap();
+        Sim86 {
+            helper: helper.clone(),
+            board: board_file,
+            run_dir: tempfile::tempdir().unwrap().keep(),
+            plan,
+            image,
+            timeout_ms,
+            capture: Capture::default(),
+            program: None,
+        }
+    };
+    let record = |venue: &mut Sim86, elf: &std::path::Path, check: &str| {
+        let file = ter_check::CheckFile::parse(check).unwrap();
+        venue.prepare(elf).unwrap();
+        let rec = venue
+            .run(&file.stimuli(), Sim86::budget(file.timeout_ms))
+            .unwrap_or_else(|e| panic!("{}\n{}", e.message, e.output));
+        let verdicts = ter_check::evaluate(&file, &rec);
+        (rec, verdicts)
+    };
+    let esp = || Image::EspMerged {
+        espflash: espflash.clone(),
+        chip: "esp32c3".into(),
+    };
+    let edges = |rec: &ter_telemetry::Recording| -> Vec<(u64, Level)> {
+        rec.events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::PinEdge { level, .. } => Some((e.t_us, *level)),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // The heartbeat: four toggles a second, flashes 100 ms wide.
+    let heartbeat = "timeout_ms: 5500\nassert:\n  - id: heartbeat-rate\n    pin: user_led\n    toggles_per_s: { min: 3.6, max: 4.4 }\n    window_ms: [900, 4900]\n  - id: flash-width\n    pin: user_led\n    pulse_width_ms: { min: 80, max: 120 }\n    window_ms: [900, 4900]\n";
+    let mut xiao = venue("uferris-c3", &["user_led"], &[], esp(), 5500);
+    let (rec, verdicts) = record(
+        &mut xiao,
+        &pilot.join("elf/solution--gpio-blinky--xiao-esp32c3-nostd--debug.elf"),
+        heartbeat,
+    );
+    assert!(
+        verdicts
+            .iter()
+            .all(|v| v.status == ter_check::CheckStatus::Pass),
+        "{verdicts:?}"
+    );
+    let seen = edges(&rec);
+    assert_eq!(seen[0], (0, Level::Low), "the level at reset");
+    // The program's first flash, well inside what a run paused late loses.
+    assert!(
+        seen[1].1 == Level::High && seen[1].0 < 500_000,
+        "the first edge is in the recording: {:?}",
+        &seen[..3]
+    );
+    assert!(
+        !xiao.run_dir.join(sim86::FIRMWARE).exists(),
+        "the flash image is not kept"
+    );
+    eprintln!("xiao heartbeat: {verdicts:?}");
+
+    // A press at 1000 ms, held 200 ms, on the Nucleo's own button.
+    let toggle = "timeout_ms: 3000\nsetup:\n  - press: user_button\n    at_ms: 1000\n    hold_ms: 200\nassert:\n  - id: led-off\n    pin: user_led\n    is: low\n    between_ms: [0, 900]\n  - id: led-on\n    pin: user_led\n    is: high\n    after_ms: 1100\n";
+    let mut nucleo = venue(
+        "nucleo-d13",
+        &["user_led"],
+        &["user_button"],
+        Image::Elf,
+        3000,
+    );
+    let (rec, verdicts) = record(
+        &mut nucleo,
+        &pilot.join("elf/solution--stm32-gpio-button-toggle--nucleo-f401re-nostd--debug.elf"),
+        toggle,
+    );
+    assert!(
+        verdicts
+            .iter()
+            .all(|v| v.status == ter_check::CheckStatus::Pass),
+        "{verdicts:?}"
+    );
+    let seen = edges(&rec);
+    assert!(
+        seen.iter()
+            .any(|(t, level)| *level == Level::High && (1_000_000..1_010_000).contains(t)),
+        "the LED answers the press at 1000 ms: {seen:?}"
+    );
+    eprintln!("nucleo button toggle: {verdicts:?}");
+
+    // A PWM-rate signal: every edge, though one read of the net gives a
+    // summary past about a thousand.
+    let Ok(pwm) = std::env::var("TER_SIM86_PWM_ELF") else {
+        eprintln!("PWM part skipped: set TER_SIM86_PWM_ELF");
+        return;
+    };
+    let rate = "timeout_ms: 3600\nassert:\n  - id: slow\n    pin: user_led\n    toggles_per_s: { min: 1900, max: 2100 }\n    window_ms: [500, 1500]\n  - id: fast\n    pin: user_led\n    toggles_per_s: { min: 17000, max: 21000 }\n    window_ms: [2400, 2900]\n  - id: every-edge\n    pin: user_led\n    edge_count: { min: 24000, max: 24000 }\n    window_ms: [0, 3600]\n";
+    let mut xiao = venue("uferris-c3", &["user_led"], &[], esp(), 3600);
+    let (rec, verdicts) = record(&mut xiao, std::path::Path::new(&pwm), rate);
+    assert!(
+        verdicts
+            .iter()
+            .all(|v| v.status == ter_check::CheckStatus::Pass),
+        "{verdicts:?}"
+    );
+    let seen = edges(&rec);
+    assert_eq!(seen.len(), 24_001, "the level at reset and 24000 edges");
+    assert!(
+        seen.windows(2)
+            .all(|w| w[0].0 <= w[1].0 && w[0].1 != w[1].1),
+        "in time order, each a change"
+    );
+    eprintln!("pwm: {verdicts:?}");
+}

@@ -6,7 +6,10 @@
 #   scripts/check.sh --live          also the tests against the live site
 #                                    (needs TER_TOKEN for a test account;
 #                                    TER_CURRICULUM=<checkout> adds the
-#                                    --dev and solution build checks)
+#                                    --dev and solution build checks;
+#                                    SIM86_API_KEY and TER_SIM86_PILOT=<a
+#                                    folder of sim86 boards and built
+#                                    programs> add the sim86 run)
 #   scripts/check.sh --install-hook  install the git pre-commit hook
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
