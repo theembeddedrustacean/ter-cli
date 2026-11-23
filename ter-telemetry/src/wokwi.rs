@@ -751,19 +751,19 @@ fn last_lines(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join(" ")
 }
 
-enum Ended {
+pub(crate) enum Ended {
     Exited(i32),
     Killed,
 }
 
-struct Output {
-    status: Ended,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct Output {
+    pub(crate) status: Ended,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 /// Run `cmd`, stopping it after `budget` of wall time.
-fn run_with_budget(cmd: &mut Command, budget: Duration) -> std::io::Result<Output> {
+pub(crate) fn run_with_budget(cmd: &mut Command, budget: Duration) -> std::io::Result<Output> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

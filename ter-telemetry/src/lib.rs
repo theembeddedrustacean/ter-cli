@@ -11,6 +11,7 @@
 pub mod event;
 pub mod local;
 pub mod recording;
+pub mod sim86;
 pub mod vcd;
 pub mod venue;
 pub mod wokwi;
