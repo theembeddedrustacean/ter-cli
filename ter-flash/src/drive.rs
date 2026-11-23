@@ -197,6 +197,16 @@ pub fn unmounted() -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// How to mount the UF2 bootloader at `disk`: the desktop's way, and the
+/// one that works where that is refused (over ssh on a machine with no
+/// desktop, where nothing can ask for the password).
+pub fn how_to_mount(disk: &Path) -> String {
+    format!(
+        "`udisksctl mount -b {0}`; where that is refused (over ssh, with no desktop), `sudo mount -o uid=$(id -u),gid=$(id -g) {0} <dir>`, then `sudo umount <dir>` once the board has restarted",
+        disk.display()
+    )
+}
+
 /// Of `/dev/disk/by-id` names, the UF2 bootloaders' disks: the first
 /// partition where the disk has one (RPI-RP2), else the disk (Adafruit's
 /// bootloaders show a bare FAT volume).

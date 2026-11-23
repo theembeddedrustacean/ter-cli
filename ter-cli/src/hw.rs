@@ -251,8 +251,9 @@ fn no_drive(family: &Family, wrong: &[Drive], unmounted: &[PathBuf]) -> String {
 
 fn mount_it(disk: &Path) -> String {
     format!(
-        "A UF2 bootloader is on USB at {0} but not mounted: mount it (for example `udisksctl mount -b {0}`).",
-        disk.display()
+        "A UF2 bootloader is on USB at {} but not mounted. Mount it: {}.",
+        disk.display(),
+        ter_flash::drive::how_to_mount(disk)
     )
 }
 
@@ -382,7 +383,15 @@ mod tests {
             m.contains("/media/omar/RPI-RP2 is Raspberry Pi RP2 (RPI-RP2), another board"),
             "{m}"
         );
-        assert!(m.contains("`udisksctl mount -b /dev/sdc`"), "{m}");
+        assert!(
+            m.ends_with(
+                " A UF2 bootloader is on USB at /dev/sdc but not mounted. Mount it: \
+                 `udisksctl mount -b /dev/sdc`; where that is refused (over ssh, with no \
+                 desktop), `sudo mount -o uid=$(id -u),gid=$(id -g) /dev/sdc <dir>`, then \
+                 `sudo umount <dir>` once the board has restarted."
+            ),
+            "{m}"
+        );
         let err = fits(rp.clone(), &ter_flash::uf2::NRF52840).unwrap_err();
         assert!(err.message.contains("is an RP2040's"), "{}", err.message);
         assert_eq!(fits(rp.clone(), &ter_flash::uf2::RP2040).unwrap(), rp);

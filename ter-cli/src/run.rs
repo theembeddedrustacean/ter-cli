@@ -431,6 +431,17 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     })
 }
 
+/// `text` as a sentence: a venue's message ends without a full stop, or
+/// with whatever a tool said last.
+fn sentence(text: &str) -> String {
+    let text = text.trim_end();
+    if text.ends_with(['.', '!', '?']) {
+        text.to_string()
+    } else {
+        format!("{text}.")
+    }
+}
+
 /// The error `ter run` exits with after posting, if the run did not pass.
 fn failure(outcome: &Outcome, log_path: &Path, recording: &Path) -> Option<CliError> {
     match outcome {
@@ -445,7 +456,7 @@ fn failure(outcome: &Outcome, log_path: &Path, recording: &Path) -> Option<CliEr
             failure.code(),
             format!(
                 "{} The run was posted as not run; it does not count against you. Details in {}.",
-                output.lines().next().unwrap_or("The venue failed."),
+                sentence(output.lines().next().unwrap_or("The venue failed")),
                 recording.display()
             ),
         )),
@@ -649,6 +660,32 @@ pub fn exercise_dir(dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_the_venue_said_ends_before_the_run_is_called_not_run() {
+        let said = |output: &str| {
+            failure(
+                &Outcome::Infra {
+                    failure: Infra::VenueUnavailable,
+                    output: output.into(),
+                },
+                Path::new("build.log"),
+                Path::new("runs/3"),
+            )
+            .unwrap()
+            .message
+        };
+        assert_eq!(
+            said("this program may not set one up\nthe tool's output"),
+            "this program may not set one up. The run was posted as not run; \
+             it does not count against you. Details in runs/3."
+        );
+        assert!(
+            said("Is it a RP2040's drive?\n").starts_with("Is it a RP2040's drive? The run"),
+            "a question keeps its mark"
+        );
+        assert!(said("").starts_with("The venue failed. The run"));
+    }
 
     #[test]
     fn a_pass_on_a_board_that_did_not_complete_the_lesson_points_at_sim() {

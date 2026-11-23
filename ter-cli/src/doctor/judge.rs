@@ -640,7 +640,7 @@ fn boards(facts: &Facts, needs: &Needs) -> Check {
                 "{} is a UF2 bootloader that is not mounted",
                 disk.display()
             ))
-            .fix(format!("udisksctl mount -b {}", disk.display())),
+            .fix(ter_flash::drive::how_to_mount(disk)),
             None => missing(format!("no {} board in its UF2 bootloader", family.name))
                 .fix("Plug the board in with a data cable and put it in its bootloader."),
         };
@@ -1509,9 +1509,12 @@ mod tests {
         );
 
         facts.survey.unmounted = vec!["/dev/sda1".into()];
-        assert_eq!(
-            get(&judge(&facts), "usb.boards").fix.as_deref(),
-            Some("udisksctl mount -b /dev/sda1")
+        let fix = get(&judge(&facts), "usb.boards").fix.clone().unwrap();
+        assert!(fix.starts_with("`udisksctl mount -b /dev/sda1`; "), "{fix}");
+        assert!(
+            fix.contains("`sudo mount -o uid=$(id -u),gid=$(id -g) /dev/sda1 <dir>`"),
+            "{fix}"
         );
+        assert!(fix.contains("`sudo umount <dir>`"), "{fix}");
     }
 }

@@ -1,6 +1,8 @@
 //! `ter venues`: where this machine can run exercises, and what each place
 //! can see. Needs no account.
 
+use std::path::Path;
+
 use serde_json::{Value, json};
 use ter_flash::{PortKind, Tool};
 use ter_telemetry::local::Local;
@@ -137,7 +139,7 @@ pub fn run(json: bool) -> Result<(), CliError> {
         );
     }
     for disk in &unmounted {
-        println!("  {disk}  UF2 bootloader, not mounted (`udisksctl mount -b {disk}`)");
+        println!("{}", unmounted_line(disk));
     }
     if let Some(p) = &port_env {
         println!("  {PORT_ENV}={p}");
@@ -169,4 +171,28 @@ pub fn run(json: bool) -> Result<(), CliError> {
     println!();
     println!("instruments: none");
     Ok(())
+}
+
+/// A UF2 bootloader ter cannot use yet, and how to mount it.
+fn unmounted_line(disk: &str) -> String {
+    format!(
+        "  {disk}  UF2 bootloader, not mounted\n      mount it: {}",
+        ter_flash::drive::how_to_mount(Path::new(disk))
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unmounted_bootloader_comes_with_both_ways_to_mount_it() {
+        assert_eq!(
+            unmounted_line("/dev/sdb1"),
+            "  /dev/sdb1  UF2 bootloader, not mounted\n      mount it: \
+             `udisksctl mount -b /dev/sdb1`; where that is refused (over ssh, with no \
+             desktop), `sudo mount -o uid=$(id -u),gid=$(id -g) /dev/sdb1 <dir>`, then \
+             `sudo umount <dir>` once the board has restarted"
+        );
+    }
 }
