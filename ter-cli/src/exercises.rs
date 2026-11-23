@@ -6,6 +6,7 @@ use serde::Serialize;
 use ter_sdk::exercise::default_modes;
 use ter_sdk::project::{self, Fetched, Freed, Layout, Scaffold};
 use ter_sdk::{Exercise, dev};
+use ter_telemetry::sim86;
 
 use crate::config::Config;
 use crate::output::{CliError, print_json};
@@ -404,6 +405,8 @@ struct ShowOut {
     /// The modes a run can pass it in: `hardware`, `simulation`, both or
     /// neither.
     passes_in: Vec<&'static str>,
+    /// The simulators that can run it: `wokwi`, `sim86`, both or neither.
+    sim_venues: Vec<&'static str>,
     summary: String,
 }
 
@@ -491,6 +494,20 @@ fn describe(shown: Shown) -> Result<ShowOut, CliError> {
             .iter()
             .any(|f| f.path == ter_telemetry::wokwi::RUN_DIAGRAM),
     };
+    // A sim86 run needs the exercise's sim86 board and pin map.
+    let sim86_files = match &shown {
+        Shown::Folder { dir, .. } => {
+            let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+            read(sim86::BOARD_FILE).zip(read(sim86::PINS_FILE))
+        }
+        Shown::Site { exercise, .. } => {
+            let read = |name: &str| {
+                let file = exercise.files.iter().find(|f| f.path == name)?;
+                Some(String::from_utf8_lossy(&file.bytes().ok()?).into_owned())
+            };
+            read(sim86::BOARD_FILE).zip(read(sim86::PINS_FILE))
+        }
+    };
     let (mut out, text) = match shown {
         Shown::Folder { dir, ter, check } => {
             let (check_yaml, text) = check.unzip();
@@ -507,6 +524,7 @@ fn describe(shown: Shown) -> Result<ShowOut, CliError> {
                     has_check: false,
                     checks: vec![],
                     passes_in: vec![],
+                    sim_venues: vec![],
                     summary: String::new(),
                 },
                 text,
@@ -525,6 +543,7 @@ fn describe(shown: Shown) -> Result<ShowOut, CliError> {
                 has_check: false,
                 checks: vec![],
                 passes_in: vec![],
+                sim_venues: vec![],
                 summary: String::new(),
             },
             check,
@@ -532,7 +551,6 @@ fn describe(shown: Shown) -> Result<ShowOut, CliError> {
     };
     let hardware = out.modes.iter().any(|m| m == "hardware");
     let sim_mode = out.modes.iter().any(|m| m == "simulation");
-    let simulation = sim_mode && circuit;
     let Some(text) = text else {
         out.summary = "No check: nothing to pass.".into();
         return Ok(out);
@@ -543,6 +561,18 @@ fn describe(shown: Shown) -> Result<ShowOut, CliError> {
         .unwrap_or_else(|| PathBuf::from(crate::run::CHECK_YAML));
     let file =
         ter_check::CheckFile::parse(&text).map_err(|e| crate::telemetry::bad_check(&where_, e))?;
+    // sim86 runs it when its board shows every check: each watched pin on
+    // a wired net, each pressed one on a button.
+    let on_sim86 = sim86_files
+        .as_ref()
+        .map(|(board, pins)| crate::sim86::wiring(board, pins, &file).map_err(|e| e.to_string()));
+    if sim_mode && circuit {
+        out.sim_venues.push("wokwi");
+    }
+    if sim_mode && matches!(on_sim86, Some(Ok(_))) {
+        out.sim_venues.push("sim86");
+    }
+    let simulation = !out.sim_venues.is_empty();
     out.has_check = true;
     out.checks = file
         .checks
@@ -579,11 +609,27 @@ fn describe(shown: Shown) -> Result<ShowOut, CliError> {
                           complete on the lesson page once the rest pass."
             .into(),
     };
-    if sim_mode && !circuit {
+    if sim_mode && !simulation {
         out.summary.push_str(&format!(
             " Its modes allow simulation, but it has no Wokwi circuit ({}), so `ter run --sim` can't run it.",
             ter_telemetry::wokwi::RUN_DIAGRAM
         ));
+    }
+    match (sim_mode, &on_sim86) {
+        (true, Some(Ok(_))) if circuit => {
+            out.summary
+                .push_str(" sim86 runs it too: `ter run --sim sim86`.");
+        }
+        (true, Some(Ok(_))) => {
+            out.summary
+                .push_str(" The simulator is sim86 (`ter install sim86` sets it up).");
+        }
+        (true, Some(Err(why))) => {
+            out.summary.push_str(&format!(
+                " sim86 does not run it: its sim86 board cannot show these checks ({why})."
+            ));
+        }
+        _ => {}
     }
     Ok(out)
 }
@@ -617,6 +663,9 @@ fn print_show(out: &ShowOut) {
     }
     println!("  target  {}", out.target);
     println!("  modes   {}", out.modes.join(", "));
+    if out.sim_venues.contains(&"sim86") {
+        println!("  sims    {}", out.sim_venues.join(", "));
+    }
     if out.has_check {
         match &out.check_yaml {
             Some(path) => println!(

@@ -2,8 +2,9 @@
 //! that fixes each thing.
 //!
 //! It only looks. It never builds, flashes, opens a serial port, talks to
-//! a chip, spends Wokwi minutes or changes the machine; the site is asked
-//! one `ping` (none with `--offline`). In an exercise or project folder it
+//! a chip, spends Wokwi minutes or sim86 credits, or changes the machine;
+//! the site is asked one `ping`, and sim86, where it is installed, for the
+//! account's plan and credits (neither with `--offline`). In an exercise or project folder it
 //! judges for that folder's run; elsewhere only what every run needs can
 //! fail.
 

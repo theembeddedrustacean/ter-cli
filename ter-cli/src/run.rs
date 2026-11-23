@@ -12,6 +12,7 @@ use ter_check::{CheckFile, CheckStatus, CheckVerdict, REPORT_FILE};
 use ter_sdk::project::{Layout, TerToml, new_recording};
 use ter_sdk::run::{LastRun, RunAnswer, RunRecord};
 use ter_telemetry::local::Local;
+use ter_telemetry::sim86::Sim86;
 use ter_telemetry::wokwi::Wokwi;
 use ter_telemetry::{Capture, Venue, rfc3339_utc};
 
@@ -21,7 +22,7 @@ use crate::output::{CliError, print_json};
 use crate::record::{Infra, Outcome, RunContext, assemble, file_sha256};
 use crate::session::Session;
 use crate::telemetry::{RUN_CHECK, bad_check, check_recording};
-use crate::{hw, remote, sim};
+use crate::{hw, remote, sim, sim86};
 use ter_flash::Tool;
 
 pub const CHECK_YAML: &str = "check.yaml";
@@ -62,6 +63,7 @@ enum Plan {
     /// No check.yaml: build only, whatever the mode.
     NoCheck,
     Wokwi(Box<Checked<sim::Ready>>),
+    Sim86(Box<Checked<sim86::Ready>>),
     Local(Box<Checked<hw::Ready>>),
     /// Someone's shared bench; settled once the account is known.
     Bench(Box<Checked<Tool>>),
@@ -74,10 +76,14 @@ struct Checked<R> {
     ready: R,
 }
 
-/// The default venue of each mode, and the ones this ter can run.
-pub fn venue_for(mode: &str, asked: Option<&str>) -> Result<&'static str, CliError> {
+/// The simulators `ter run --sim` can name.
+pub const SIM_VENUES: [&str; 2] = ["wokwi", "sim86"];
+
+/// The default venue of each mode for the exercise in `dir`, and the ones
+/// this ter can run.
+pub fn venue_for(mode: &str, asked: Option<&str>, dir: &Path) -> Result<&'static str, CliError> {
     let (default, known): (&str, &[&'static str]) = match mode {
-        "simulation" => ("wokwi", &["wokwi"]),
+        "simulation" => (sim::default_venue(dir), &SIM_VENUES),
         _ => ("local", &["local", "bench"]),
     };
     let wanted = asked.unwrap_or(default);
@@ -124,7 +130,7 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
             ),
         ));
     }
-    let venue = venue_for(&mode, args.venue.as_deref().or(ter.venue.as_deref()))?;
+    let venue = venue_for(&mode, args.venue.as_deref().or(ter.venue.as_deref()), &dir)?;
     // What ter points at as the run that completes the exercise.
     let sim_allowed = sim::offered(&dir, &ter.modes);
 
@@ -147,6 +153,9 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         } else if venue == "local" {
             let ready = hw::ready(&dir, !json)?;
             Plan::Local(Box::new(Checked { file, text, ready }))
+        } else if venue == "sim86" {
+            let ready = sim86::ready(&dir, sim86::plan(&dir, &ter, &file)?)?;
+            Plan::Sim86(Box::new(Checked { file, text, ready }))
         } else {
             let ready = sim::ready(sim::plan(&dir, &ter, &file)?)?;
             Plan::Wokwi(Box::new(Checked { file, text, ready }))
@@ -190,6 +199,7 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
             Plan::BuildOnly => "build only".to_string(),
             Plan::NoCheck => "build only, no check.yaml".to_string(),
             Plan::Wokwi(_) => "then Wokwi".to_string(),
+            Plan::Sim86(_) => "then sim86".to_string(),
             Plan::Local(hw) => match &hw.ready.drive {
                 Some(d) => format!("then the board through its UF2 drive {}", d.path.display()),
                 None => format!("then the board on {}", hw.ready.port.path),
@@ -234,10 +244,36 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         },
         (Plan::BuildOnly, _) => Outcome::Built,
         (Plan::NoCheck, _) => Outcome::NoCheck,
-        (Plan::Wokwi(_) | Plan::Local(_) | Plan::Bench(_), None) => Outcome::Infra {
-            failure: Infra::VenueUnavailable,
-            output: "cargo built no program to run".into(),
-        },
+        (Plan::Wokwi(_) | Plan::Sim86(_) | Plan::Local(_) | Plan::Bench(_), None) => {
+            Outcome::Infra {
+                failure: Infra::VenueUnavailable,
+                output: "cargo built no program to run".into(),
+            }
+        }
+        (Plan::Sim86(sim), Some(elf)) => {
+            let Checked { file, text, ready } = sim.as_ref();
+            if !json {
+                eprintln!(
+                    "Running {} ms on sim86 (sending the program and starting the board takes a few seconds more)",
+                    file.timeout_ms
+                );
+            }
+            let t = Instant::now();
+            let mut venue = Sim86 {
+                helper: ready.helper.clone(),
+                board: ready.board.clone(),
+                run_dir: recording.to_path_buf(),
+                plan: ready.plan.clone(),
+                image: ready.image.clone(),
+                timeout_ms: file.timeout_ms,
+                capture: capture(&ter, client.cli_version(), &elf_sha256),
+                program: None,
+            };
+            let budget = Sim86::budget(file.timeout_ms);
+            let outcome = record_and_judge(&mut venue, file, text, elf, budget, &recording)?;
+            ran_in = Some((t.elapsed(), "on sim86"));
+            outcome
+        }
         (Plan::Wokwi(sim), Some(elf)) => {
             let Checked { file, text, ready } = sim.as_ref();
             if !json {
@@ -314,8 +350,11 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
         RunContext {
             ter: &ter,
             mode: &mode,
-            venue: matches!(plan, Plan::Wokwi(_) | Plan::Local(_) | Plan::Bench(_))
-                .then_some(venue),
+            venue: matches!(
+                plan,
+                Plan::Wokwi(_) | Plan::Sim86(_) | Plan::Local(_) | Plan::Bench(_)
+            )
+            .then_some(venue),
             elf_sha256,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             hints_used: previous.as_ref().map_or(0, |p| p.hints.used),
@@ -364,6 +403,15 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
 /// the simulated time.
 pub fn wokwi_budget(timeout_ms: u64) -> Duration {
     Duration::from_secs(120) + Duration::from_millis(timeout_ms * 20)
+}
+
+/// How long a simulation of the exercise in `dir` may take, on the
+/// simulator a run there uses when none is named.
+pub fn sim_budget(dir: &Path, timeout_ms: u64) -> Duration {
+    match sim::default_venue(dir) {
+        "sim86" => Sim86::budget(timeout_ms),
+        _ => wokwi_budget(timeout_ms),
+    }
 }
 
 /// How long a capture on the board may take, once it is flashed.
@@ -767,12 +815,33 @@ mod tests {
 
     #[test]
     fn each_mode_has_its_venue() {
-        assert_eq!(venue_for("simulation", None).unwrap(), "wokwi");
-        assert_eq!(venue_for("hardware", None).unwrap(), "local");
-        assert_eq!(venue_for("simulation", Some("wokwi")).unwrap(), "wokwi");
-        let err = venue_for("simulation", Some("sim86")).unwrap_err();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        assert_eq!(venue_for("simulation", None, dir).unwrap(), "wokwi");
+        assert_eq!(venue_for("hardware", None, dir).unwrap(), "local");
+        assert_eq!(
+            venue_for("simulation", Some("wokwi"), dir).unwrap(),
+            "wokwi"
+        );
+        assert_eq!(
+            venue_for("simulation", Some("sim86"), dir).unwrap(),
+            "sim86"
+        );
+        let err = venue_for("simulation", Some("renode"), dir).unwrap_err();
         assert_eq!(err.code, "venue_unavailable");
-        assert!(err.message.contains("wokwi"), "{}", err.message);
-        assert!(venue_for("hardware", Some("wokwi")).is_err());
+        assert!(err.message.contains("wokwi, sim86"), "{}", err.message);
+        assert!(venue_for("hardware", Some("wokwi"), dir).is_err());
+        assert!(venue_for("hardware", Some("sim86"), dir).is_err());
+
+        // A sim86 board and no Wokwi circuit: sim86 is what `--sim` runs.
+        std::fs::create_dir_all(dir.join("sim86")).unwrap();
+        std::fs::write(dir.join("sim86/board.json"), "{}").unwrap();
+        std::fs::write(dir.join("sim86/pins.json"), "{}").unwrap();
+        assert_eq!(venue_for("simulation", None, dir).unwrap(), "sim86");
+        assert_eq!(sim_budget(dir, 1000), Sim86::budget(1000));
+        // With a Wokwi circuit too, Wokwi stays the default.
+        std::fs::write(dir.join("diagram.json"), "{}").unwrap();
+        assert_eq!(venue_for("simulation", None, dir).unwrap(), "wokwi");
+        assert_eq!(sim_budget(dir, 1000), wokwi_budget(1000));
     }
 }

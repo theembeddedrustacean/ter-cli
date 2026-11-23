@@ -11,7 +11,10 @@ use ter_sdk::project::{self, TerToml};
 use ter_telemetry::local::Local;
 
 use super::Args;
-use super::judge::{Facts, Folder, Kind, NodeAccess, Pins, Root, Site, Targets, ToolFact};
+use super::judge::{
+    Facts, Folder, Kind, NodeAccess, Pins, Root, Sim86, Sim86Account, Sim86Install, Site, Targets,
+    ToolFact,
+};
 use crate::config::Config;
 use crate::output::CliError;
 use crate::session::Session;
@@ -114,12 +117,53 @@ pub async fn gather(args: &Args) -> Result<Facts, CliError> {
         root: root(&config.courses_root),
         courses_root: config.courses_root,
         linux: cfg!(target_os = "linux"),
+        sim86: sim86(args.offline),
         serial: serial_access(&survey, port_env_present),
         probes: probe_access(&survey),
         survey,
         folder,
         pins,
     })
+}
+
+/// The sim86 package in ter's tools folder, and, unless `offline`, what
+/// sim86 says of the account: one call, which spends no credits.
+fn sim86(offline: bool) -> Sim86 {
+    use ter_telemetry::sim86::FailureKind;
+    let command = crate::sim86::home()
+        .map(|home| crate::sim86::command_in(&home))
+        .unwrap_or_default();
+    let Some(helper) = crate::sim86::installed() else {
+        return Sim86 {
+            command,
+            ..Sim86::default()
+        };
+    };
+    let install = match helper.version() {
+        Ok(found) => Sim86Install::Found {
+            version: found.sim86.unwrap_or_default(),
+            python: found.python.unwrap_or_default(),
+        },
+        Err(e) => Sim86Install::Broken(e.explain()),
+    };
+    let account = if offline || !matches!(install, Sim86Install::Found { .. }) {
+        Sim86Account::NotAsked
+    } else {
+        match helper.balance() {
+            Ok(balance) => Sim86Account::Balance {
+                plan: balance.plan,
+                credits: balance.credits,
+            },
+            Err(e) if e.kind == FailureKind::NoKey => Sim86Account::NoKey,
+            Err(e) if e.kind == FailureKind::Auth => Sim86Account::Refused,
+            Err(e) => Sim86Account::Unknown(e.message.lines().next().unwrap_or_default().into()),
+        }
+    };
+    Sim86 {
+        install,
+        account,
+        command,
+    }
 }
 
 /// What `dir` is and what its run needs, without building it.
@@ -167,7 +211,7 @@ fn folder(start: &Path, survey: &Survey) -> Folder {
         return folder;
     }
     folder.mode = Some(ter.mode.clone());
-    let venue = match run::venue_for(&ter.mode, ter.venue.as_deref()) {
+    let venue = match run::venue_for(&ter.mode, ter.venue.as_deref(), &dir) {
         Ok(venue) => venue,
         Err(e) => {
             folder.broken = Some(e.message);
@@ -192,6 +236,13 @@ fn folder(start: &Path, survey: &Survey) -> Folder {
                 if venue == "wokwi" {
                     folder.sim_plan = Some(
                         sim::plan(&dir, &ter, &file)
+                            .map(|_| ())
+                            .map_err(|e| e.message),
+                    );
+                }
+                if venue == "sim86" {
+                    folder.sim_plan = Some(
+                        crate::sim86::plan(&dir, &ter, &file)
                             .map(|_| ())
                             .map_err(|e| e.message),
                     );

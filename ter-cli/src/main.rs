@@ -23,6 +23,7 @@ mod serve;
 mod session;
 mod share;
 mod sim;
+mod sim86;
 mod status;
 mod survey;
 mod telemetry;
@@ -89,13 +90,20 @@ enum Command {
         /// The exercise folder; the one you are in by default.
         dir: Option<PathBuf>,
         /// Run in simulation this time, whatever ter.toml's `mode` says.
-        #[arg(long, conflicts_with = "hw")]
-        sim: bool,
+        /// `--sim sim86` runs it on sim86 instead of Wokwi.
+        #[arg(
+            long,
+            conflicts_with = "hw",
+            num_args = 0..=1,
+            default_missing_value = "",
+            value_name = "SIMULATOR"
+        )]
+        sim: Option<String>,
         /// Run on hardware this time, whatever ter.toml's `mode` says.
         #[arg(long)]
         hw: bool,
-        /// Where to run within the mode: `local` (your board on USB) on
-        /// hardware, `wokwi` in simulation.
+        /// Where to run within the mode: `local` (your board on USB) or
+        /// `bench` on hardware, `wokwi` or `sim86` in simulation.
         #[arg(long)]
         venue: Option<String>,
         /// Build only: post the attempt without running or checking it.
@@ -240,7 +248,8 @@ enum Command {
         /// `targets` (the Rust target of the project in this folder),
         /// `xiao-generate` (for `ter new`), `espflash`, `probe-rs`,
         /// `elf2uf2-rs`, `uf2deploy` (UF2 boards' `cargo run`),
-        /// `wokwi-cli` (with your Wokwi token).
+        /// `wokwi-cli` (with your Wokwi token), `sim86` (the sim86
+        /// simulator, for `ter run --sim sim86`; needs Python).
         #[arg(required = true, value_parser = install::TOOLS)]
         tools: Vec<String>,
         /// The project `targets` reads, instead of the current folder.
@@ -426,7 +435,8 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
             venue,
             no_check,
         } => {
-            let mode = match (sim, hw) {
+            let (dir, venue) = sim_names(sim.as_deref(), dir, venue)?;
+            let mode = match (sim.is_some(), hw) {
                 (true, _) => Some("simulation"),
                 (_, true) => Some("hardware"),
                 _ => None,
@@ -557,6 +567,33 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
             notify_newer_version(&session, json);
             result.map_err(|e| session.forget_dead_token(e))
         }
+    }
+}
+
+/// What the word after `--sim` names: a simulator (`--sim sim86`), or,
+/// as before simulators could be named, the exercise folder.
+fn sim_names(
+    sim: Option<&str>,
+    dir: Option<PathBuf>,
+    venue: Option<String>,
+) -> Result<(Option<PathBuf>, Option<String>), CliError> {
+    match sim {
+        None | Some("") => Ok((dir, venue)),
+        Some(named) if run::SIM_VENUES.contains(&named) => match venue {
+            Some(other) if other != named => Err(CliError::new(
+                "bad_request",
+                format!("--sim {named} and --venue {other} name two venues; give one."),
+            )),
+            _ => Ok((dir, Some(named.to_string()))),
+        },
+        Some(folder) if dir.is_none() => Ok((Some(PathBuf::from(folder)), venue)),
+        Some(other) => Err(CliError::new(
+            "bad_request",
+            format!(
+                "--sim {other}: ter knows the simulators {}.",
+                run::SIM_VENUES.join(" and ")
+            ),
+        )),
     }
 }
 

@@ -79,9 +79,11 @@ impl Machine {
             .env("CARGO_HOME", self.root.path().join("cargo-home"))
             .env("TER_KEYCHAIN", "off")
             .env("TER_CONFIG_DIR", self.config())
+            .env("TER_TOOLS_DIR", self.root.path().join("tools"))
             .env("TER_SITE_URL", &self.site);
         for var in [
             "TER_TOKEN",
+            "SIM86_API_KEY",
             "WOKWI_CLI_TOKEN",
             "TER_PORT",
             "TER_UF2_DRIVE",
@@ -185,7 +187,9 @@ fn without_an_account_the_json_report_and_the_error_both_come_out() {
             "tool.uf2deploy",
             "tool.xiao-generate",
             "tool.wokwi-cli",
+            "tool.sim86",
             "wokwi.token",
+            "sim86.account",
             "courses.root",
             "usb.boards",
             "usb.probes",
@@ -522,4 +526,126 @@ fn venues_still_answers_in_the_same_shape() {
     assert_eq!(wokwi["wokwi_cli"], Value::Null);
     assert_eq!(wokwi["ready"], false);
     assert_no_token(&out);
+}
+
+/// Plays the Python that holds sim86, running ter's helper: the package
+/// is 0.1.4, and the account is what `$FAKE/sim86-balance` says.
+const SIM86_PYTHON: &str = r#"#!/bin/sh
+case "$2" in
+  version) echo '{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.1.4"}' ;;
+  balance) echo asked >> "$FAKE/sim86-asked"; cat "$FAKE/sim86-balance" ;;
+esac
+"#;
+
+#[test]
+fn a_sim86_exercise_is_judged_for_the_package_the_key_and_the_credits() {
+    let m = Machine::new();
+    m.has_target("riscv32imc-unknown-none-elf");
+    m.tool("espflash", "4.6.0");
+    let dir = exercise("simulation");
+    let folder = dir.path();
+    let mut ter = std::fs::read_to_string(folder.join("ter.toml")).unwrap();
+    ter.push_str("venue = \"sim86\"\n");
+    std::fs::write(folder.join("ter.toml"), ter).unwrap();
+    std::fs::write(
+        folder.join("check.yaml"),
+        "timeout_ms: 2000\nassert:\n  - id: blink\n    pin: user_led\n    toggles_per_s: { min: 1, max: 9 }\n    window_ms: [0, 1900]\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(folder.join("sim86")).unwrap();
+    std::fs::write(
+        folder.join("sim86/board.json"),
+        r#"{"parts": [{"id": "mcu", "type": "XiaoESP32C3", "firmware": "fw.bin"}, {"id": "led1", "type": "Led"}],
+            "wires": [["mcu.D1", "led1.+"], ["led1.-", "mcu.GND"]]}"#,
+    )
+    .unwrap();
+    std::fs::write(folder.join("sim86/pins.json"), r#"{"user_led": "mcu.D1"}"#).unwrap();
+
+    // Not installed: `ter install sim86` puts it right.
+    let out = m.doctor(folder, &["--offline", "--json"]);
+    let r = report(&out);
+    assert_eq!(out.status.code(), Some(1), "{r:#}");
+    assert_eq!(r["context"]["venue"], "sim86");
+    assert_eq!(r["install"], json!(["sim86"]));
+    assert_eq!(check(&r, "tool.sim86")["status"], "fail");
+    assert_eq!(check(&r, "tool.sim86")["fix"], "ter install sim86");
+    assert_eq!(check(&r, "tool.wokwi-cli")["status"], "skip");
+
+    // Installed, with a key sim86 accepts.
+    let bin = m.root.path().join("tools/sim86/venv/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("python"), SIM86_PYTHON).unwrap();
+    std::fs::set_permissions(bin.join("python"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let balance = |text: &str| std::fs::write(m.root.path().join("sim86-balance"), text).unwrap();
+    balance(
+        r#"{"helper": 1, "ok": true, "sim86": "0.1.4", "balance": {"credits": 87, "plan": "free"}}"#,
+    );
+    let key = "sk-sim86-never-shown";
+    let doctor = |args: &[&str]| {
+        m.ter(folder, &[&["doctor"], args].concat())
+            .env("TER_TOKEN", TOKEN)
+            .env("SIM86_API_KEY", key)
+            .output()
+            .unwrap()
+    };
+    // Offline, sim86 is not asked.
+    let out = doctor(&["--offline", "--json"]);
+    let r = report(&out);
+    assert_eq!(out.status.code(), Some(0), "{r:#}");
+    assert_eq!(check(&r, "tool.sim86")["found"], "0.1.4, Python 3.12.3");
+    assert_eq!(check(&r, "sim86.account")["found"], "not asked");
+    assert!(!m.root.path().join("sim86-asked").exists());
+    assert_eq!(check(&r, "exercise.venue")["found"], "simulation on sim86");
+
+    // Asked once, sim86 says the plan and the credits. (Nothing answers
+    // as the site here, which is its own line of the report.)
+    let out = doctor(&["--json"]);
+    let r = report(&out);
+    assert_eq!(
+        check(&r, "sim86.account")["found"],
+        "key accepted: plan free, 87 credits"
+    );
+    assert_eq!(check(&r, "sim86.account")["status"], "ok");
+    let asked = std::fs::read_to_string(m.root.path().join("sim86-asked")).unwrap();
+    assert_eq!(asked.lines().count(), 1);
+    for out in [&out.stdout, &out.stderr] {
+        assert!(!text(out).contains(key), "the sim86 key never shows");
+    }
+    let shown = text(&doctor(&[]).stdout);
+    for line in [
+        "  ok    tool.sim86          0.1.4, Python 3.12.3\n",
+        "\nsim86\n  ok    sim86.account       key accepted: plan free, 87 credits\n",
+        "simulation on sim86\n",
+    ] {
+        assert!(shown.contains(line), "no {line:?} in:\n{shown}");
+    }
+
+    // No key, and no credits: each stops this exercise's run.
+    balance(
+        r#"{"helper": 1, "ok": false, "error": {"kind": "no_key", "message": "no API key: run `sim86 login`"}}"#,
+    );
+    let r = report(&doctor(&["--json"]));
+    let account = check(&r, "sim86.account");
+    assert_eq!(
+        (&account["status"], &account["found"]),
+        (&json!("fail"), &json!("no key"))
+    );
+    assert_eq!(
+        account["fix"],
+        format!(
+            "{} login (or set SIM86_API_KEY)",
+            bin.join("sim86").display()
+        )
+    );
+    balance(
+        r#"{"helper": 1, "ok": true, "sim86": "0.1.4", "balance": {"credits": 0, "plan": "free"}}"#,
+    );
+    let r = report(&doctor(&["--json"]));
+    assert_eq!(check(&r, "sim86.account")["status"], "fail");
+    assert_eq!(check(&r, "exercise.venue")["status"], "fail");
+    // sim86 not saying is a warning, and the venue is not stopped by it.
+    balance(r#"{"helper": 1, "ok": false, "error": {"kind": "api", "message": "API error 500"}}"#);
+    let r = report(&doctor(&["--json"]));
+    assert_eq!(check(&r, "sim86.account")["status"], "warn");
+    assert_eq!(check(&r, "sim86.account")["found"], "balance unknown");
 }

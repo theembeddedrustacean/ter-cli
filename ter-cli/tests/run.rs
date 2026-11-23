@@ -97,6 +97,63 @@ echo "Timeout: simulation did not finish in ${timeout}ms" >&2
 exit 42
 "#;
 
+/// Plays the Python that holds the sim86 package, running ter's helper:
+/// `python <helper> version|balance|run <request>`. It answers with the
+/// JSON beside it (`balance.json`, `run.json`: what the real helper
+/// printed, recorded) and keeps what it was given for the test to look at.
+const FAKE_SIM86_PYTHON: &str = r#"#!/bin/sh
+here="$(dirname "$0")"
+[ -f "$1" ] || { echo "no helper at $1" >&2; exit 2; }
+cp "$1" "$here/got-helper.py"
+case "$2" in
+  version) echo '{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.1.4"}' ;;
+  balance) cat "$here/balance.json" ;;
+  run)
+    cp "$3" "$here/got-request.json"
+    echo "$SIM86_TELEMETRY" > "$here/got-telemetry"
+    echo "sim86: waiting" >&2
+    cat "$here/run.json" ;;
+esac
+"#;
+
+/// The pilot's sim86 boards: uFerris with an LED on D1 and a button on D3,
+/// and a Nucleo with an LED on D13.
+const SIM86_UFERRIS: &str = r#"{"name": "ter-uferris-c3-basic",
+ "parts": [{"id": "mcu", "type": "XiaoESP32C3", "firmware": "fw.bin"},
+           {"id": "led1", "type": "Led", "config": {"color": "red"}},
+           {"id": "btn1", "type": "Btn"}],
+ "wires": [["mcu.D1", "led1.+"], ["led1.-", "mcu.GND"], ["btn1.L1", "mcu.D3"], ["btn1.L2", "mcu.GND"]],
+ "limits": {"duration": "30s"}}
+"#;
+const SIM86_UFERRIS_PINS: &str =
+    r#"{"user_led": "mcu.D1", "buzzer": "mcu.D2", "user_button": {"part": "btn1"}}"#;
+const SIM86_NUCLEO: &str = r#"{"name": "ter-nucleo-f401re",
+ "parts": [{"id": "mcu", "type": "NucleoF401RE", "firmware": "fw.elf"},
+           {"id": "probe", "type": "Led", "config": {"color": "green"}}],
+ "wires": [["mcu.D13", "probe.+"], ["probe.-", "mcu.GND"]]}
+"#;
+const SIM86_NUCLEO_PINS: &str =
+    r#"{"user_led": "mcu.D13", "user_button": {"part": "mcu", "input": "button"}}"#;
+const SIM86_BALANCE: &str = r#"{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.1.4", "balance": {"credits": 20184, "plan": "free"}}"#;
+const SIM86_KEY: &str = "sk-sim86-never-shown";
+
+/// gpio-blinky's check, and a line the chip's ROM prints at reset.
+const SIM86_HEARTBEAT_CHECK: &str = "\
+timeout_ms: 5500
+assert:
+  - id: boot
+    serial_contains: \"ESP-ROM:esp32c3\"
+    within_ms: 2000
+  - id: heartbeat-rate
+    pin: user_led
+    toggles_per_s: { min: 3.6, max: 4.4 }
+    window_ms: [900, 4900]
+  - id: flash-width
+    pin: user_led
+    pulse_width_ms: { min: 80, max: 120 }
+    window_ms: [900, 4900]
+";
+
 /// Plays `espflash`: keeps its arguments, fails with the exit code in
 /// `exit-code`, and otherwise says it flashed and leaves `flashed` for the
 /// test's board to start printing.
@@ -169,6 +226,11 @@ struct Machine {
     /// A UF2 bootloader's drive (`TER_UF2_DRIVE`) and the linker that
     /// makes the build an Arm program for it, when set.
     uf2: Option<TempDir>,
+    /// ter's tools folder (`TER_TOOLS_DIR`): empty, or with a stand-in
+    /// for the Python that holds sim86.
+    tools: TempDir,
+    /// Whether sim86 is installed there, and so a key is set.
+    sim86: bool,
 }
 
 impl Machine {
@@ -189,6 +251,8 @@ impl Machine {
             fake_espflash: None,
             port: None,
             uf2: None,
+            tools: tempfile::tempdir().unwrap(),
+            sim86: false,
         };
         let dir = m.exercise();
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -290,6 +354,8 @@ impl Machine {
             .env("TER_CONFIG_DIR", self.config.path())
             .env("TER_TOKEN", "good-token")
             .env_remove("WOKWI_CLI_TOKEN")
+            .env_remove("SIM86_API_KEY")
+            .env("TER_TOOLS_DIR", self.tools.path())
             .env_remove("TER_PORT")
             .env_remove("TER_UF2_DRIVE")
             // A page's bench run waits this long for a busy bench.
@@ -305,6 +371,9 @@ impl Machine {
             let mut dirs = vec![fake.path().to_path_buf()];
             dirs.extend(std::env::split_paths(&path));
             cmd.env("PATH", std::env::join_paths(dirs).unwrap());
+        }
+        if self.sim86 {
+            cmd.env("SIM86_API_KEY", SIM86_KEY);
         }
         if let Some(fake) = &self.fake_wokwi {
             let path = std::env::var_os("PATH").unwrap_or_default();
@@ -346,6 +415,43 @@ impl Machine {
         .unwrap();
         self.fake_wokwi = Some(fake);
         self
+    }
+
+    /// Where the stand-in for sim86's Python and its files are.
+    fn sim86_bin(&self) -> PathBuf {
+        self.tools.path().join("sim86/venv/bin")
+    }
+
+    /// Give the exercise a sim86 board (`board`, `pins`) and `check` as
+    /// its check.yaml, and install a stand-in for sim86 that answers a run
+    /// with `answer`: a file in tests/fixtures/sim86, or the text itself.
+    #[cfg(unix)]
+    fn on_sim86(mut self, check: &str, board: &str, pins: &str, answer: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.exercise();
+        std::fs::write(dir.join("check.yaml"), check).unwrap();
+        std::fs::create_dir_all(dir.join("sim86")).unwrap();
+        std::fs::write(dir.join("sim86/board.json"), board).unwrap();
+        std::fs::write(dir.join("sim86/pins.json"), pins).unwrap();
+
+        let bin = self.sim86_bin();
+        std::fs::create_dir_all(&bin).unwrap();
+        let python = bin.join("python");
+        std::fs::write(&python, FAKE_SIM86_PYTHON).unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(bin.join("balance.json"), SIM86_BALANCE).unwrap();
+        let answer = if answer.ends_with(".json") {
+            sim86_fixture(answer)
+        } else {
+            answer.to_string()
+        };
+        std::fs::write(bin.join("run.json"), answer).unwrap();
+        self.sim86 = true;
+        self
+    }
+
+    fn sim86_saw(&self, file: &str) -> String {
+        std::fs::read_to_string(self.sim86_bin().join(file)).unwrap()
     }
 
     /// Make the exercise one for the board: `check` as its check.yaml, an
@@ -2726,4 +2832,403 @@ assert:
     );
     assert!(posted(&server, "run").await.is_empty());
     assert!(!driver.exercise().join(".runs").exists());
+}
+
+/// What ter's helper printed for a real sim86 run, recorded 2026-11-23.
+fn sim86_fixture(name: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/sim86")
+        .join(name);
+    std::fs::read_to_string(path).unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sim86_run_is_recorded_judged_and_posted() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]).on_sim86(
+        SIM86_HEARTBEAT_CHECK,
+        SIM86_UFERRIS,
+        SIM86_UFERRIS_PINS,
+        "blinky.json",
+    );
+
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+
+    assert!(ok, "{v}");
+    let p = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(p["mode"], "simulation");
+    assert_eq!(p["venue"], "sim86");
+    assert_eq!(p["build_status"], "passed");
+    assert_eq!(p["check_status"], "passed", "{v}");
+    assert_eq!(
+        (&p["checks_seen"], &p["checks_total"]),
+        (&json!(3), &json!(3))
+    );
+    assert_eq!(
+        v["verdicts"][1]["observed"],
+        "4 toggles per second (16 level changes)"
+    );
+    // sim86 times an edge to the nanosecond; ter keeps the microsecond.
+    assert_eq!(
+        v["verdicts"][2]["observed"],
+        "8 pulses, 100.001 to 100.002 ms"
+    );
+
+    // The helper was asked for the LED's net on the exercise's own board,
+    // with the program as built, for the check's time and a little more.
+    let request: Value = serde_json::from_str(&m.sim86_saw("got-request.json")).unwrap();
+    assert_eq!(request["watch"], json!(["mcu.D1"]));
+    assert_eq!(
+        request["board"],
+        json!(m.exercise().join("sim86/board.json"))
+    );
+    let program = request["firmware"]["mcu"].as_str().unwrap();
+    assert!(Path::new(program).is_file(), "{program}");
+    assert_eq!(request["timeout_ms"], 5500);
+    assert_eq!(request["duration_ms"], 5800);
+    assert_eq!(request["scenario"], Value::Null);
+    assert_eq!(m.sim86_saw("got-telemetry").trim(), "0");
+    // The helper beside the package is the one this ter ships.
+    assert_eq!(
+        m.sim86_saw("got-helper.py"),
+        ter_telemetry::sim86::HELPER,
+        "written before the run"
+    );
+
+    let run = m.exercise().join(".runs/1");
+    for f in [
+        "sim86-request.json",
+        "sim86.json",
+        "sim86.err",
+        "events.jsonl",
+        "check.toml",
+        "check.yaml",
+        "build.log",
+    ] {
+        assert!(run.join(f).is_file(), "{f} is in the run folder");
+    }
+    let events = std::fs::read_to_string(run.join("events.jsonl")).unwrap();
+    assert!(events.contains(r#""venue":"sim86""#), "{events}");
+    // The first edge of the run is in the recording: 143.325 ms.
+    assert!(
+        events.contains(r#"{"t_us":143325,"kind":"pin_edge","name":"user_led","level":"high"}"#),
+        "{events}"
+    );
+    // The key is the learner's and stays in the environment.
+    for f in ["sim86-request.json", "sim86.json", "events.jsonl"] {
+        let text = std::fs::read_to_string(run.join(f)).unwrap();
+        assert!(!text.contains(SIM86_KEY), "{f}");
+    }
+    assert!(!v.to_string().contains(SIM86_KEY));
+
+    // Re-checking the recording offline gives check.toml back byte for byte.
+    let o = m.ter_in(
+        "http://127.0.0.1:9",
+        &["telemetry", "check", ".runs/1", "--check", "check.yaml"],
+        &m.exercise(),
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(o.stdout, std::fs::read(run.join("check.toml")).unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sim86_is_the_simulator_of_an_exercise_with_no_wokwi_circuit() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]).on_sim86(
+        SIM86_HEARTBEAT_CHECK,
+        SIM86_UFERRIS,
+        SIM86_UFERRIS_PINS,
+        "blinky.json",
+    );
+    std::fs::remove_file(m.exercise().join("diagram.json")).unwrap();
+
+    let o = m.ter_in(&server.uri(), &["run", "--sim"], &m.exercise());
+
+    let (out, err) = (
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr),
+    );
+    assert!(o.status.success(), "{out}{err}");
+    assert!(err.contains("(simulation, then sim86)"), "{err}");
+    assert!(err.contains("Running 5500 ms on sim86"), "{err}");
+    assert!(out.contains("on sim86 in"), "{out}");
+    assert_eq!(posted(&server, "run").await[0]["payload"]["venue"], "sim86");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_wrong_program_fails_the_right_check_on_sim86() {
+    let server = site("0.1.0", run_answer()).await;
+    // The same run with the LED never driven: no edge on its net.
+    let mut answer: Value = serde_json::from_str(&sim86_fixture("blinky.json")).unwrap();
+    answer["pins"]["mcu.D1"]["edges"] = json!([]);
+    let m = Machine::with_exercise(GOOD, &["simulation"]).on_sim86(
+        SIM86_HEARTBEAT_CHECK,
+        SIM86_UFERRIS,
+        SIM86_UFERRIS_PINS,
+        &answer.to_string(),
+    );
+
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "check_failed", "{v}");
+    let p = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(p["check_status"], "failed");
+    let ff: Value = serde_json::from_str(p["first_failure"].as_str().unwrap()).unwrap();
+    assert_eq!(ff["id"], "heartbeat-rate");
+    assert_eq!(ff["observed"], "0 toggles per second (0 level changes)");
+    assert_eq!(v["verdicts"][0]["status"], "pass", "the boot line is there");
+}
+
+/// A sim86 run whose helper answers `answer`: posted as not run.
+#[cfg(unix)]
+async fn sim86_not_run(answer: &str) -> (Value, Value) {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]).on_sim86(
+        SIM86_HEARTBEAT_CHECK,
+        SIM86_UFERRIS,
+        SIM86_UFERRIS_PINS,
+        answer,
+    );
+
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    let p = posted(&server, "run").await[0]["payload"].clone();
+    assert_eq!(p["venue"], "sim86");
+    assert_eq!(p["check_status"], "not_run", "never failed");
+    assert!(p.get("first_failure").is_none());
+    let tail = p["transcript_tail"].as_str().unwrap();
+    assert_eq!(tail.lines().next(), Some("venue_unavailable"));
+    assert!(!v.to_string().contains(SIM86_KEY) && !tail.contains(SIM86_KEY));
+    assert!(!m.exercise().join(".runs/1/check.toml").exists());
+    (v, p)
+}
+
+#[cfg(unix)]
+fn sim86_error(kind: &str, message: &str) -> String {
+    json!({"helper": 1, "ok": false, "sim86": "0.1.4",
+           "error": {"kind": kind, "message": message}})
+    .to_string()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn every_sim86_failure_is_posted_as_not_run_with_sim86s_words() {
+    for (kind, said, ours) in [
+        (
+            "busy",
+            "No simulator came free in 5 minutes.",
+            "Every sim86 simulator is busy",
+        ),
+        (
+            "credits",
+            "run refused: out of credits",
+            "no credits left for a run",
+        ),
+        (
+            "auth",
+            "API key rejected (invalid or missing API key)",
+            "sim86 refused your key",
+        ),
+        (
+            "image",
+            "fw.bin is not a format this chip runs (esp-merged-bin)",
+            "does not take the program as built",
+        ),
+        (
+            "board",
+            "unknown part type 'Ledd'",
+            "sim86/board.json needs fixing in the curriculum",
+        ),
+        ("version", "API error 426", "ter install sim86"),
+        (
+            "ended",
+            "run r ended (duration) before it answered",
+            "ended before the check's time was up",
+        ),
+        (
+            "incomplete",
+            "mcu.D1: the recording between 0 and 1000 ns is a summary, not every edge",
+            "could not give every edge of a watched pin, so the run is not judged",
+        ),
+    ] {
+        let (v, p) = sim86_not_run(&sim86_error(kind, said)).await;
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains(ours), "{kind}: {msg}");
+        assert!(msg.contains("posted as not run"), "{msg}");
+        let tail = p["transcript_tail"].as_str().unwrap();
+        assert!(tail.contains(said), "sim86's own words kept: {tail}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sim86_run_that_did_not_start_paused_at_zero_is_not_judged() {
+    // The whole recording of a passing run, said to start 742 ms in.
+    let mut answer: Value = serde_json::from_str(&sim86_fixture("blinky.json")).unwrap();
+    answer["started_ns"] = json!(742_000_000u64);
+    let (v, _) = sim86_not_run(&answer.to_string()).await;
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("did not hold the board at its start") && msg.contains("742.000 ms"),
+        "{msg}"
+    );
+    // And a helper that printed nothing it should have.
+    let (v, _) = sim86_not_run("Traceback (most recent call last):").await;
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("helper failed"), "{msg}");
+}
+
+/// `ter run --sim sim86` stopped before the build: nothing built, nothing
+/// posted.
+#[cfg(unix)]
+async fn sim86_refused(m: &Machine, code: &str) -> String {
+    let server = site("0.1.0", run_answer()).await;
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], code, "{v}");
+    assert!(posted(&server, "run").await.is_empty());
+    assert!(!m.exercise().join(".runs").exists());
+    assert!(!v.to_string().contains(SIM86_KEY));
+    v["error"]["message"].as_str().unwrap().to_string()
+}
+
+#[cfg(unix)]
+fn sim86_blinky() -> Machine {
+    Machine::with_exercise(GOOD, &["hardware", "simulation"]).on_sim86(
+        SIM86_HEARTBEAT_CHECK,
+        SIM86_UFERRIS,
+        SIM86_UFERRIS_PINS,
+        "blinky.json",
+    )
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sim86_not_installed_no_key_or_no_credits_stops_before_the_build() {
+    let m = sim86_blinky();
+    std::fs::remove_dir_all(m.tools.path().join("sim86")).unwrap();
+    let msg = sim86_refused(&m, "venue_unavailable").await;
+    assert!(msg.contains("ter install sim86"), "{msg}");
+
+    let balance = |m: &Machine, text: &str| {
+        std::fs::write(m.sim86_bin().join("balance.json"), text).unwrap();
+    };
+    let m = sim86_blinky();
+    balance(
+        &m,
+        &sim86_error(
+            "no_key",
+            "no API key: set SIM86_API_KEY, or run `sim86 login`",
+        ),
+    );
+    let msg = sim86_refused(&m, "venue_unavailable").await;
+    assert!(msg.contains("No sim86 key on this machine"), "{msg}");
+
+    balance(&m, &sim86_error("auth", "API key rejected"));
+    let msg = sim86_refused(&m, "venue_unavailable").await;
+    assert!(msg.contains("sim86 refused your key"), "{msg}");
+
+    balance(
+        &m,
+        &SIM86_BALANCE.replace("\"credits\": 20184", "\"credits\": 0"),
+    );
+    let msg = sim86_refused(&m, "venue_unavailable").await;
+    assert!(msg.contains("no credits left"), "{msg}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_balance_sim86_does_not_give_does_not_stop_the_run() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = sim86_blinky();
+    std::fs::write(
+        m.sim86_bin().join("balance.json"),
+        sim86_error("api", "API error 500"),
+    )
+    .unwrap();
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+    assert!(ok, "{v}");
+    assert_eq!(
+        posted(&server, "run").await[0]["payload"]["check_status"],
+        "passed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_folder_without_a_sim86_board_or_a_pin_without_a_wire_is_not_run_on_sim86() {
+    // No sim86 folder at all.
+    let m = sim86_blinky();
+    std::fs::remove_dir_all(m.exercise().join("sim86")).unwrap();
+    let msg = sim86_refused(&m, "not_observable").await;
+    assert!(msg.contains("has no sim86 board"), "{msg}");
+    assert!(msg.contains("Run it in Wokwi: `ter run --sim`"), "{msg}");
+
+    // The board without its pin map.
+    let m = sim86_blinky();
+    std::fs::remove_file(m.exercise().join("sim86/pins.json")).unwrap();
+    let msg = sim86_refused(&m, "not_observable").await;
+    assert!(msg.contains("has no sim86 board"), "{msg}");
+
+    // A check on the buzzer, which no wire in the board takes anywhere.
+    let check = SIM86_HEARTBEAT_CHECK.replace("pin: user_led\n    pulse", "pin: buzzer\n    pulse");
+    assert_ne!(check, SIM86_HEARTBEAT_CHECK);
+    let m = Machine::with_exercise(GOOD, &["simulation"]).on_sim86(
+        &check,
+        SIM86_UFERRIS,
+        SIM86_UFERRIS_PINS,
+        "blinky.json",
+    );
+    let msg = sim86_refused(&m, "not_observable").await;
+    assert!(
+        msg.contains("buzzer is mcu.D2, which has no wire to another part"),
+        "{msg}"
+    );
+    assert!(!m.sim86_bin().join("got-request.json").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_press_on_sim86_is_planned_before_the_board_starts_and_checked_after() {
+    let server = site("0.1.0", run_answer()).await;
+    let check = "timeout_ms: 3000\nsetup:\n  - press: user_button\n    at_ms: 1000\n    hold_ms: 200\nassert:\n  - id: led-on\n    pin: user_led\n    is: high\n    after_ms: 1100\n";
+    let m = Machine::with_exercise(GOOD, &["simulation"]).on_sim86(
+        check,
+        SIM86_NUCLEO,
+        SIM86_NUCLEO_PINS,
+        "button-toggle.json",
+    );
+
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+
+    assert!(ok, "{v}");
+    assert_eq!(v["verdicts"][0]["status"], "pass", "{v}");
+    let request: Value = serde_json::from_str(&m.sim86_saw("got-request.json")).unwrap();
+    assert_eq!(
+        request["scenario"]["events"],
+        json!([
+            {"at": "1000ms", "env": {"part": "mcu", "input": "button", "value": 1.0}},
+            {"at": "1200ms", "env": {"part": "mcu", "input": "button", "value": 0.0}},
+        ])
+    );
+    assert_eq!(request["watch"], json!(["mcu.D13"]));
+
+    // The same recording without the press among what sim86 applied: the
+    // LED still came on, and the run is not judged.
+    let mut answer: Value = serde_json::from_str(&sim86_fixture("button-toggle.json")).unwrap();
+    answer["applied"] = json!([{"atNs": 0, "event": "reached"}]);
+    std::fs::write(m.sim86_bin().join("run.json"), answer.to_string()).unwrap();
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+    assert!(!ok);
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("did not apply the setup's input"), "{msg}");
+    let runs = posted(&server, "run").await;
+    assert_eq!(runs[1]["payload"]["check_status"], "not_run");
 }

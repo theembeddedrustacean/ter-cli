@@ -6,7 +6,12 @@
 //! `cargo run` uses; `ter run` flashes UF2 boards itself) are installed
 //! with rustup and cargo; `wokwi-cli` is
 //! Wokwi's command line simulator, downloaded, with the learner's own Wokwi
-//! token.
+//! token; `sim86` is the sim86 simulator's Python package, installed with
+//! pip into a Python environment of ter's own, with ter's helper beside it.
+//!
+//! sim86 runs on the learner's own sim86 account too. Its key is the
+//! package's to keep (`sim86 login`), or comes from `SIM86_API_KEY`; ter
+//! stores no copy.
 //!
 //! TER holds no Wokwi account for anyone: each learner creates a CI token
 //! on their own Wokwi account, and ter keeps it like the TER token (the
@@ -23,6 +28,7 @@ use ter_gen::install::{self as plan, Cmd, Item, State, Tool};
 use crate::output::{CliError, print_json};
 use crate::sim::{self, TOKEN_ENV, TOKEN_PAGE, WOKWI_CLI};
 use crate::token_store::TokenStore;
+use ter_telemetry::sim86 as sim86lib;
 
 /// What `ter install` takes, in the order it installs them.
 pub const TOOLS: [&str; 9] = [
@@ -42,6 +48,7 @@ pub const TOOLS: [&str; 9] = [
 enum Report {
     Planned { tool: String, items: Vec<Done> },
     Wokwi(Installed),
+    Sim86(Sim86Installed),
 }
 
 #[derive(Serialize)]
@@ -60,7 +67,7 @@ pub async fn run(
     json: bool,
 ) -> Result<(), CliError> {
     for tool in tools {
-        if matches!(tool.as_str(), "sim86" | "telemetry-firmware") {
+        if tool == "telemetry-firmware" {
             return Err(CliError::new(
                 "not_available",
                 format!("`{tool}` cannot be installed yet: it is not released."),
@@ -101,6 +108,10 @@ pub async fn run(
             "elf2uf2-rs" => Tool::Elf2uf2Rs,
             "uf2deploy" => Tool::Uf2deploy,
             "xiao-generate" => Tool::XiaoGenerate,
+            "sim86" => {
+                reports.push(Report::Sim86(sim86(json)?));
+                continue;
+            }
             _ => {
                 reports.push(Report::Wokwi(wokwi(token_stdin, json).await?));
                 continue;
@@ -201,6 +212,208 @@ fn execute(cmd: &Cmd, dir: &Path, json: bool) -> Result<(), CliError> {
         return Err(fail(format!("`{cmd}` failed ({status}).")));
     }
     Ok(())
+}
+
+/// What `ter install sim86` did and found.
+#[derive(Serialize)]
+struct Sim86Installed {
+    tool: &'static str,
+    /// The folder with the Python environment and ter's helper.
+    path: PathBuf,
+    /// Installed or updated now, rather than already there.
+    installed: bool,
+    /// The sim86 package's version.
+    version: String,
+    python: String,
+    /// `accepted`, `none`, `refused` or `unknown` (sim86 did not answer).
+    key: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credits: Option<i64>,
+}
+
+/// The oldest Python the sim86 package runs on.
+const MIN_PYTHON: (u32, u32) = (3, 9);
+
+/// `Python 3.12.3` as `(3, 12)`.
+fn python_version(said: &str) -> Option<(u32, u32)> {
+    let mut numbers = said.trim().strip_prefix("Python ")?.split('.');
+    Some((numbers.next()?.parse().ok()?, numbers.next()?.parse().ok()?))
+}
+
+/// A Python new enough for sim86, from the PATH.
+fn find_python() -> Result<PathBuf, CliError> {
+    let mut too_old = None;
+    for name in ["python3", "python"] {
+        let Some(path) = plan::find_program(name) else {
+            continue;
+        };
+        let said = Command::new(&path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_default();
+        match python_version(&said) {
+            Some(v) if v >= MIN_PYTHON => return Ok(path),
+            Some(_) => too_old = Some(said.trim().to_string()),
+            None => {}
+        }
+    }
+    let (major, minor) = MIN_PYTHON;
+    Err(CliError::new(
+        "install_failed",
+        match too_old {
+            Some(found) => format!(
+                "sim86 needs Python {major}.{minor} or newer, and this machine has {found}. Install a newer Python, then run `ter install sim86` again."
+            ),
+            None => format!(
+                "sim86 is a Python package and no Python is on the PATH. Install Python {major}.{minor} or newer (python.org, or your system's package manager), then run `ter install sim86` again."
+            ),
+        },
+    ))
+}
+
+/// Whether an installed package version is one [`sim86lib::PACKAGE`] asks
+/// for: at least the tested one, and before the next minor.
+fn package_fits(version: &str) -> bool {
+    plan::at_least(version, sim86lib::TESTED)
+        && version.split('.').take(2).collect::<Vec<_>>()
+            == sim86lib::TESTED.split('.').take(2).collect::<Vec<_>>()
+}
+
+/// Run one step of the install; with `--json` its output goes to stderr.
+fn step(command: &mut Command, what: &str, hint: &str, json: bool) -> Result<(), CliError> {
+    command.stdin(Stdio::null());
+    if json {
+        command.stdout(std::io::stderr());
+    }
+    let done = command.status().is_ok_and(|s| s.success());
+    if done {
+        Ok(())
+    } else {
+        Err(CliError::new(
+            "install_failed",
+            format!("Could not {what}.{hint}"),
+        ))
+    }
+}
+
+/// The Python environment with the sim86 package, ter's helper beside it,
+/// and a look at the learner's sim86 account.
+fn sim86(json: bool) -> Result<Sim86Installed, CliError> {
+    let fail = |m: String| CliError::new("install_failed", m);
+    let home = crate::sim86::home()?;
+    let python = crate::sim86::python_in(&home);
+    let helper = sim86lib::Helper {
+        python: python.clone(),
+        script: home.join(sim86lib::HELPER_FILE),
+        key: None,
+    };
+    let write_helper = || {
+        std::fs::create_dir_all(&home)
+            .and_then(|()| crate::sim86::write_helper(&helper))
+            .map_err(|e| fail(format!("Could not write {}: {e}", helper.script.display())))
+    };
+    let present = python.is_file()
+        && write_helper().is_ok()
+        && helper
+            .version()
+            .is_ok_and(|v| v.sim86.as_deref().is_some_and(package_fits));
+    if !present {
+        let system = find_python()?;
+        if !json {
+            println!("Installing sim86 in {}.", home.display());
+        }
+        std::fs::create_dir_all(&home)
+            .map_err(|e| fail(format!("Could not create {}: {e}", home.display())))?;
+        if !python.is_file() {
+            step(
+                Command::new(&system)
+                    .args(["-m", "venv"])
+                    .arg(home.join("venv")),
+                "create a Python environment for sim86",
+                " On Debian and Ubuntu, Python's venv module is its own package: `sudo apt install python3-venv`.",
+                json,
+            )?;
+        }
+        step(
+            Command::new(&python)
+                .args(["-m", "pip", "install", "--upgrade", "--quiet"])
+                .arg(sim86lib::PACKAGE)
+                .env("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
+            "install the sim86 package with pip",
+            " It is downloaded from PyPI: check the network, then run `ter install sim86` again.",
+            json,
+        )?;
+        write_helper()?;
+    }
+    let found = helper.version().map_err(|e| fail(e.explain()))?;
+    let version = found.sim86.unwrap_or_default();
+    if !package_fits(&version) {
+        return Err(fail(format!(
+            "pip installed sim86 {version}, and ter needs {}.",
+            sim86lib::PACKAGE
+        )));
+    }
+    let asked = sim86lib::Helper {
+        key: crate::sim86::installed().and_then(|h| h.key),
+        ..helper.clone()
+    }
+    .balance();
+    let (key, balance) = match asked {
+        Ok(balance) => ("accepted", Some(balance)),
+        Err(e) if e.kind == sim86lib::FailureKind::NoKey => ("none", None),
+        Err(e) if e.kind == sim86lib::FailureKind::Auth => ("refused", None),
+        Err(_) => ("unknown", None),
+    };
+    if !json {
+        if present {
+            println!(
+                "sim86 {version} is already installed in {}.",
+                home.display()
+            );
+        } else {
+            println!("Installed sim86 {version} in {}.", home.display());
+        }
+        let login = crate::sim86::command_in(&home);
+        match (key, &balance) {
+            (_, Some(b)) => println!(
+                "Your sim86 key is accepted: plan {}, {} credits (one a simulated minute). `ter run --sim sim86` is ready.",
+                b.plan, b.credits
+            ),
+            ("none", _) => println!(
+                "sim86 runs on your own sim86 account, and this machine has no key for it yet. Sign in with `{} login`, or set {}.",
+                login.display(),
+                sim86lib::KEY_ENV
+            ),
+            ("refused", _) => println!(
+                "sim86 refused the key on this machine. Sign in again with `{} login`, or put a new key in {}.",
+                login.display(),
+                sim86lib::KEY_ENV
+            ),
+            _ => {
+                println!("sim86 did not say whether your key is accepted; `ter doctor` asks again.")
+            }
+        }
+    }
+    Ok(Sim86Installed {
+        tool: "sim86",
+        path: home,
+        installed: !present,
+        version,
+        python: found.python.unwrap_or_default(),
+        key,
+        plan: balance.as_ref().map(|b| b.plan.clone()),
+        credits: balance.as_ref().map(|b| b.credits),
+    })
 }
 
 const RELEASES: &str = "https://github.com/wokwi/wokwi-cli/releases/latest/download";
@@ -370,6 +583,25 @@ mod tests {
         assert!(store.load().unwrap().is_none());
         assert_eq!(save(&store, "wok_abc").unwrap(), "file");
         assert_eq!(store.load().unwrap().unwrap().0, "wok_abc");
+    }
+
+    #[test]
+    fn a_python_is_new_enough_from_3_9() {
+        assert_eq!(python_version("Python 3.12.3\n"), Some((3, 12)));
+        assert_eq!(python_version("Python 2.7.18"), Some((2, 7)));
+        assert_eq!(python_version("zsh: command not found"), None);
+        assert!(python_version("Python 3.9.0").unwrap() >= MIN_PYTHON);
+        assert!(python_version("Python 3.8.19").unwrap() < MIN_PYTHON);
+    }
+
+    #[test]
+    fn the_package_must_be_in_the_range_pip_is_asked_for() {
+        assert!(package_fits(sim86lib::TESTED));
+        assert!(package_fits("0.1.9"));
+        assert!(!package_fits("0.1.3"));
+        assert!(!package_fits("0.2.0"));
+        assert!(!package_fits(""));
+        assert!(sim86lib::PACKAGE.contains(sim86lib::TESTED));
     }
 
     #[test]

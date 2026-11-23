@@ -709,6 +709,17 @@ async fn site_with_circuit(
     modes: &[&str],
     circuit: bool,
 ) -> MockServer {
+    site_with_files(id, check, modes, circuit, &[]).await
+}
+
+/// The same, with `extra` files (path, content) in the exercise.
+async fn site_with_files(
+    id: &str,
+    check: Option<&str>,
+    modes: &[&str],
+    circuit: bool,
+    extra: &[(&str, &str)],
+) -> MockServer {
     let site = mock_site().await;
     let mut files = vec![
         json!({"path": "Cargo.toml", "content": "[package]\nname = \"exercise\"\n", "encoding": "utf8"}),
@@ -722,6 +733,9 @@ async fn site_with_circuit(
         files.push(
             json!({"path": "diagram.json", "content": "{\"parts\":[]}\n", "encoding": "utf8"}),
         );
+    }
+    for (path, content) in extra {
+        files.push(json!({"path": path, "content": content, "encoding": "utf8"}));
     }
     let mut ex = exercise(id, Value::Array(files));
     ex["modes"] = json!(modes);
@@ -961,4 +975,83 @@ async fn show_passes_the_sites_refusals_through() {
     assert!(!o.status.success());
     assert!(stderr(&o).starts_with("error[locked]"), "{}", stderr(&o));
     assert!(m.is_empty());
+}
+
+const SIM86_BOARD: &str = r#"{"parts": [{"id": "mcu", "type": "XiaoESP32C3", "firmware": "fw.bin"},
+  {"id": "led1", "type": "Led"}], "wires": [["mcu.D1", "led1.+"], ["led1.-", "mcu.GND"]]}"#;
+
+/// sim86 is listed for an exercise only when its folder has the sim86
+/// board and pin map and the board shows every check.
+#[tokio::test]
+async fn show_lists_sim86_only_for_a_board_that_shows_every_check() {
+    let id = "pins--xiao-esp32c3-nostd";
+    let modes = ["hardware", "simulation"];
+    let wired = [
+        ("sim86/board.json", SIM86_BOARD),
+        ("sim86/pins.json", r#"{"user_led": "mcu.D1"}"#),
+    ];
+
+    // Beside a Wokwi circuit: both simulators, by id and in the folder.
+    let site = site_with_files(id, Some(PIN_CHECK), &modes, true, &wired).await;
+    let m = Machine::new();
+    let (ok, v) = m.json(&site.uri(), &["ex", "show", id]);
+    assert!(ok, "{v}");
+    assert_eq!(v["source"], "site");
+    assert_eq!(v["sim_venues"], json!(["wokwi", "sim86"]));
+    assert_eq!(v["passes_in"], json!(["simulation"]));
+    let o = m.ter(&site.uri(), &["ex", "fetch", id]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let dir = m.exercise_dir("unlisted", id);
+    assert!(dir.join("sim86/board.json").is_file() && dir.join("sim86/pins.json").is_file());
+    let o = m.ter_in("http://127.0.0.1:9", &["ex", "show"], &dir);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{out}\n{}", stderr(&o));
+    assert!(out.contains("  sims    wokwi, sim86\n"), "{out}");
+    assert!(
+        out.ends_with(
+            "Passes only in simulation: `ter run --sim`. A run on a board can't complete it. \
+             sim86 runs it too: `ter run --sim sim86`.\n"
+        ),
+        "{out}"
+    );
+
+    // With no Wokwi circuit, sim86 is the simulator.
+    let site = site_with_files(id, Some(PIN_CHECK), &modes, false, &wired).await;
+    let (_, v) = Machine::new().json(&site.uri(), &["ex", "show", id]);
+    assert_eq!(v["sim_venues"], json!(["sim86"]));
+    assert_eq!(v["passes_in"], json!(["simulation"]));
+    assert_eq!(
+        v["summary"],
+        "Passes only in simulation: `ter run --sim`. A run on a board can't complete it. \
+         The simulator is sim86 (`ter install sim86` sets it up)."
+    );
+
+    // The checked pin has no wire on the sim86 board: not listed, and why.
+    let unwired = [
+        ("sim86/board.json", SIM86_BOARD),
+        ("sim86/pins.json", r#"{"user_led": "mcu.D2"}"#),
+    ];
+    let site = site_with_files(id, Some(PIN_CHECK), &modes, true, &unwired).await;
+    let (_, v) = Machine::new().json(&site.uri(), &["ex", "show", id]);
+    assert_eq!(v["sim_venues"], json!(["wokwi"]));
+    let summary = v["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("sim86 does not run it") && summary.contains("user_led is mcu.D2"),
+        "{summary}"
+    );
+    // And with no Wokwi circuit either, no run passes it.
+    let site = site_with_files(id, Some(PIN_CHECK), &modes, false, &unwired).await;
+    let (_, v) = Machine::new().json(&site.uri(), &["ex", "show", id]);
+    assert_eq!(v["sim_venues"], json!([]));
+    assert_eq!(v["passes_in"], json!([]));
+
+    // One of the two files alone is no sim86 board: nothing is said of it.
+    let half = [("sim86/board.json", SIM86_BOARD)];
+    let site = site_with_files(id, Some(PIN_CHECK), &modes, true, &half).await;
+    let m = Machine::new();
+    let (_, v) = m.json(&site.uri(), &["ex", "show", id]);
+    assert_eq!(v["sim_venues"], json!(["wokwi"]));
+    assert!(!v["summary"].as_str().unwrap().contains("sim86"), "{v}");
+    let o = m.ter(&site.uri(), &["ex", "show", id]);
+    assert!(!stdout(&o).contains("sim86"), "{}", stdout(&o));
 }

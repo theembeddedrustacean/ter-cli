@@ -257,7 +257,7 @@ fn limit(dir: &Path, mode: &str, venue: Option<&str>) -> Duration {
         .and_then(|t| CheckFile::parse(&t).ok())
         .map_or(0, |f| f.timeout_ms);
     let run = if mode != "hardware" {
-        run::wokwi_budget(timeout_ms)
+        run::sim_budget(dir, timeout_ms)
     } else if venue == Some("bench") {
         bench_queue() + BENCH_ALLOWANCE + FLASH_ALLOWANCE + run::board_budget(timeout_ms)
     } else {

@@ -71,6 +71,10 @@ impl Machine {
     }
 
     fn ter(&self, dir: &Path, args: &[&str]) -> Output {
+        self.ter_with(dir, args, &[])
+    }
+
+    fn ter_with(&self, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_ter"))
             .args(["install"])
             .args(args)
@@ -81,10 +85,49 @@ impl Machine {
             .env("CARGO_HOME", self.root.path().join("cargo-home"))
             .env("TER_KEYCHAIN", "off")
             .env("TER_CONFIG_DIR", self.root.path().join("config"))
+            .env("TER_TOOLS_DIR", self.tools())
+            .env_remove("SIM86_API_KEY")
+            .envs(env.iter().copied())
             .output()
             .unwrap()
     }
+
+    /// ter's own tools folder on this machine.
+    fn tools(&self) -> PathBuf {
+        self.root.path().join("tools")
+    }
 }
+
+/// Plays Python, the one on the PATH and, once `-m venv` has copied it,
+/// the one of the environment: `--version`, `-m venv <dir>`, `-m pip
+/// install ...` (after which the sim86 package is "there"), and ter's
+/// helper, which it answers for. Every call is logged.
+const PYTHON: &str = r#"#!/bin/sh
+echo "python $*" >> "$FAKE/log"
+case "$1" in
+  --version) echo "Python ${FAKE_PYTHON_VERSION:-3.12.3}"; exit 0 ;;
+  -m)
+    case "$2" in
+      venv) mkdir -p "$3/bin" && cp "$0" "$3/bin/python" ;;
+      pip) touch "$FAKE/sim86-package" ;;
+    esac
+    exit 0 ;;
+esac
+[ -f "$1" ] || { echo "python: can't open file '$1'" >&2; exit 2; }
+if [ ! -f "$FAKE/sim86-package" ]; then
+  echo '{"helper": 1, "ok": false, "python": "3.12.3", "error": {"kind": "missing", "message": "the sim86 package is not in this Python"}}'
+  exit 0
+fi
+case "$2" in
+  version) echo '{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.1.4"}' ;;
+  balance)
+    if [ -n "$SIM86_API_KEY" ]; then
+      echo '{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.1.4", "balance": {"credits": 87, "plan": "free"}}'
+    else
+      echo '{"helper": 1, "ok": false, "sim86": "0.1.4", "error": {"kind": "no_key", "message": "no API key: set SIM86_API_KEY, or run `sim86 login`"}}'
+    fi ;;
+esac
+"#;
 
 fn project(config: &str, toolchain: Option<&str>) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -228,14 +271,106 @@ fn a_failing_install_stops_with_install_failed() {
 fn unreleased_tools_are_refused() {
     let m = Machine::new();
     let dir = c3();
-    for tool in ["sim86", "telemetry-firmware"] {
-        let out = m.ter(dir.path(), &[tool]);
-        assert!(!out.status.success());
-        assert!(
-            text(&out.stderr).contains("error[not_available]"),
-            "{}",
-            text(&out.stderr)
-        );
-    }
+    let out = m.ter(dir.path(), &["telemetry-firmware"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("error[not_available]"),
+        "{}",
+        text(&out.stderr)
+    );
     assert!(m.log().is_empty());
+}
+
+#[test]
+fn sim86_goes_into_ters_own_python_environment_with_the_helper_beside_it() {
+    let m = Machine::new();
+    m.program("python3", PYTHON);
+    let dir = tempfile::tempdir().unwrap();
+    let home = m.tools().join("sim86");
+
+    let first = m.ter(dir.path(), &["sim86"]);
+    assert!(first.status.success(), "{}", text(&first.stderr));
+    let venv = home.join("venv");
+    assert_eq!(
+        m.log()
+            .lines()
+            .filter(|l| l.contains(" -m "))
+            .collect::<Vec<_>>(),
+        [
+            format!("python -m venv {}", venv.display()),
+            "python -m pip install --upgrade --quiet sim86>=0.1.4,<0.2".to_string(),
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("ter_sim86.py")).unwrap(),
+        ter_telemetry::sim86::HELPER
+    );
+    let out = text(&first.stdout);
+    assert!(
+        out.contains(&format!("Installed sim86 0.1.4 in {}.", home.display())),
+        "{out}"
+    );
+    // No key yet: the install is done, and the next step is named.
+    assert!(
+        out.contains(&format!(
+            "Sign in with `{} login`, or set SIM86_API_KEY.",
+            venv.join("bin/sim86").display()
+        )),
+        "{out}"
+    );
+
+    // Again, with a key: nothing is installed, and the account is shown.
+    let before = m.log();
+    let key = "sk-sim86-never-shown";
+    let again = m.ter_with(dir.path(), &["sim86", "--json"], &[("SIM86_API_KEY", key)]);
+    assert!(again.status.success(), "{}", text(&again.stderr));
+    assert!(!m.log()[before.len()..].contains(" -m "), "{}", m.log());
+    let v: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(
+        v["tools"][0],
+        serde_json::json!({
+            "tool": "sim86",
+            "path": home,
+            "installed": false,
+            "version": "0.1.4",
+            "python": "3.12.3",
+            "key": "accepted",
+            "plan": "free",
+            "credits": 87,
+        })
+    );
+    assert!(!text(&again.stdout).contains(key) && !text(&again.stderr).contains(key));
+    let said = m.ter_with(dir.path(), &["sim86"], &[("SIM86_API_KEY", key)]);
+    assert!(
+        text(&said.stdout).contains(
+            "Your sim86 key is accepted: plan free, 87 credits (one a simulated minute). `ter run --sim sim86` is ready."
+        ),
+        "{}",
+        text(&said.stdout)
+    );
+
+    // A helper someone changed is put back.
+    std::fs::write(home.join("ter_sim86.py"), "print('edited')\n").unwrap();
+    assert!(m.ter(dir.path(), &["sim86"]).status.success());
+    assert_eq!(
+        std::fs::read_to_string(home.join("ter_sim86.py")).unwrap(),
+        ter_telemetry::sim86::HELPER
+    );
+}
+
+#[test]
+fn sim86_needs_a_python_from_3_9() {
+    let m = Machine::new();
+    m.program("python3", PYTHON);
+    m.program("python", PYTHON);
+    let dir = tempfile::tempdir().unwrap();
+    let out = m.ter_with(dir.path(), &["sim86"], &[("FAKE_PYTHON_VERSION", "3.8.19")]);
+    assert!(!out.status.success());
+    let err = text(&out.stderr);
+    assert!(err.contains("error[install_failed]"), "{err}");
+    assert!(
+        err.contains("sim86 needs Python 3.9 or newer, and this machine has Python 3.8.19"),
+        "{err}"
+    );
+    assert!(!m.tools().join("sim86/venv").exists());
 }

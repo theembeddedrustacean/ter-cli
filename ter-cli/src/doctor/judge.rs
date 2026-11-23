@@ -7,6 +7,7 @@ use serde::Serialize;
 use ter_flash::{PortKind, Tool};
 use ter_gen::install::{Item, NOT_INSTALLED, State, at_least, same_version};
 use ter_sdk::version::{check_supported, newer_available};
+use ter_telemetry::sim86::{KEY_ENV, TESTED};
 
 use crate::hw::{PORT_ENV, graded_only};
 use crate::sim::TOKEN_PAGE;
@@ -192,6 +193,43 @@ pub struct NodeAccess {
     pub listed: bool,
 }
 
+/// The sim86 package in ter's tools folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Sim86Install {
+    #[default]
+    None,
+    /// The environment is there and does not answer.
+    Broken(String),
+    Found {
+        version: String,
+        python: String,
+    },
+}
+
+/// What sim86 said about the learner's account.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Sim86Account {
+    /// `--offline`, or sim86 is not installed.
+    #[default]
+    NotAsked,
+    Balance {
+        plan: String,
+        credits: i64,
+    },
+    NoKey,
+    Refused,
+    /// sim86 did not say; a run is not stopped for it.
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Sim86 {
+    pub install: Sim86Install,
+    pub account: Sim86Account,
+    /// The `sim86` command of ter's install, for `sim86 login`.
+    pub command: PathBuf,
+}
+
 /// Everything doctor found.
 #[derive(Debug, Clone)]
 pub struct Facts {
@@ -207,6 +245,7 @@ pub struct Facts {
     pub targets: Targets,
     pub tools: Vec<ToolFact>,
     pub survey: Survey,
+    pub sim86: Sim86,
     /// `TER_PORT` names a port that is there.
     pub port_env_present: bool,
     pub courses_root: PathBuf,
@@ -227,6 +266,7 @@ struct Needs<'a> {
     /// The program that has to be installed for it.
     program: Option<&'a str>,
     wokwi: bool,
+    sim86: bool,
 }
 
 fn needs(folder: &Folder) -> Needs<'_> {
@@ -236,6 +276,7 @@ fn needs(folder: &Folder) -> Needs<'_> {
         board_required: false,
         program: None,
         wokwi: false,
+        sim86: false,
     };
     if folder.broken.is_some() {
         return none;
@@ -245,6 +286,14 @@ fn needs(folder: &Folder) -> Needs<'_> {
             board: tool,
             board_required: true,
             program: tool.filter(|t| t.external()).map(Tool::program),
+            ..none
+        },
+        // sim86 runs an ESP chip's flash image, which espflash makes.
+        (Kind::Exercise, Some("simulation"), Some("sim86")) => Needs {
+            sim86: true,
+            program: tool
+                .filter(|t| matches!(t, Tool::Espflash { .. }))
+                .map(Tool::program),
             ..none
         },
         (Kind::Exercise, Some("simulation"), _) => Needs {
@@ -283,11 +332,19 @@ pub fn judge(facts: &Facts) -> Report {
         checks.push(check);
     }
 
-    let wokwi = wokwi(&facts.survey, needs.wokwi);
-    if wokwi.iter().any(|c| c.status == Status::Fail) {
+    // Each simulator's tool sits with the tools, its account after them.
+    let [wokwi_cli, wokwi_token] = wokwi(&facts.survey, needs.wokwi);
+    let [sim86_tool, sim86_account] = sim86(&facts.sim86, needs.sim86);
+    if [&wokwi_cli, &wokwi_token]
+        .iter()
+        .any(|c| c.status == Status::Fail)
+    {
         install.push("wokwi-cli");
     }
-    checks.extend(wokwi);
+    if sim86_tool.status == Status::Fail {
+        install.push("sim86");
+    }
+    checks.extend([wokwi_cli, sim86_tool, wokwi_token, sim86_account]);
 
     checks.push(courses_root(facts));
     checks.push(boards(facts, &needs));
@@ -579,6 +636,70 @@ fn wokwi(survey: &Survey, needed: bool) -> [Check; 2] {
     [cli, token]
 }
 
+/// `tool.sim86` and `sim86.account`: the package in ter's tools folder,
+/// and what sim86 says of the learner's key, plan and credits.
+fn sim86(facts: &Sim86, needed: bool) -> [Check; 2] {
+    let not_needed = "not needed here; `ter install sim86` sets it up";
+    let tool = match (&facts.install, needed) {
+        (Sim86Install::Found { version, python }, _) => {
+            let check = Check::ok("tool.sim86", format!("{version}, Python {python}"));
+            if version == TESTED {
+                check
+            } else {
+                check.why(format!("this ter was tested with sim86 {TESTED}"))
+            }
+        }
+        (Sim86Install::Broken(why), true) => Check::fail("tool.sim86", "installed, not working")
+            .why(why.as_str())
+            .fix("ter install sim86"),
+        (Sim86Install::Broken(why), false) => Check::warn("tool.sim86", "installed, not working")
+            .why(why.as_str())
+            .fix("ter install sim86"),
+        (Sim86Install::None, true) => {
+            Check::fail("tool.sim86", NOT_INSTALLED).fix("ter install sim86")
+        }
+        (Sim86Install::None, false) => Check::skip("tool.sim86", NOT_INSTALLED).why(not_needed),
+    };
+    const ID: &str = "sim86.account";
+    let sign_in = format!("{} login (or set {KEY_ENV})", facts.command.display());
+    // A problem with the account stops a sim86 run, and is a warning
+    // anywhere else.
+    let problem = |found: &str| {
+        if needed {
+            Check::fail(ID, found)
+        } else {
+            Check::warn(ID, found)
+        }
+    };
+    let account = match (&facts.install, &facts.account) {
+        (Sim86Install::Found { .. }, Sim86Account::Balance { plan, credits }) if *credits > 0 => {
+            Check::ok(ID, format!("key accepted: plan {plan}, {credits} credits"))
+        }
+        (Sim86Install::Found { .. }, Sim86Account::Balance { plan, credits }) => {
+            problem(&format!("key accepted: plan {plan}, {credits} credits"))
+                .why("a run needs credits: one for each simulated minute")
+                .fix("add credits on your sim86 account")
+        }
+        (Sim86Install::Found { .. }, Sim86Account::NoKey) => problem("no key")
+            .why("sim86 runs on your own sim86 account")
+            .fix(sign_in),
+        (Sim86Install::Found { .. }, Sim86Account::Refused) => problem("key refused")
+            .why("sim86 does not accept the key on this machine: it is wrong or revoked")
+            .fix(sign_in),
+        (Sim86Install::Found { .. }, Sim86Account::Unknown(why)) => {
+            Check::warn(ID, "balance unknown").why(format!(
+                "sim86 did not say ({why}); a run is not stopped for it"
+            ))
+        }
+        (Sim86Install::Found { .. }, Sim86Account::NotAsked) => {
+            Check::skip(ID, "not asked").why("--offline")
+        }
+        (_, _) if needed => Check::skip(ID, "not looked at").why("sim86 is not working here"),
+        (_, _) => Check::skip(ID, "not looked at").why(not_needed),
+    };
+    [tool, account]
+}
+
 fn courses_root(facts: &Facts) -> Check {
     const ID: &str = "courses.root";
     let path = facts.courses_root.display().to_string();
@@ -795,6 +916,7 @@ fn venue(folder: &Folder, checks: &[Check]) -> Check {
     let tool = folder.tool.as_ref().and_then(|t| t.as_ref().ok());
     let found = match (venue, tool) {
         ("wokwi", _) => "simulation in Wokwi".to_string(),
+        ("sim86", _) => "simulation on sim86".to_string(),
         ("bench", _) => "hardware on a shared bench".to_string(),
         (_, Some(tool)) if tool.external() => {
             format!("hardware on your board, flashed with {}", tool.program())
@@ -809,7 +931,7 @@ fn venue(folder: &Folder, checks: &[Check]) -> Check {
         .map(|c| c.id)
         .collect();
     let own_failure = match (venue, &folder.tool, &folder.sim_plan) {
-        ("local", Some(Err(why)), _) | ("wokwi", _, Some(Err(why))) => Some(why.as_str()),
+        ("local", Some(Err(why)), _) | ("wokwi" | "sim86", _, Some(Err(why))) => Some(why.as_str()),
         _ => None,
     };
     if let Some(why) = own_failure {
@@ -903,6 +1025,7 @@ mod tests {
             .map(absent)
             .collect(),
             survey: Survey::default(),
+            sim86: Sim86::default(),
             port_env_present: false,
             courses_root: "/home/l/ter-courses".into(),
             root: Root::WillCreate,
@@ -986,7 +1109,9 @@ mod tests {
                 "tool.uf2deploy",
                 "tool.xiao-generate",
                 "tool.wokwi-cli",
+                "tool.sim86",
                 "wokwi.token",
+                "sim86.account",
                 "courses.root",
                 "usb.boards",
                 "usb.probes",
@@ -998,7 +1123,126 @@ mod tests {
         assert_eq!(get(&report, "linux.probe-usb").group, "linux");
         assert_eq!(get(&report, "tool.wokwi-cli").group, "tools");
         assert_eq!(get(&report, "wokwi.token").group, "wokwi");
+        assert_eq!(get(&report, "tool.sim86").group, "tools");
+        assert_eq!(get(&report, "sim86.account").group, "sim86");
         assert_eq!(get(&report, "courses.root").group, "disk");
+    }
+
+    fn sim86_found(account: Sim86Account) -> Sim86 {
+        Sim86 {
+            install: Sim86Install::Found {
+                version: TESTED.into(),
+                python: "3.12.3".into(),
+            },
+            account,
+            command: "/t/sim86/venv/bin/sim86".into(),
+        }
+    }
+
+    #[test]
+    fn a_sim86_exercise_needs_the_package_a_key_and_credits() {
+        let mut facts = bare();
+        facts.folder = exercise("simulation", "sim86", c3());
+        facts.tools[0] = present("espflash", "4.6.0");
+        // Nothing installed: the package is the problem, the account is
+        // not looked at, and Wokwi is not needed.
+        let report = judge(&facts);
+        assert_eq!(failed(&report), ["tool.sim86", "exercise.venue"]);
+        assert_eq!(report.install, ["sim86"]);
+        assert_eq!(get(&report, "sim86.account").status, Status::Skip);
+        assert_eq!(get(&report, "tool.wokwi-cli").status, Status::Skip);
+
+        let balance = |credits| Sim86Account::Balance {
+            plan: "free".into(),
+            credits,
+        };
+        facts.sim86 = sim86_found(balance(20184));
+        let report = judge(&facts);
+        assert!(report.ok, "{:?}", failed(&report));
+        assert_eq!(get(&report, "tool.sim86").found, "0.1.4, Python 3.12.3");
+        assert_eq!(
+            get(&report, "sim86.account").found,
+            "key accepted: plan free, 20184 credits"
+        );
+        assert_eq!(get(&report, "exercise.venue").found, "simulation on sim86");
+
+        // No key, a refused key and no credits each stop the run.
+        for (account, found) in [
+            (Sim86Account::NoKey, "no key"),
+            (Sim86Account::Refused, "key refused"),
+            (balance(0), "key accepted: plan free, 0 credits"),
+        ] {
+            facts.sim86 = sim86_found(account);
+            let report = judge(&facts);
+            assert_eq!(failed(&report), ["sim86.account", "exercise.venue"]);
+            assert_eq!(get(&report, "sim86.account").found, found);
+            assert!(get(&report, "sim86.account").fix.is_some());
+        }
+        facts.sim86 = sim86_found(Sim86Account::NoKey);
+        assert_eq!(
+            get(&judge(&facts), "sim86.account").fix.as_deref(),
+            Some("/t/sim86/venv/bin/sim86 login (or set SIM86_API_KEY)")
+        );
+
+        // sim86 not saying the balance is a warning: the run goes ahead.
+        facts.sim86 = sim86_found(Sim86Account::Unknown("API error 500".into()));
+        let report = judge(&facts);
+        assert!(report.ok, "{:?}", failed(&report));
+        assert_eq!(get(&report, "sim86.account").status, Status::Warn);
+        assert_eq!(get(&report, "sim86.account").found, "balance unknown");
+
+        // An ESP program goes to sim86 as a flash image espflash makes.
+        facts.sim86 = sim86_found(balance(5));
+        facts.tools[0] = absent("espflash");
+        let report = judge(&facts);
+        assert_eq!(failed(&report), ["tool.espflash", "exercise.venue"]);
+
+        // A board that cannot show the checks stops the run.
+        facts.tools[0] = present("espflash", "4.6.0");
+        facts.folder.sim_plan = Some(Err("sim86 cannot run these checks as written.".into()));
+        assert_eq!(
+            get(&judge(&facts), "exercise.venue").why.as_deref(),
+            Some("sim86 cannot run these checks as written.")
+        );
+    }
+
+    #[test]
+    fn sim86_outside_a_sim86_exercise_is_never_a_problem() {
+        let mut facts = bare();
+        let report = judge(&facts);
+        assert_eq!(get(&report, "tool.sim86").status, Status::Skip);
+        assert_eq!(get(&report, "sim86.account").status, Status::Skip);
+
+        // Installed with no key: a warning, with the way to sign in.
+        facts.sim86 = sim86_found(Sim86Account::NoKey);
+        let report = judge(&facts);
+        assert!(report.ok);
+        assert_eq!(get(&report, "sim86.account").status, Status::Warn);
+        // Offline, sim86 is not asked.
+        facts.sim86 = sim86_found(Sim86Account::NotAsked);
+        let account = get(&judge(&facts), "sim86.account").clone();
+        assert_eq!(
+            (account.status, account.found.as_str()),
+            (Status::Skip, "not asked")
+        );
+        // An environment that does not answer.
+        facts.sim86.install = Sim86Install::Broken("the sim86 package is not there".into());
+        let report = judge(&facts);
+        assert!(report.ok);
+        assert_eq!(get(&report, "tool.sim86").status, Status::Warn);
+        assert_eq!(
+            get(&report, "tool.sim86").fix.as_deref(),
+            Some("ter install sim86")
+        );
+        // A package newer than the tested one says so and is fine.
+        facts.sim86 = sim86_found(Sim86Account::NotAsked);
+        facts.sim86.install = Sim86Install::Found {
+            version: "0.1.7".into(),
+            python: "3.12.3".into(),
+        };
+        let tool = get(&judge(&facts), "tool.sim86").clone();
+        assert_eq!(tool.status, Status::Ok);
+        assert!(tool.why.unwrap().contains(TESTED));
     }
 
     #[test]

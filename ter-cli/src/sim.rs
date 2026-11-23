@@ -123,11 +123,22 @@ pub fn has_circuit(dir: &Path) -> bool {
 }
 
 /// Whether ter offers a simulation run of the exercise in `dir`: its
-/// modes allow one and it has a circuit. Modes that allow simulation for
+/// modes allow one and it has a circuit, Wokwi's or a sim86 board that
+/// shows its checks. Modes that allow simulation for
 /// an exercise fetched without a circuit do not send anyone to a run that
 /// cannot start.
 pub fn offered(dir: &Path, modes: &[String]) -> bool {
-    modes.iter().any(|m| m == "simulation") && has_circuit(dir)
+    modes.iter().any(|m| m == "simulation") && (has_circuit(dir) || crate::sim86::runs(dir))
+}
+
+/// The simulator a simulation run uses when none is named: Wokwi, or
+/// sim86 for an exercise that has a sim86 board and no Wokwi circuit.
+pub fn default_venue(dir: &Path) -> &'static str {
+    if !has_circuit(dir) && crate::sim86::has_board(dir) {
+        "sim86"
+    } else {
+        "wokwi"
+    }
 }
 
 /// Why an exercise with no circuit does not run in simulation, and what
