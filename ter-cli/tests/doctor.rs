@@ -525,6 +525,15 @@ fn venues_still_answers_in_the_same_shape() {
     assert_eq!(wokwi["token"], true);
     assert_eq!(wokwi["wokwi_cli"], Value::Null);
     assert_eq!(wokwi["ready"], false);
+    let sim86 = &v["venues"][2];
+    assert_eq!(keys(sim86), ["mode", "name", "provides", "ready", "reason"]);
+    assert_eq!(sim86["name"], "sim86");
+    assert_eq!(sim86["mode"], "simulation");
+    assert_eq!(sim86["ready"], false);
+    assert_eq!(
+        sim86["reason"],
+        "sim86 is not installed. `ter install sim86` installs it; it runs on your own sim86 account."
+    );
     assert_no_token(&out);
 }
 

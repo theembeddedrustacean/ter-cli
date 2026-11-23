@@ -6,6 +6,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 use ter_flash::{PortKind, Tool};
 use ter_telemetry::local::Local;
+use ter_telemetry::sim86::Sim86;
 use ter_telemetry::wokwi::Wokwi;
 use ter_telemetry::{EventKinds, Kind};
 
@@ -78,6 +79,10 @@ pub fn run(json: bool) -> Result<(), CliError> {
     let wokwi_cli = wokwi_cli.map(|p| p.display().to_string());
     let wokwi_token = wokwi_token.is_some();
     let wokwi_provides: EventKinds = Wokwi::PROVIDES.into();
+    // What this machine has for sim86, found as `ter serve` finds it:
+    // nothing is asked of the service.
+    let sim86_provides: EventKinds = Sim86::PROVIDES.into();
+    let sim86_missing = crate::sim86::setup().err().map(|e| e.message);
 
     let answer = json!({
         "venues": [
@@ -98,6 +103,13 @@ pub fn run(json: bool) -> Result<(), CliError> {
                 "provides": kinds(&wokwi_provides),
                 "wokwi_cli": wokwi_cli,
                 "token": wokwi_token,
+            },
+            {
+                "name": "sim86",
+                "mode": "simulation",
+                "ready": sim86_missing.is_none(),
+                "provides": kinds(&sim86_provides),
+                "reason": sim86_missing,
             }
         ],
         "instruments": [],
@@ -169,6 +181,12 @@ pub fn run(json: bool) -> Result<(), CliError> {
         }
     );
     println!();
+    println!(
+        "sim86 (simulation): sees {}",
+        kinds(&sim86_provides).join(", ")
+    );
+    println!("{}", sim86_line(sim86_missing.as_deref()));
+    println!();
     println!("instruments: none");
     Ok(())
 }
@@ -181,9 +199,26 @@ fn unmounted_line(disk: &str) -> String {
     )
 }
 
+/// Whether this machine is set up for sim86, or what it lacks.
+fn sim86_line(missing: Option<&str>) -> String {
+    match missing {
+        None => "  installed, with a key".to_string(),
+        Some(why) => format!("  not ready: {why}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sim86_says_whether_it_is_set_up_or_what_it_lacks() {
+        assert_eq!(sim86_line(None), "  installed, with a key");
+        assert_eq!(
+            sim86_line(Some("sim86 is not installed.")),
+            "  not ready: sim86 is not installed."
+        );
+    }
 
     #[test]
     fn an_unmounted_bootloader_comes_with_both_ways_to_mount_it() {
