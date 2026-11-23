@@ -58,6 +58,9 @@ pub struct PageFile {
     pub content: String,
 }
 
+/// The simulators a page can name as the `venue` of a simulation.
+pub const SIMULATORS: [&str; 2] = ["wokwi", "sim86"];
+
 /// A validated `/run` body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequest {
@@ -67,9 +70,10 @@ pub struct RunRequest {
     /// service then runs a simulation where the exercise has one (the
     /// editor is the simulation path), else on the board.
     pub mode: Option<String>,
-    /// Where a hardware run goes: `local` (this machine's board) or
-    /// `bench` (a shared bench this account connected to). `None` is the
-    /// exercise's own venue, as before the field existed.
+    /// Where the run goes within its mode. Hardware: `local` (this
+    /// machine's board) or `bench` (a shared bench this account connected
+    /// to). Simulation: one of [`SIMULATORS`]. `None` is the exercise's own
+    /// venue, as before the field existed.
     pub venue: Option<String>,
     /// The bench to run on (its `name` on the Devices list) when `venue`
     /// is `bench`; `None` is the bench this account connected to last.
@@ -188,29 +192,41 @@ impl RunRequest {
         let venue = match text("venue")? {
             None if bench.is_some() => Some("bench".to_string()),
             None => None,
-            Some(v) if v == "local" || v == "bench" => Some(v),
+            Some(v) if v == "local" || v == "bench" || SIMULATORS.contains(&v.as_str()) => Some(v),
             Some(other) => {
                 return Err(ServeError::bad_request(format!(
-                    "venue must be \"local\" or \"bench\", not {other:?}."
+                    "venue must be \"local\" or \"bench\", or a simulator ({}), not {other:?}.",
+                    SIMULATORS.join(", ")
                 )));
             }
         };
-        if bench.is_some() && venue.as_deref() == Some("local") {
-            return Err(ServeError::bad_request(
-                "bench names a shared bench; it goes with venue \"bench\", not \"local\".",
-            ));
+        let simulator = venue.as_deref().is_some_and(|v| SIMULATORS.contains(&v));
+        if let (Some(_), Some(v)) = (&bench, &venue)
+            && v != "bench"
+        {
+            return Err(ServeError::bad_request(format!(
+                "bench names a shared bench; it goes with venue \"bench\", not {v:?}."
+            )));
         }
-        let mode = match obj.get("mode") {
-            // A venue is a place to run hardware.
-            None | Some(Value::Null) if venue.is_some() => Some("hardware".to_string()),
-            None | Some(Value::Null) => None,
-            Some(Value::String(m)) if m == "simulation" && venue.is_some() => {
-                return Err(ServeError::bad_request(
-                    "venue goes with mode \"hardware\": a simulation runs in Wokwi.",
-                ));
+        let mode = match (obj.get("mode"), &venue) {
+            // A simulator runs a simulation; any other venue is a place to
+            // run hardware.
+            (None | Some(Value::Null), Some(_)) if simulator => Some("simulation".to_string()),
+            (None | Some(Value::Null), Some(_)) => Some("hardware".to_string()),
+            (None | Some(Value::Null), None) => None,
+            (Some(Value::String(m)), Some(v)) if m == "simulation" && !simulator => {
+                return Err(ServeError::bad_request(format!(
+                    "venue {v:?} goes with mode \"hardware\"; a simulation names a simulator ({}) or no venue.",
+                    SIMULATORS.join(", ")
+                )));
             }
-            Some(Value::String(m)) if m == "simulation" || m == "hardware" => Some(m.clone()),
-            Some(other) => {
+            (Some(Value::String(m)), Some(v)) if m == "hardware" && simulator => {
+                return Err(ServeError::bad_request(format!(
+                    "venue {v:?} is a simulator; it goes with mode \"simulation\"."
+                )));
+            }
+            (Some(Value::String(m)), _) if m == "simulation" || m == "hardware" => Some(m.clone()),
+            (Some(other), _) => {
                 return Err(ServeError::bad_request(format!(
                     "mode must be \"simulation\" or \"hardware\", not {other}."
                 )));
@@ -834,7 +850,7 @@ mod tests {
             "no mode named: the service picks the exercise's"
         );
 
-        assert!(bad(r#"{"exercise_id": "a", "venue": "wokwi"}"#).contains("venue must be"));
+        assert!(bad(r#"{"exercise_id": "a", "venue": "renode"}"#).contains("venue must be"));
         assert!(bad(r#"{"exercise_id": "a", "venue": 1}"#).contains("venue must be a string"));
         assert!(bad(r#"{"exercise_id": "a", "bench": 1}"#).contains("bench must be a string"));
         assert!(
@@ -842,6 +858,36 @@ mod tests {
                 .contains("hardware")
         );
         assert!(bad(r#"{"exercise_id": "a", "venue": "local", "bench": "b-1"}"#).contains("bench"));
+    }
+
+    #[test]
+    fn a_simulator_is_the_venue_of_a_simulation() {
+        let parse = |body: &str| RunRequest::parse(body.as_bytes());
+        let bad = |body: &str| parse(body).unwrap_err().message;
+
+        for sim in SIMULATORS {
+            let r = parse(&format!(
+                r#"{{"exercise_id": "a", "mode": "simulation", "venue": "{sim}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                (r.mode.as_deref(), r.venue.as_deref(), r.bench),
+                (Some("simulation"), Some(sim), None)
+            );
+            // A simulator alone means a simulation.
+            let r = parse(&format!(r#"{{"exercise_id": "a", "venue": "{sim}"}}"#)).unwrap();
+            assert_eq!(r.mode.as_deref(), Some("simulation"));
+        }
+        // A simulation that names none is the exercise's own, as before.
+        let r = parse(r#"{"exercise_id": "a", "mode": "simulation"}"#).unwrap();
+        assert_eq!((r.mode.as_deref(), r.venue), (Some("simulation"), None));
+
+        let m = bad(r#"{"exercise_id": "a", "mode": "hardware", "venue": "sim86"}"#);
+        assert!(m.contains("\"sim86\" is a simulator"), "{m}");
+        let m = bad(r#"{"exercise_id": "a", "mode": "simulation", "venue": "local"}"#);
+        assert!(m.contains("wokwi, sim86"), "{m}");
+        let m = bad(r#"{"exercise_id": "a", "venue": "sim86", "bench": "b-1"}"#);
+        assert!(m.contains("not \"sim86\""), "{m}");
     }
 
     #[test]

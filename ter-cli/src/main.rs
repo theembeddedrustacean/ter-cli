@@ -7,6 +7,7 @@ mod bench;
 mod build;
 mod config;
 mod doctor;
+mod events;
 mod exercises;
 mod hint;
 mod hw;

@@ -45,7 +45,7 @@ pub const PINS_FILE: &str = "sim86/pins.json";
 pub const HELPER: &str = include_str!("sim86_helper.py");
 pub const HELPER_FILE: &str = "ter_sim86.py";
 /// The `helper` number in the script's answers.
-pub const HELPER_VERSION: u64 = 1;
+pub const HELPER_VERSION: u64 = 2;
 /// What `pip install` is asked for.
 pub const PACKAGE: &str = "sim86>=0.1.4,<0.2";
 /// The package version this ter was tested with.
@@ -507,6 +507,9 @@ pub struct Answer {
     pub applied: Vec<Applied>,
     #[serde(default)]
     pub balance: Option<Balance>,
+    /// Whether the package finds a key, from the helper's `version`.
+    #[serde(default)]
+    pub key: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -692,7 +695,8 @@ impl Helper {
         })
     }
 
-    /// The package and Python versions. Asks sim86 nothing.
+    /// The package and Python versions, and whether the package finds a
+    /// key. Asks sim86 nothing.
     pub fn version(&self) -> Result<Answer, Failure> {
         self.call(&["version".into()], Duration::from_secs(30), None)
     }

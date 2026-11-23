@@ -32,7 +32,8 @@ token, which you create at <https://wokwi.com/dashboard/ci>.
 An exercise that comes with a sim86 board can also run on sim86:
 `ter run --sim sim86`. `ter install sim86` sets it up; it needs Python 3.9
 or newer and your own sim86 account. `ter ex show` lists the simulators
-that can run an exercise.
+that can run an exercise. A lesson page that shows the exercise on a sim86
+board asks `ter serve` for that run on sim86.
 
 ## Commands
 
@@ -53,7 +54,9 @@ ter self-update                  how to update ter
 ```
 
 `ter <command> --help` shows the options for each command. Every command
-also takes `--json`.
+also takes `--json`. For a run that was judged, `ter run --json` includes
+what was recorded: `events`, every pin change and serial line with its
+time.
 
 ## Good to know
 

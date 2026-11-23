@@ -199,9 +199,9 @@ pub fn account(answer: Result<Balance, Failure>) -> Result<Option<Balance>, CliE
     }
 }
 
-/// The installed package, the program's form and the account, or why
-/// sim86 cannot be used.
-pub fn ready(dir: &Path, plan: Plan) -> Result<Ready, CliError> {
+/// The installed package with this ter's helper beside it, or why sim86
+/// cannot be used on this machine.
+fn helper() -> Result<Helper, CliError> {
     let helper = installed().ok_or_else(|| {
         unavailable(
             "sim86 is not installed. `ter install sim86` installs it; it runs on your own sim86 account.",
@@ -213,6 +213,35 @@ pub fn ready(dir: &Path, plan: Plan) -> Result<Ready, CliError> {
             format!("Could not write {}: {e}", helper.script.display()),
         )
     })?;
+    Ok(helper)
+}
+
+/// What this machine needs before any sim86 run: the package and a key.
+/// Asks sim86 nothing, so a key that is there may still be refused, and
+/// the account may have no credits; a run finds that out.
+pub fn setup() -> Result<(), CliError> {
+    let helper = helper()?;
+    if helper.key.is_some() {
+        return Ok(());
+    }
+    match helper.version() {
+        Ok(found) if found.key == Some(true) => Ok(()),
+        Ok(_) => Err(unavailable(format!(
+            "{}.",
+            Failure {
+                kind: FailureKind::NoKey,
+                message: String::new(),
+            }
+            .explain()
+        ))),
+        Err(failure) => Err(unavailable(format!("{}.", failure.explain()))),
+    }
+}
+
+/// The installed package, the program's form and the account, or why
+/// sim86 cannot be used.
+pub fn ready(dir: &Path, plan: Plan) -> Result<Ready, CliError> {
+    let helper = helper()?;
     let image = image(dir)?;
     account(helper.balance())?;
     Ok(Ready {

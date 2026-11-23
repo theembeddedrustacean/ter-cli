@@ -9,7 +9,9 @@
 #                                    --dev and solution build checks;
 #                                    SIM86_API_KEY and TER_SIM86_PILOT=<a
 #                                    folder of sim86 boards and built
-#                                    programs> add the sim86 run)
+#                                    programs> add the sim86 runs; the
+#                                    one through ter serve needs
+#                                    TER_CURRICULUM too)
 #   scripts/check.sh --install-hook  install the git pre-commit hook
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

@@ -14,6 +14,11 @@
 //! same bench client as `ter run --hw --venue bench`, and waits a little
 //! while someone else is driving before answering `bench_busy`.
 //!
+//! A simulation may name its simulator the same way (`wokwi`, `sim86`):
+//! that run goes there or is refused before the build, never to another
+//! simulator. `/health` lists the simulators and whether this machine is
+//! set up for each.
+//!
 //! One run at a time: a second request waits for the first, since both
 //! would build in the same course cache.
 
@@ -25,6 +30,7 @@ use serde_json::{Value, json};
 use ter_check::CheckFile;
 use ter_remote::serve::{RunFuture, RunRequest, ServeError, Service, editable, origin_of};
 use ter_sdk::project::TerToml;
+use ter_telemetry::sim86::Sim86;
 
 use crate::config::Config;
 use crate::exercises;
@@ -47,9 +53,41 @@ const BENCH_ALLOWANCE: Duration = Duration::from_secs(60);
 /// The places a page's run can go, as `/health` lists them.
 pub const VENUES: [&str; 3] = ["simulation", "local", "bench"];
 
+/// How long `/health` reuses what it found about the simulators: finding
+/// out starts sim86's Python.
+const SIMULATORS_FOR: Duration = Duration::from_secs(20);
+
 struct Inner {
     /// Held for the whole of a run, past a timeout answer too.
     turn: Arc<tokio::sync::Mutex<()>>,
+    /// The simulators as `/health` last listed them, and when.
+    simulators: std::sync::Mutex<Option<(std::time::Instant, Value)>>,
+}
+
+/// One simulator as `/health` lists it: `ready` when this machine has what
+/// a run on it needs, else why not, in words for the learner.
+fn simulator(name: &str, setup: Result<(), CliError>) -> Value {
+    match setup {
+        Ok(()) => json!({"name": name, "ready": true}),
+        Err(e) => json!({"name": name, "ready": false, "reason": e.message}),
+    }
+}
+
+/// Every simulator a page can name, in the order of [`run::SIM_VENUES`]:
+/// Wokwi, the default, first.
+fn simulators() -> Value {
+    Value::Array(
+        run::SIM_VENUES
+            .iter()
+            .map(|name| {
+                let setup = match *name {
+                    "sim86" => crate::sim86::setup(),
+                    _ => crate::sim::setup().map(|_| ()),
+                };
+                simulator(name, setup)
+            })
+            .collect(),
+    )
 }
 
 pub struct Serve(Arc<Inner>);
@@ -66,7 +104,19 @@ impl From<CliError> for ServeFailure {
 impl Service for Serve {
     fn health(&self) -> Value {
         let posts = Session::open().is_ok_and(|s| s.token_source != "none");
-        json!({"version": env!("CARGO_PKG_VERSION"), "posts_to_site": posts, "venues": VENUES})
+        let simulators = {
+            let mut kept = self.0.simulators.lock().unwrap_or_else(|e| e.into_inner());
+            match kept.as_ref() {
+                Some((at, list)) if at.elapsed() < SIMULATORS_FOR => list.clone(),
+                _ => {
+                    let list = simulators();
+                    *kept = Some((std::time::Instant::now(), list.clone()));
+                    list
+                }
+            }
+        };
+        json!({"version": env!("CARGO_PKG_VERSION"), "posts_to_site": posts,
+               "venues": VENUES, "simulators": simulators})
     }
 
     fn run(&self, request: RunRequest) -> RunFuture {
@@ -229,9 +279,6 @@ fn bench_queue() -> Duration {
         .map_or(BENCH_QUEUE, Duration::from_secs)
 }
 
-/// The most a run may take: the build, then the venue's own budget for
-/// the check's `timeout_ms`. A bench run also has its queue and the trip
-/// to the owner's machine.
 /// The mode of a page's run. A page that names none gets a simulation
 /// where the exercise has one (the editor's Run button is the simulation
 /// path), and a run on the board where the board is all it allows.
@@ -251,13 +298,21 @@ fn mode_for(dir: &Path, asked: Option<&str>) -> &'static str {
     }
 }
 
+/// The most a run may take: the build, then the venue's own budget for
+/// the check's `timeout_ms` (the named simulator's, or the one the
+/// exercise runs on when none is named). A bench run also has its queue
+/// and the trip to the owner's machine.
 fn limit(dir: &Path, mode: &str, venue: Option<&str>) -> Duration {
     let timeout_ms = std::fs::read_to_string(dir.join(CHECK_YAML))
         .ok()
         .and_then(|t| CheckFile::parse(&t).ok())
         .map_or(0, |f| f.timeout_ms);
     let run = if mode != "hardware" {
-        run::sim_budget(dir, timeout_ms)
+        match venue {
+            Some("sim86") => Sim86::budget(timeout_ms),
+            Some(_) => run::wokwi_budget(timeout_ms),
+            None => run::sim_budget(dir, timeout_ms),
+        }
     } else if venue == Some("bench") {
         bench_queue() + BENCH_ALLOWANCE + FLASH_ALLOWANCE + run::board_budget(timeout_ms)
     } else {
@@ -382,7 +437,10 @@ pub async fn serve(
         let _ = out.write_all(banner.as_bytes()).and_then(|()| out.flush());
     }
 
-    let service = Arc::new(Serve(Arc::new(Inner { turn })));
+    let service = Arc::new(Serve(Arc::new(Inner {
+        turn,
+        simulators: std::sync::Mutex::new(None),
+    })));
     ter_remote::serve::serve(listener, service, &page, dev)
         .await
         .map_err(|e| CliError::new("io_error", format!("ter serve stopped: {e}")))
@@ -486,6 +544,29 @@ mod tests {
     }
 
     #[test]
+    fn a_page_can_name_every_simulator_ter_run_can() {
+        assert_eq!(ter_remote::serve::SIMULATORS, run::SIM_VENUES);
+    }
+
+    #[test]
+    fn a_simulator_is_ready_or_says_why_not() {
+        assert_eq!(
+            simulator("wokwi", Ok(())),
+            json!({"name": "wokwi", "ready": true})
+        );
+        assert_eq!(
+            simulator(
+                "sim86",
+                Err(CliError::new(
+                    "venue_unavailable",
+                    "sim86 is not installed."
+                ))
+            ),
+            json!({"name": "sim86", "ready": false, "reason": "sim86 is not installed."})
+        );
+    }
+
+    #[test]
     fn the_limit_is_the_build_plus_the_venues_budget() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -500,6 +581,15 @@ mod tests {
         assert_eq!(
             limit(dir.path(), "simulation", None),
             BUILD_ALLOWANCE + Duration::from_secs(120 + 140)
+        );
+        assert_eq!(
+            limit(dir.path(), "simulation", Some("wokwi")),
+            limit(dir.path(), "simulation", None)
+        );
+        assert_eq!(
+            limit(dir.path(), "simulation", Some("sim86")),
+            BUILD_ALLOWANCE + Sim86::budget(7000),
+            "the simulator the page names, not the folder's default"
         );
         assert_eq!(
             limit(dir.path(), "hardware", None),

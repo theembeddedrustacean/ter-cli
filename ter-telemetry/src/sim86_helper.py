@@ -3,7 +3,8 @@
 
     ter_sim86.py run <request.json>    run a program and print the recording
     ter_sim86.py balance               the account's plan and credits
-    ter_sim86.py version               the sim86 package found, no network
+    ter_sim86.py version               the sim86 package found and whether
+                                       it has a key, no network
 
 Prints exactly one JSON object on standard output, {"ok": true, ...} or
 {"ok": false, "error": {"kind": ..., "message": ...}}, and exits 0 either
@@ -17,7 +18,7 @@ import sys
 import time
 import warnings
 
-HELPER = 1
+HELPER = 2
 
 # A trace comes back exact, every edge with its time, only while it has
 # few enough edges; past that it is a summary. A slice is cut to hold
@@ -267,6 +268,14 @@ def balance():
     return {"balance": {"credits": int(credits), "plan": str(details.get("plan") or "")}}
 
 
+def has_key():
+    """Whether the package finds a key (the environment, a token.env, or
+    the one `sim86 login` stored). The key itself stays with the package."""
+    from sim86 import Client
+
+    return bool(Client().api_key)
+
+
 def main(argv):
     out = {"helper": HELPER, "ok": False, "python": ".".join(str(n) for n in sys.version_info[:3])}
     try:
@@ -282,7 +291,7 @@ def main(argv):
         elif mode == "balance":
             out.update(balance())
         elif mode == "version":
-            pass
+            out["key"] = has_key()
         else:
             raise Failed("internal", "usage: ter_sim86.py run <request.json> | balance | version")
         out["ok"] = True

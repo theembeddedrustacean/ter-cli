@@ -14,7 +14,7 @@ use ter_sdk::run::{LastRun, RunAnswer, RunRecord};
 use ter_telemetry::local::Local;
 use ter_telemetry::sim86::Sim86;
 use ter_telemetry::wokwi::Wokwi;
-use ter_telemetry::{Capture, Venue, rfc3339_utc};
+use ter_telemetry::{Capture, Recording, Venue, rfc3339_utc};
 
 use crate::build::cargo_build;
 use crate::config::Config;
@@ -22,7 +22,7 @@ use crate::output::{CliError, print_json};
 use crate::record::{Infra, Outcome, RunContext, assemble, file_sha256};
 use crate::session::Session;
 use crate::telemetry::{RUN_CHECK, bad_check, check_recording};
-use crate::{hw, remote, sim, sim86};
+use crate::{events, hw, remote, sim, sim86};
 use ter_flash::Tool;
 
 pub const CHECK_YAML: &str = "check.yaml";
@@ -385,8 +385,30 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
     .save(&dir)?;
 
     let failure = failure(&outcome, &log_path, &recording);
+    // What the venue recorded, for whoever shows the run. Read back from
+    // the run folder, like the verdicts.
+    let shown = matches!(outcome, Outcome::Checked { .. })
+        .then(|| Recording::read(&recording).ok())
+        .flatten()
+        .map(|rec| {
+            let nets = match &plan {
+                Plan::Sim86(sim) => sim
+                    .ready
+                    .plan
+                    .watch
+                    .iter()
+                    .map(|w| (w.pin.clone(), w.net.clone()))
+                    .collect(),
+                _ => Default::default(),
+            };
+            events::shown(&rec, &ter.pins, &nets)
+        });
+    let mut answer_json = answer_json(&record, &answer, &outcome, &recording, failure.as_ref());
+    if let Some(shown) = shown {
+        shown.put_into(&mut answer_json);
+    }
     Ok(Done {
-        answer: answer_json(&record, &answer, &outcome, &recording, failure.as_ref()),
+        answer: answer_json,
         failure,
         record,
         site: answer,
@@ -525,7 +547,8 @@ fn failure(outcome: &Outcome, log_path: &Path, recording: &Path) -> Option<CliEr
 }
 
 /// The run record as posted, plus the site's answer, as `ter serve` will
-/// return it to the lesson page.
+/// return it to the lesson page. A judged run's answer also gets its
+/// `events` (see [`events`]); those are not posted.
 fn answer_json(
     record: &RunRecord,
     answer: &RunAnswer,

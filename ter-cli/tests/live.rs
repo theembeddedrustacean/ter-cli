@@ -2009,6 +2009,141 @@ fn sim86_ready() -> Option<std::path::PathBuf> {
     }
 }
 
+/// The lesson page asks `ter serve` for one run on sim86: Heartbeat as the
+/// site serves it, with the pilot's uFerris board and pin map in its folder
+/// (the site does not send them yet) and the reference solution in `src/`.
+/// `/health` says sim86 is ready, the run goes to sim86 though the folder
+/// has a Wokwi circuit, it is posted with venue `sim86`, and the answer
+/// carries the recording from its first edge. Needs `TER_CURRICULUM` too,
+/// for the solution.
+#[test]
+#[ignore = "live site and sim86"]
+fn live_serve_runs_the_pages_run_on_sim86_and_answers_with_its_events() {
+    use std::io::BufRead;
+    let Some(pilot) = sim86_ready() else {
+        return;
+    };
+    let Ok(curriculum) = std::env::var("TER_CURRICULUM") else {
+        eprintln!("skipped: set TER_CURRICULUM");
+        return;
+    };
+    let m = LiveMachine::new();
+    let (ok, v) = m.json(&["ex", "fetch", LIVE_OPEN], m.courses.path());
+    assert!(ok, "{v}");
+    let dir = std::path::PathBuf::from(v["path"].as_str().unwrap());
+    assert!(dir.join("diagram.json").is_file(), "Wokwi is its default");
+    lay_solution_over(&curriculum, &dir);
+    std::fs::create_dir_all(dir.join("sim86")).unwrap();
+    for (from, to) in [
+        ("uferris-c3.json", "sim86/board.json"),
+        ("uferris-c3.pins.json", "sim86/pins.json"),
+    ] {
+        std::fs::copy(pilot.join("boards").join(from), dir.join(to)).unwrap();
+    }
+
+    let tools = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["install", "sim86", "--json"])
+        .env("TER_TOOLS_DIR", tools.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["serve", "--port", "0", "--dev"])
+        .env("TER_CONFIG_DIR", m.config.path())
+        .env("TER_TOKEN", &m.token)
+        .env("TER_KEYCHAIN", "off")
+        .env("TER_TOOLS_DIR", tools.path())
+        .env_remove("TER_SITE_URL")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    stdout.read_line(&mut line).unwrap();
+    let url = line
+        .strip_prefix("ter serve on ")
+        .and_then(|l| l.split(',').next())
+        .unwrap()
+        .to_string();
+
+    let (health, status, v): (Value, u16, Value) = {
+        let _turn = take_turn();
+        block_on(async {
+            let page = reqwest::Client::new();
+            let health = page
+                .get(format!("{url}/health"))
+                .header("origin", "http://localhost:8080")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let r = page
+                .post(format!("{url}/run"))
+                .header("origin", "http://localhost:8080")
+                .json(&serde_json::json!({
+                    "exercise_id": LIVE_OPEN, "mode": "simulation", "venue": "sim86"
+                }))
+                .send()
+                .await
+                .unwrap();
+            (health, r.status().as_u16(), r.json().await.unwrap())
+        })
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let key = std::env::var("SIM86_API_KEY").unwrap();
+    assert!(!health.to_string().contains(&key) && !v.to_string().contains(&key));
+    assert_eq!(
+        health["simulators"][1],
+        serde_json::json!({"name": "sim86", "ready": true}),
+        "{health}"
+    );
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["venue"], "sim86", "{v}");
+    assert_eq!(v["check_status"], "passed", "{v}");
+    assert!(v["site"]["attempt"].as_u64().is_some(), "{v}");
+
+    let events = v["events"].as_array().expect("events");
+    let edges: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "pin_edge" && e["name"] == "user_led")
+        .collect();
+    assert!(
+        edges.len() > 16,
+        "a heartbeat, 4 flashes a second: {edges:?}"
+    );
+    assert_eq!(
+        (&edges[0]["pin"], &edges[0]["net"]),
+        (&serde_json::json!("GPIO3"), &serde_json::json!("mcu.D1")),
+        "{:?}",
+        edges[0]
+    );
+    // The LED's level at the start, then its first edge, well inside the
+    // first second: nothing before the first observed time is missing.
+    assert_eq!(edges[0]["t_us"], 0, "{:?}", edges[0]);
+    let first = edges[1]["t_us"].as_u64().unwrap();
+    assert!((1_000..1_000_000).contains(&first), "{first}");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["kind"] == "serial" && !e["text"].as_str().unwrap().is_empty()),
+        "the chip's boot lines"
+    );
+    assert!(v["events_end_us"].as_u64().unwrap() >= 1_000_000, "{v}");
+    assert!(v.get("events_cut").is_none(), "{v}");
+    eprintln!(
+        "serve posted sim86 run {} attempt {}: {} events, first edge at {first} us",
+        v["name"],
+        v["site"]["attempt"],
+        events.len()
+    );
+}
+
 /// `ter install sim86` into a tools folder of the test's own, then the
 /// venue itself on sim86: the heartbeat on the XIAO ESP32-C3 board passes
 /// its two pin checks from a recording that holds the first edge, and a

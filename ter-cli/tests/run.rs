@@ -101,12 +101,15 @@ exit 42
 /// `python <helper> version|balance|run <request>`. It answers with the
 /// JSON beside it (`balance.json`, `run.json`: what the real helper
 /// printed, recorded) and keeps what it was given for the test to look at.
+/// Its package has a key of its own once `has-key` is beside it.
 const FAKE_SIM86_PYTHON: &str = r#"#!/bin/sh
 here="$(dirname "$0")"
 [ -f "$1" ] || { echo "no helper at $1" >&2; exit 2; }
 cp "$1" "$here/got-helper.py"
 case "$2" in
-  version) echo '{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.1.4"}' ;;
+  version)
+    key=false; [ -f "$here/has-key" ] && key=true
+    echo "{\"helper\": 2, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"0.1.4\", \"key\": $key}" ;;
   balance) cat "$here/balance.json" ;;
   run)
     cp "$3" "$here/got-request.json"
@@ -1437,6 +1440,37 @@ async fn a_simulated_run_is_recorded_judged_and_posted() {
     );
     assert_eq!(v["verdicts"][2]["observed"], "8 pulses, 100 ms");
 
+    // The answer carries what was recorded, in time order, each pin with
+    // the board's name for it; the site is not sent it.
+    let events = v["events"].as_array().expect("events");
+    assert_eq!(events[0], json!({"t_us": 0, "kind": "reset"}), "{v}");
+    let edges: Vec<&Value> = events.iter().filter(|e| e["kind"] == "pin_edge").collect();
+    assert!(edges.len() > 16, "{v}");
+    for e in &edges {
+        assert_eq!(
+            (&e["name"], &e["pin"]),
+            (&json!("user_led"), &json!("GPIO3"))
+        );
+        assert!(e.get("net").is_none(), "Wokwi has no names of its own: {e}");
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| e["kind"] == "serial" && e["text"].as_str().unwrap().contains("Hello world!")),
+        "{v}"
+    );
+    let times: Vec<u64> = events.iter().map(|e| e["t_us"].as_u64().unwrap()).collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
+    assert_eq!(v["events_end_us"], 5_500_000, "{v}");
+    assert!(v.get("events_cut").is_none(), "{v}");
+    assert!(p.get("events").is_none(), "{p}");
+    let recorded = std::fs::read_to_string(m.exercise().join(".runs/1/events.jsonl")).unwrap();
+    assert_eq!(
+        recorded.lines().count(),
+        events.len() + 1,
+        "the header and every event"
+    );
+
     // The run copy of the circuit got the analyzer on the LED; the
     // learner's did not.
     let run = m.exercise().join(".runs/1");
@@ -2406,6 +2440,222 @@ async fn serve_runs_a_hardware_only_exercise_on_the_board_when_the_page_names_no
     assert_eq!(v["venue"], "local", "{v}");
     let run = &posted(&server, "run").await[0]["payload"];
     assert_eq!(run["mode"], "hardware", "{run}");
+}
+
+/// `/health` as the lesson page reads it.
+async fn health_of(served: &Served) -> Value {
+    reqwest::Client::new()
+        .get(format!("{}/health", served.url))
+        .header("origin", &served.page)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// The page shows the exercise on a sim86 board and asks for that run on
+/// sim86: it goes there though the folder has a Wokwi circuit too, and the
+/// answer carries the recording for the page to play.
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_runs_on_sim86_when_the_page_names_it() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]).on_sim86(
+        SIM86_HEARTBEAT_CHECK,
+        SIM86_UFERRIS,
+        SIM86_UFERRIS_PINS,
+        "blinky.json",
+    );
+    assert!(m.exercise().join("diagram.json").is_file());
+    let mut ter = std::fs::read_to_string(m.exercise().join("ter.toml")).unwrap();
+    ter.push_str("\n[pins]\nuser_led = \"GPIO3\"\n");
+    std::fs::write(m.exercise().join("ter.toml"), ter).unwrap();
+    let served = m.serve(&server.uri());
+
+    let health = health_of(&served).await;
+    assert_eq!(
+        health["simulators"][1],
+        json!({"name": "sim86", "ready": true}),
+        "{health}"
+    );
+
+    let (status, _, v) = served
+        .run(json!({"exercise_id": EXERCISE, "mode": "simulation", "venue": "sim86"}))
+        .await;
+
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(
+        (&v["mode"], &v["venue"]),
+        (&json!("simulation"), &json!("sim86"))
+    );
+    assert_eq!(v["check_status"], "passed", "{v}");
+    let p = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(p["venue"], "sim86");
+    assert!(p.get("events").is_none(), "events are not posted: {p}");
+
+    let events = v["events"].as_array().expect("events");
+    assert_eq!(events[0], json!({"t_us": 0, "kind": "reset"}));
+    let edges: Vec<&Value> = events.iter().filter(|e| e["kind"] == "pin_edge").collect();
+    // The LED's level at the start, then the first edge of the run.
+    assert_eq!(
+        edges[0],
+        &json!({"t_us": 0, "kind": "pin_edge", "name": "user_led", "level": "low",
+                "pin": "GPIO3", "net": "mcu.D1"})
+    );
+    assert_eq!(
+        edges[1],
+        &json!({"t_us": 143_325, "kind": "pin_edge", "name": "user_led", "level": "high",
+                "pin": "GPIO3", "net": "mcu.D1"})
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["kind"] == "serial" && e["text"].as_str().unwrap().contains("ESP-ROM")),
+        "{v}"
+    );
+    assert_eq!(v["events_end_us"], 5_500_000);
+    assert!(v.get("events_cut").is_none(), "{v}");
+    assert!(!v.to_string().contains(SIM86_KEY));
+}
+
+/// A page that asks for sim86 where it cannot run is told why before
+/// anything is built, and the run does not go to Wokwi instead.
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_refuses_sim86_where_it_cannot_run_and_does_not_fall_back() {
+    let server = site("0.1.0", run_answer()).await;
+    let ask = json!({"exercise_id": EXERCISE, "mode": "simulation", "venue": "sim86"});
+    let not_built = |m: &Machine| !m.exercise().join(".runs").exists();
+
+    // An exercise with a Wokwi circuit that would pass there, and no
+    // sim86 board.
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        42,
+    );
+    let served = m.serve(&server.uri());
+    let (status, _, v) = served.run(ask.clone()).await;
+    assert_eq!(status, 400, "{v}");
+    assert_eq!(v["error"]["code"], "not_observable", "{v}");
+    let said = v["error"]["message"].as_str().unwrap();
+    assert!(said.contains("has no sim86 board"), "{said}");
+    assert!(not_built(&m));
+    // The same page naming no simulator runs it in Wokwi, as before.
+    let (status, _, v) = served.run(json!({"exercise_id": EXERCISE})).await;
+    assert_eq!((status, &v["venue"]), (200, &json!("wokwi")), "{v}");
+    drop(served);
+
+    // A sim86 board, and sim86 not installed on this machine.
+    let m = sim86_blinky();
+    std::fs::remove_dir_all(m.tools.path().join("sim86")).unwrap();
+    let served = m.serve(&server.uri());
+    let health = health_of(&served).await;
+    assert_eq!(health["simulators"][1]["ready"], false, "{health}");
+    let (status, _, v) = served.run(ask.clone()).await;
+    assert_eq!(status, 503, "{v}");
+    assert_eq!(v["error"]["code"], "venue_unavailable", "{v}");
+    let said = v["error"]["message"].as_str().unwrap();
+    assert!(said.contains("ter install sim86"), "{said}");
+    assert_eq!(
+        health["simulators"][1]["reason"], said,
+        "/health gave the same reason before the page asked"
+    );
+    assert!(not_built(&m));
+    drop(served);
+
+    // A check sim86's board cannot show.
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]).on_sim86(
+        SIM86_HEARTBEAT_CHECK,
+        SIM86_UFERRIS,
+        r#"{"user_button": {"part": "btn1"}}"#,
+        "blinky.json",
+    );
+    let served = m.serve(&server.uri());
+    let (status, _, v) = served.run(ask).await;
+    assert_eq!(status, 400, "{v}");
+    assert_eq!(v["error"]["code"], "not_observable", "{v}");
+    assert!(not_built(&m));
+
+    // A simulator is not a place to run hardware, and the other way round.
+    let (status, _, v) = served
+        .run(json!({"exercise_id": EXERCISE, "mode": "hardware", "venue": "sim86"}))
+        .await;
+    assert_eq!(
+        (status, &v["error"]["code"]),
+        (400, &json!("bad_request")),
+        "{v}"
+    );
+
+    assert_eq!(posted(&server, "run").await.len(), 1, "only the Wokwi run");
+}
+
+/// `/health` lists each simulator a page can name and whether this
+/// machine is set up for it: the tool and a key, nothing asked of the
+/// simulator's service.
+#[cfg(unix)]
+#[tokio::test]
+async fn health_lists_the_simulators_and_whether_each_is_ready() {
+    let server = site("0.1.0", run_answer()).await;
+    let names = |h: &Value| -> Vec<String> {
+        h["simulators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Wokwi set up, sim86 not installed.
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        42,
+    );
+    let served = m.serve(&server.uri());
+    let health = health_of(&served).await;
+    assert_eq!(names(&health), ["wokwi", "sim86"], "the default first");
+    assert_eq!(
+        health["simulators"][0],
+        json!({"name": "wokwi", "ready": true})
+    );
+    assert_eq!(health["simulators"][1]["ready"], false);
+    let why = health["simulators"][1]["reason"].as_str().unwrap();
+    assert!(why.contains("ter install sim86"), "{why}");
+    assert_eq!(
+        health["venues"],
+        json!(["simulation", "local", "bench"]),
+        "as before"
+    );
+    drop(served);
+
+    // sim86 installed with no key in the environment: the package is
+    // asked whether it has one of its own.
+    let mut m = sim86_blinky();
+    m.sim86 = false;
+    let served = m.serve(&server.uri());
+    let health = health_of(&served).await;
+    assert_eq!(health["simulators"][1]["ready"], false, "{health}");
+    let why = health["simulators"][1]["reason"].as_str().unwrap();
+    assert!(why.contains("No sim86 key on this machine"), "{why}");
+    assert_eq!(
+        m.sim86_saw("got-helper.py"),
+        ter_telemetry::sim86::HELPER,
+        "the helper this ter ships was asked"
+    );
+    drop(served);
+
+    std::fs::write(m.sim86_bin().join("has-key"), "").unwrap();
+    let served = m.serve(&server.uri());
+    let health = health_of(&served).await;
+    assert_eq!(
+        health["simulators"][1],
+        json!({"name": "sim86", "ready": true}),
+        "{health}"
+    );
+    assert!(!health.to_string().contains(SIM86_KEY));
 }
 
 #[tokio::test]

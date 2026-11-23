@@ -271,6 +271,12 @@ fn checks_for(file: &CheckFile, e: &WiringError) -> Vec<String> {
 
 /// `wokwi-cli` and the learner's token, or why Wokwi cannot be used.
 pub fn ready(plan: Plan) -> Result<Ready, CliError> {
+    let (cli, token) = setup()?;
+    Ok(Ready { cli, token, plan })
+}
+
+/// What this machine needs before any Wokwi run: `wokwi-cli` and a token.
+pub fn setup() -> Result<(PathBuf, String), CliError> {
     let cli = find_cli().ok_or_else(|| {
         CliError::new(
             "venue_unavailable",
@@ -285,7 +291,7 @@ pub fn ready(plan: Plan) -> Result<Ready, CliError> {
             ),
         )
     })?;
-    Ok(Ready { cli, token, plan })
+    Ok((cli, token))
 }
 
 /// `WOKWI_CLI_TOKEN`, else the one `ter install wokwi-cli` stored.
