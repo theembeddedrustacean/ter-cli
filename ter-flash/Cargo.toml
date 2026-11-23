@@ -10,7 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-serialport = "4.10"
+serialport = { version = "4.10", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true

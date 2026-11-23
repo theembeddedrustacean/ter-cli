@@ -53,7 +53,7 @@ zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] 
 [dev-dependencies]
 tempfile.workspace = true
 wiremock.workspace = true
-serialport = "4.10"
+serialport = { version = "4.10", default-features = false }
 
 [lints]
 workspace = true

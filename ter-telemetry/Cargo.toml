@@ -11,7 +11,7 @@ homepage.workspace = true
 
 [dependencies]
 ter-flash.workspace = true
-serialport = "4.10"
+serialport = { version = "4.10", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 

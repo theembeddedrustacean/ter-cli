@@ -12,7 +12,6 @@ cargo install ter-cli
 ```
 
 ter needs Rust 1.98 or newer, so run `rustup update` first.
-On Debian and Ubuntu, also install `pkg-config libudev-dev`.
 
 ## Quick start
 
