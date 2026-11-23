@@ -135,8 +135,9 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
         /// Also answer a lesson page served from http://localhost:8080 (a
-        /// development copy of the site). Without it only the TER Learn
-        /// site's own lesson page can start a run.
+        /// development copy of the site). Without it only the lesson page
+        /// of the site this ter is set to (TER Learn, unless the config
+        /// says otherwise) can start a run.
         #[arg(long)]
         dev: bool,
         /// Also share the board on this machine as a bench: register it on

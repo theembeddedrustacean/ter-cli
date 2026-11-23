@@ -9,7 +9,10 @@
 //!
 //! Only the lesson page's origin gets an answer a browser will read (and
 //! the fork's dev server, when `ter serve --dev` asks for it), and any
-//! other origin is refused before anything runs: a POST from an unknown
+//! other origin is refused before anything runs. The lesson page's origin
+//! is that of the site this ter is set to talk to, the one its runs are
+//! posted to: a ter set to another copy of the site answers that copy's
+//! page and not the live one's. Refusing comes first because a POST from an unknown
 //! page must not build or post, whatever CORS lets it read. A `/run` with
 //! no `Origin` at all is refused too: every browser sends one on a
 //! cross-origin POST, so a request without it is not the lesson page. A
@@ -30,8 +33,17 @@ use axum::routing::{get, post};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-/// The lesson page on the site.
-pub const SITE_ORIGIN: &str = "https://learn.theembeddedrustacean.com";
+/// The origin a browser sends for a page on the site at `site_url`: scheme,
+/// host and port (left out when it is the scheme's own), with no path and
+/// no trailing slash. `None` when the address is not an http or https one.
+pub fn origin_of(site_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(site_url.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
 /// The fork's dev server: trusted only when `ter serve --dev` says so, since
 /// anything a learner runs on that port would otherwise count as the page.
 pub const DEV_ORIGIN: &str = "http://localhost:8080";
@@ -248,28 +260,34 @@ pub fn editable(path: &str) -> bool {
 struct Ctx {
     service: Arc<dyn Service>,
     port: u16,
-    /// Whether [`DEV_ORIGIN`] is trusted next to the site.
-    dev: bool,
+    /// The origins that may start a run: the site's lesson page, and
+    /// [`DEV_ORIGIN`] under `--dev`.
+    origins: Arc<[String]>,
 }
 
 impl Ctx {
-    fn origins(&self) -> &'static [&'static str] {
-        if self.dev {
-            &[SITE_ORIGIN, DEV_ORIGIN]
-        } else {
-            &[SITE_ORIGIN]
-        }
+    fn origins(&self) -> &[String] {
+        &self.origins
     }
 
     fn allowed_origin(&self, origin: &str) -> bool {
-        self.origins().contains(&origin)
+        self.origins.iter().any(|o| o == origin)
     }
 }
 
-/// The routes, behind the origin and host guards. `dev` also trusts the
-/// fork's dev server.
-pub fn router(service: Arc<dyn Service>, port: u16, dev: bool) -> Router {
-    let ctx = Ctx { service, port, dev };
+/// The routes, behind the origin and host guards. `site_origin` is the
+/// lesson page's origin ([`origin_of`] the site this ter talks to); `dev`
+/// also trusts the fork's dev server.
+pub fn router(service: Arc<dyn Service>, port: u16, site_origin: &str, dev: bool) -> Router {
+    let mut origins = vec![site_origin.to_string()];
+    if dev && site_origin != DEV_ORIGIN {
+        origins.push(DEV_ORIGIN.to_string());
+    }
+    let ctx = Ctx {
+        service,
+        port,
+        origins: origins.into(),
+    };
     Router::new()
         .route("/health", get(health))
         .route("/", get(health))
@@ -412,15 +430,17 @@ async fn guard(State(ctx): State<Ctx>, request: Request, next: Next) -> Response
     response
 }
 
-/// Serve on `listener` until the process ends. `dev` also trusts the
-/// fork's dev server.
+/// Serve on `listener` until the process ends, for the lesson page on
+/// `site_origin`. `dev` also trusts the fork's dev server.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     service: Arc<dyn Service>,
+    site_origin: &str,
     dev: bool,
 ) -> std::io::Result<()> {
     let port = listener.local_addr()?.port();
-    let app = router(service, port, dev).layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT));
+    let app = router(service, port, site_origin, dev)
+        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT));
     axum::serve(listener, app).await
 }
 
@@ -453,13 +473,22 @@ mod tests {
         app_with(answer, false)
     }
 
-    /// As `ter serve --dev` when `dev`.
+    /// As `ter serve --dev` when `dev`, set to the live site.
     fn app_with(answer: Result<Value, ServeError>, dev: bool) -> (Router, Arc<Fake>) {
+        app_for(answer, SITE_ORIGIN, dev)
+    }
+
+    /// As a ter set to the site whose lesson page is on `site_origin`.
+    fn app_for(
+        answer: Result<Value, ServeError>,
+        site_origin: &str,
+        dev: bool,
+    ) -> (Router, Arc<Fake>) {
         let fake = Arc::new(Fake {
             asked: Mutex::new(Vec::new()),
             answer,
         });
-        (router(fake.clone(), PORT, dev), fake)
+        (router(fake.clone(), PORT, site_origin, dev), fake)
     }
 
     fn req(method: &str, path: &str, origin: Option<&str>, body: &str) -> Request {
@@ -485,7 +514,11 @@ mod tests {
         (status, headers, v)
     }
 
+    /// The live site's lesson page.
+    const SITE_ORIGIN: &str = "https://learn.theembeddedrustacean.com";
     const SITE: &str = SITE_ORIGIN;
+    /// Another copy of the site (a made-up host).
+    const OTHER: &str = "https://staging.learn.example";
     const BODY: &str = r#"{"exercise_id": "gpio-blinky--xiao-esp32c3-nostd",
         "files": [{"path": "src/bin/main.rs", "content": "fn main() {}"}]}"#;
 
@@ -554,6 +587,90 @@ mod tests {
         let (status, h, _) = send(&app, req("POST", "/run", Some(SITE), BODY)).await;
         assert_eq!(status, StatusCode::OK, "the site still runs");
         assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], SITE);
+    }
+
+    #[tokio::test]
+    async fn a_ter_set_to_another_site_answers_that_sites_page_and_not_the_live_one() {
+        for dev in [false, true] {
+            let (app, fake) = app_for(Ok(json!({"check_status": "passed"})), OTHER, dev);
+            let mut r = req("OPTIONS", "/run", Some(OTHER), "");
+            r.headers_mut().insert(
+                "access-control-request-private-network",
+                HeaderValue::from_static("true"),
+            );
+            let (status, h, _) = send(&app, r).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "dev {dev}");
+            assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], OTHER);
+            assert_eq!(h["access-control-allow-private-network"], "true");
+            let (status, h, v) = send(&app, req("POST", "/run", Some(OTHER), BODY)).await;
+            assert_eq!(status, StatusCode::OK, "dev {dev}");
+            assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], OTHER);
+            assert_eq!(v["check_status"], "passed");
+            assert_eq!(fake.asked.lock().unwrap().len(), 1);
+
+            for (method, body) in [("POST", BODY), ("OPTIONS", "")] {
+                let (status, h, v) = send(&app, req(method, "/run", Some(SITE), body)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method}, dev {dev}");
+                assert_eq!(v["error"]["code"], "origin_refused");
+                let said = v["error"]["message"].as_str().unwrap();
+                assert!(said.contains(OTHER), "says which page it answers: {said}");
+                assert!(!said.contains(SITE), "{said}");
+                assert!(h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+            }
+            let (status, _, _) = send(&app, req("GET", "/health", Some(SITE), "")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(fake.asked.lock().unwrap().len(), 1, "nothing more ran");
+
+            // The dev server follows --dev, whatever the site.
+            let (status, h, _) = send(&app, req("POST", "/run", Some(DEV_ORIGIN), BODY)).await;
+            if dev {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], DEV_ORIGIN);
+            } else {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert!(h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+            }
+
+            // The other guards hold as they do for the live site.
+            let (status, _, v) = send(&app, req("POST", "/run", None, BODY)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(v["error"]["code"], "origin_refused");
+            let mut r = req("POST", "/run", Some(OTHER), BODY);
+            r.headers_mut()
+                .insert("host", HeaderValue::from_static("staging.learn.example"));
+            let (status, _, v) = send(&app, r).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(v["error"]["code"], "host_refused");
+        }
+    }
+
+    #[test]
+    fn a_sites_origin_is_its_scheme_host_and_port() {
+        for (site, origin) in [
+            (SITE_ORIGIN, SITE_ORIGIN),
+            ("https://learn.theembeddedrustacean.com/", SITE_ORIGIN),
+            ("https://Staging.Learn.Example/app/lms?x=1#y", OTHER),
+            ("https://staging.learn.example:443", OTHER),
+            (
+                "https://staging.learn.example:8443/",
+                "https://staging.learn.example:8443",
+            ),
+            ("https://user:secret@staging.learn.example/", OTHER),
+            ("http://127.0.0.1:8000/", "http://127.0.0.1:8000"),
+            ("http://localhost:80", "http://localhost"),
+            (" http://localhost:8080 ", DEV_ORIGIN),
+        ] {
+            assert_eq!(origin_of(site).as_deref(), Some(origin), "{site}");
+        }
+        for not_a_site in [
+            "",
+            "staging.learn.example",
+            "file:///tmp/site",
+            "ftp://x.example",
+            "https://",
+        ] {
+            assert_eq!(origin_of(not_a_site), None, "{not_a_site:?}");
+        }
     }
 
     #[tokio::test]

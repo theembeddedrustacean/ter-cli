@@ -263,7 +263,9 @@ impl Machine {
             .unwrap_or_else(|| panic!("{line}"))
             .to_string();
         let mut banner = line.clone();
-        let lines = if extra.contains(&"--share") { 3 } else { 1 };
+        // The mock site is not the live one, so the banner says which page
+        // is answered: one line more than a learner sees.
+        let lines = if extra.contains(&"--share") { 4 } else { 2 };
         for _ in 0..lines {
             let mut more = String::new();
             stdout.read_line(&mut more).unwrap();
@@ -273,6 +275,7 @@ impl Machine {
             stdin: child.stdin.take(),
             child,
             url,
+            page: site.trim_end_matches('/').to_string(),
             banner,
             _stdout: stdout,
         }
@@ -460,6 +463,8 @@ impl Machine {
 struct Served {
     child: std::process::Child,
     url: String,
+    /// The origin of the lesson page it answers: the mock site's.
+    page: String,
     /// What it printed on start.
     banner: String,
     stdin: Option<std::process::ChildStdin>,
@@ -479,7 +484,7 @@ impl Served {
     async fn run(&self, body: Value) -> (u16, reqwest::header::HeaderMap, Value) {
         let r = reqwest::Client::new()
             .post(format!("{}/run", self.url))
-            .header("origin", PAGE)
+            .header("origin", &self.page)
             .json(&body)
             .send()
             .await
@@ -490,7 +495,8 @@ impl Served {
     }
 }
 
-const PAGE: &str = "https://learn.theembeddedrustacean.com";
+/// The live site's lesson page, which a ter set to the mock site refuses.
+const LIVE_PAGE: &str = "https://learn.theembeddedrustacean.com";
 
 fn ok(v: Value) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({ "message": v }))
@@ -1639,13 +1645,13 @@ async fn serve_runs_the_pages_files_and_answers_with_the_posted_run() {
 
     let health = reqwest::Client::new()
         .get(format!("{}/health", served.url))
-        .header("origin", PAGE)
+        .header("origin", &served.page)
         .send()
         .await
         .unwrap();
     assert_eq!(
         health.headers()["access-control-allow-origin"],
-        PAGE,
+        served.page.as_str(),
         "the page can read it"
     );
     let health: Value = health.json().await.unwrap();
@@ -1657,7 +1663,7 @@ async fn serve_runs_the_pages_files_and_answers_with_the_posted_run() {
         .await;
 
     assert_eq!(status, 200, "{v}");
-    assert_eq!(headers["access-control-allow-origin"], PAGE);
+    assert_eq!(headers["access-control-allow-origin"], served.page.as_str());
     assert_eq!(v["name"], "r-0001");
     assert_eq!(v["site"]["attempt"], 3);
     assert_eq!(v["mode"], "simulation", "the editor is the simulation path");
@@ -1720,7 +1726,7 @@ async fn serve_refuses_a_page_signed_in_as_someone_else() {
     assert_eq!(status, 403);
     assert_eq!(v["error"]["code"], "wrong_account", "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains(USER));
-    assert_eq!(headers["access-control-allow-origin"], PAGE);
+    assert_eq!(headers["access-control-allow-origin"], served.page.as_str());
     assert!(posted(&server, "run").await.is_empty());
     assert_eq!(
         std::fs::read_to_string(m.exercise().join("src/main.rs")).unwrap(),
@@ -1755,6 +1761,53 @@ async fn serve_refuses_any_other_origin() {
     assert_eq!(
         std::fs::read_to_string(m.exercise().join("src/main.rs")).unwrap(),
         GOOD
+    );
+}
+
+#[tokio::test]
+async fn serve_answers_the_page_of_the_site_it_is_set_to_and_not_the_live_one() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]);
+    let served = m.serve(&server.uri());
+    assert!(
+        served.banner.contains(&format!(
+            "only a lesson page on {} can start runs here",
+            served.page
+        )),
+        "{}",
+        served.banner
+    );
+
+    let health = reqwest::Client::new()
+        .get(format!("{}/health", served.url))
+        .header("origin", &served.page)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status().as_u16(), 200);
+    assert_eq!(
+        health.headers()["access-control-allow-origin"],
+        served.page.as_str()
+    );
+
+    let r = reqwest::Client::new()
+        .post(format!("{}/run", served.url))
+        .header("origin", LIVE_PAGE)
+        .json(&json!({"exercise_id": EXERCISE, "files": page_files(&m, BROKEN)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+    assert!(r.headers().get("access-control-allow-origin").is_none());
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "origin_refused");
+    let said = v["error"]["message"].as_str().unwrap();
+    assert!(said.contains(&served.page), "{said}");
+    assert!(posted(&server, "run").await.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(m.exercise().join("src/main.rs")).unwrap(),
+        GOOD,
+        "nothing written"
     );
 }
 
@@ -2256,7 +2309,7 @@ async fn health_lists_the_venues_a_page_can_ask_for() {
     let served = m.serve(&server.uri());
     let health: Value = reqwest::Client::new()
         .get(format!("{}/health", served.url))
-        .header("origin", PAGE)
+        .header("origin", &served.page)
         .send()
         .await
         .unwrap()

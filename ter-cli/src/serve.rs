@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use ter_check::CheckFile;
-use ter_remote::serve::{RunFuture, RunRequest, ServeError, Service, editable};
+use ter_remote::serve::{RunFuture, RunRequest, ServeError, Service, editable, origin_of};
 use ter_sdk::project::TerToml;
 
 use crate::config::Config;
@@ -281,10 +281,19 @@ pub async fn serve(
     share: Option<ShareFlags>,
     json: bool,
 ) -> Result<(), CliError> {
-    let port = match port {
-        Some(p) => p,
-        None => Config::load()?.serve_port,
-    };
+    let config = Config::load()?;
+    let port = port.unwrap_or(config.serve_port);
+    // The lesson page is on the site this ter posts its runs to.
+    let page = origin_of(&config.site_url).ok_or_else(|| {
+        CliError::new(
+            "config_error",
+            format!(
+                "The site address {:?} is not an http or https address, so ter serve cannot tell which lesson page to answer.",
+                config.site_url
+            ),
+        )
+    })?;
+    let elsewhere = origin_of(ter_sdk::DEFAULT_SITE_URL).is_some_and(|live| live != page);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|e| {
@@ -338,12 +347,19 @@ pub async fn serve(
         });
         format!(
             "{}\n",
-            json!({"url": url, "port": bound, "dev": dev, "bench": bench})
+            json!({"url": url, "port": bound, "page": page, "dev": dev, "bench": bench})
         )
     } else {
         let mut b = format!(
             "ter serve on {url}, {who}\nThe lesson page's Run button builds here. Stop with Ctrl-C.\n"
         );
+        if elsewhere {
+            b.push_str(&format!(
+                "This ter is set to the site {}: only a lesson page on {page} can start runs here, not one on {}.\n",
+                config.site_url,
+                ter_sdk::DEFAULT_SITE_URL
+            ));
+        }
         if dev {
             b.push_str(&format!(
                 "--dev: a lesson page on {} can start runs here too.\n",
@@ -367,7 +383,7 @@ pub async fn serve(
     }
 
     let service = Arc::new(Serve(Arc::new(Inner { turn })));
-    ter_remote::serve::serve(listener, service, dev)
+    ter_remote::serve::serve(listener, service, &page, dev)
         .await
         .map_err(|e| CliError::new("io_error", format!("ter serve stopped: {e}")))
 }

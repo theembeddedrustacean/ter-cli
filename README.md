@@ -54,8 +54,9 @@ also takes `--json`.
 ## Good to know
 
 - `ter serve` only takes runs from the lesson page on
-  learn.theembeddedrustacean.com. `ter serve --dev` also trusts a copy of
-  the site served from `http://localhost:8080`.
+  learn.theembeddedrustacean.com (or on the site its config names, if you
+  set another). `ter serve --dev` also trusts a copy of the site served
+  from `http://localhost:8080`.
 - Sharing a bench lets whoever has the code flash their own firmware onto
   your board. Firmware can burn eFuses, which cannot be undone, and can
   short pins against whatever is wired to them. Share only with people you
