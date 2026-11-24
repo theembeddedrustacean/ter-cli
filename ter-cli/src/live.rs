@@ -111,17 +111,14 @@ impl Live {
         let _ = self.events.send(LiveEvent { name, data });
     }
 
-    /// The run's events from now on. Nothing from before is sent again,
-    /// except that a run already over says so.
-    pub fn listen(self: &Arc<Self>) -> LiveEvents {
+    /// The run's events from now on; nothing from before is sent again.
+    /// `None` once the run is over: a browser reconnects a closed stream
+    /// by itself, and must then be told there is nothing left to follow.
+    pub fn listen(self: &Arc<Self>) -> Option<LiveEvents> {
         let (tx, rx) = mpsc::channel(256);
         let mut state = self.state();
-        if let Some(data) = &state.ended {
-            let _ = tx.try_send(LiveEvent {
-                name: "ended",
-                data: data.clone(),
-            });
-            return rx;
+        if state.ended.is_some() {
+            return None;
         }
         state.listeners += 1;
         let mut from = self.events.subscribe();
@@ -149,7 +146,7 @@ impl Live {
             state.listeners -= 1;
             state.alone_since = Instant::now();
         });
-        rx
+        Some(rx)
     }
 
     /// Let the run go on `add_s` seconds longer; the new end, in Unix ms.
@@ -338,7 +335,7 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
         stop,
         over,
     });
-    let first = live.listen();
+    let first = live.listen().expect("a run that has just started");
     tokio::spawn(
         Drive {
             live: live.clone(),

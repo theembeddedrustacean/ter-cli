@@ -1189,6 +1189,20 @@ mod tests {
             assert_eq!(v["error"]["code"], "not_found");
         }
 
+        // The browser asks first, as for /run: every /live path answers.
+        for path in ["/live/l1/events", "/live/l1/extend", "/live/l1/stop"] {
+            let mut r = req("OPTIONS", path, Some(SITE), "");
+            r.headers_mut().insert(
+                "access-control-request-private-network",
+                HeaderValue::from_static("true"),
+            );
+            let (status, h, _) = send(&app, r).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{path}");
+            assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], SITE);
+            assert_eq!(h[header::ACCESS_CONTROL_ALLOW_HEADERS], "Content-Type");
+            assert_eq!(h["access-control-allow-private-network"], "true");
+        }
+
         // Another page, or no page at all, gets nothing and stops nothing.
         for origin in [Some(OTHER), None] {
             for (method, path) in [("GET", "/live/l1/events"), ("POST", "/live/l1/stop")] {

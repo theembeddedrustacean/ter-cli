@@ -2643,6 +2643,18 @@ impl LiveStream {
 }
 
 impl Served {
+    /// The status `/live/<id>/events` answers the lesson page with.
+    async fn live_status(&self, id: &str) -> u16 {
+        reqwest::Client::new()
+            .get(format!("{}/live/{id}/events", self.url))
+            .header("origin", &self.page)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
     async fn live_post(&self, id: &str, what: &str, body: Value) -> (u16, Value) {
         let r = reqwest::Client::new()
             .post(format!("{}/live/{id}/{what}", self.url))
@@ -2734,9 +2746,9 @@ async fn serve_shows_a_sim86_run_live_and_stops_it_when_told() {
     assert_eq!(events.next().await, None, "the stream closes after ended");
     assert_eq!(m.sim86_saw("got-stop").trim(), "stop");
 
-    // Over: a page that reconnects is told so, and it cannot be extended.
-    let mut late = LiveStream::open(&served, &id).await;
-    assert_eq!(late.next().await.unwrap().0, "ended");
+    // Over: a browser that reconnects the closed stream by itself gets no
+    // new one, and the run cannot be extended.
+    assert_eq!(served.live_status(&id).await, 404);
     let (status, v) = served.live_post(&id, "extend", json!({"add_s": 60})).await;
     assert_eq!(
         (status, v["error"]["code"].as_str()),
@@ -2826,9 +2838,13 @@ async fn a_live_run_nobody_watches_is_stopped_and_a_new_run_replaces_the_one_bef
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(stopped(), "the run was left going with no listener");
-    let mut events = LiveStream::open(&served, &first).await;
-    let (ended, _) = events.until("ended").await;
-    assert_eq!(ended["reason"], "page-gone");
+    for _ in 0..50 {
+        if served.live_status(&first).await == 404 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(served.live_status(&first).await, 404, "the run is over");
     // It ran long enough to be judged, so it is posted as any run.
     assert_eq!(posted(&server, "run").await.len(), 1);
 

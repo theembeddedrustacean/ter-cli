@@ -142,7 +142,7 @@ impl Service for Serve {
     }
 
     fn live_events(&self, id: &str) -> Option<LiveEvents> {
-        self.0.live(id).map(|live| live.listen())
+        self.0.live(id).and_then(|live| live.listen())
     }
 
     fn live_extend(&self, id: &str, add_s: u64) -> Result<Value, ServeError> {
