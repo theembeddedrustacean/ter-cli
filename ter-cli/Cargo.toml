@@ -27,7 +27,7 @@ ter-telemetry.workspace = true
 ter-flash.workspace = true
 ter-gen.workspace = true
 ter-remote = { path = "../ter-remote", version = "0.1.7" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "process", "signal", "time"] }
 toml.workspace = true
 webbrowser.workspace = true
 keyring-core = "1"

@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -109,13 +110,29 @@ cp "$1" "$here/got-helper.py"
 case "$2" in
   version)
     key=false; [ -f "$here/has-key" ] && key=true
-    echo "{\"helper\": 2, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"0.1.4\", \"key\": $key}" ;;
+    echo "{\"helper\": 3, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"0.1.4\", \"key\": $key}" ;;
   balance) cat "$here/balance.json" ;;
   run)
     cp "$3" "$here/got-request.json"
     echo "$SIM86_TELEMETRY" > "$here/got-telemetry"
     echo "sim86: waiting" >&2
     cat "$here/run.json" ;;
+  live)
+    # The run starts, and a second later does what live.jsonl says. Then
+    # it runs until ter says stop or goes away, unless live-ends has it
+    # end by itself.
+    cp "$3" "$here/got-live-request.json"
+    echo '{"ev": "started", "run": "sim86-run-1"}'
+    sleep 1
+    cat "$here/live.jsonl"
+    if [ -f "$here/live-ends" ]; then
+      cat "$here/live-ends"
+    else
+      read -r word
+      echo "${word:-gone}" >> "$here/got-stop"
+      echo '{"ev": "ended", "reason": "stopped"}'
+    fi
+    echo '{"helper": 3, "ok": true, "run": "sim86-run-1"}' ;;
 esac
 "#;
 
@@ -309,10 +326,15 @@ impl Machine {
     /// `ter serve --port 0 <extra>`, with its standard input kept open for
     /// the kill switch and its banner read.
     fn serve_with(&self, site: &str, extra: &[&str]) -> Served {
-        use std::io::BufRead;
         let mut args = vec!["serve", "--port", "0"];
         args.extend_from_slice(extra);
-        let mut cmd = self.command(site, &args, self.courses.path());
+        let cmd = self.command(site, &args, self.courses.path());
+        self.serve_from(cmd, site, extra)
+    }
+
+    /// `cmd` is a `ter serve` of this machine, started with `extra`.
+    fn serve_from(&self, mut cmd: Command, site: &str, extra: &[&str]) -> Served {
+        use std::io::BufRead;
         let mut child = {
             let _spawning = SPAWN.read().unwrap();
             cmd.stdin(std::process::Stdio::piped())
@@ -2518,6 +2540,423 @@ async fn serve_runs_on_sim86_when_the_page_names_it() {
     assert_eq!(v["events_end_us"], 5_500_000);
     assert!(v.get("events_cut").is_none(), "{v}");
     assert!(!v.to_string().contains(SIM86_KEY));
+}
+
+/// What sim86 does in a live run of the heartbeat, as the helper prints
+/// it: two pin changes, a serial line, then the check's window read back.
+#[cfg(unix)]
+fn live_blinky() -> String {
+    let recorded = sim86_fixture("blinky.json");
+    format!(
+        "{}\n{}\n{}\n{{\"ev\": \"recording\", {}\n",
+        r#"{"ev": "pin", "t_ns": 0, "net": "mcu.D1", "level": 0}"#,
+        r#"{"ev": "pin", "t_ns": 143324763, "net": "mcu.D1", "level": 1}"#,
+        r#"{"ev": "serial", "t_ms": 12.0, "source": "mcu:uart0", "line": "hello"}"#,
+        &recorded.trim()[1..]
+    )
+}
+
+/// The heartbeat exercise on a sim86 board, with a stand-in for sim86
+/// whose live run prints `live`.
+#[cfg(unix)]
+fn live_machine(main_rs: &str, live: &str) -> Machine {
+    let m = Machine::with_exercise(main_rs, &["hardware", "simulation"]).on_sim86(
+        SIM86_HEARTBEAT_CHECK,
+        SIM86_UFERRIS,
+        SIM86_UFERRIS_PINS,
+        "blinky.json",
+    );
+    let mut ter = std::fs::read_to_string(m.exercise().join("ter.toml")).unwrap();
+    ter.push_str("\n[pins]\nuser_led = \"GPIO3\"\n");
+    std::fs::write(m.exercise().join("ter.toml"), ter).unwrap();
+    std::fs::write(m.sim86_bin().join("live.jsonl"), live).unwrap();
+    m
+}
+
+/// A live run's event stream, as the lesson page reads it.
+struct LiveStream {
+    response: reqwest::Response,
+    text: String,
+}
+
+impl LiveStream {
+    async fn open(served: &Served, id: &str) -> Self {
+        let response = reqwest::Client::new()
+            .get(format!("{}/live/{id}/events", served.url))
+            .header("origin", &served.page)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            served.page.as_str()
+        );
+        Self {
+            response,
+            text: String::new(),
+        }
+    }
+
+    /// The next event (its name and its one JSON object), or `None` when
+    /// the stream has closed.
+    async fn next(&mut self) -> Option<(String, Value)> {
+        loop {
+            if let Some(end) = self.text.find("\n\n") {
+                let block: String = self.text.drain(..end + 2).collect();
+                let field = |name: &str| {
+                    block
+                        .lines()
+                        .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+                };
+                match (field("event:"), field("data:")) {
+                    (Some(name), Some(data)) => {
+                        return Some((name, serde_json::from_str(&data).unwrap()));
+                    }
+                    // A keep-alive comment.
+                    _ => continue,
+                }
+            }
+            let chunk = tokio::time::timeout(Duration::from_secs(30), self.response.chunk())
+                .await
+                .expect("an event within 30 s")
+                .unwrap()?;
+            self.text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+
+    /// The next event named `name`, and the names of those before it.
+    async fn until(&mut self, name: &str) -> (Value, Vec<String>) {
+        let mut before = Vec::new();
+        loop {
+            let (got, data) = self
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("the stream closed before {name}: {before:?}"));
+            if got == name {
+                return (data, before);
+            }
+            before.push(got);
+        }
+    }
+}
+
+impl Served {
+    async fn live_post(&self, id: &str, what: &str, body: Value) -> (u16, Value) {
+        let r = reqwest::Client::new()
+            .post(format!("{}/live/{id}/{what}", self.url))
+            .header("origin", &self.page)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        (r.status().as_u16(), r.json().await.unwrap())
+    }
+}
+
+fn live_ask(limit_s: u64) -> Value {
+    json!({"exercise_id": EXERCISE, "mode": "simulation", "venue": "sim86",
+           "live": {"limit_s": limit_s}})
+}
+
+/// The page asks for a live run: `/run` answers as soon as the board runs,
+/// the events come as sim86 gives them, the checks are judged from the
+/// recording and posted while the board runs on, and Stop ends the run.
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_shows_a_sim86_run_live_and_stops_it_when_told() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = live_machine(GOOD, &live_blinky());
+    let served = m.serve(&server.uri());
+    assert_eq!(health_of(&served).await["live"], true);
+
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["sim86_run"], "sim86-run-1", "{v}");
+    let started_at = v["started_at"].as_u64().unwrap();
+    assert!(started_at >= before, "{v}");
+    assert_eq!(v["ends_at"].as_u64().unwrap(), started_at + 60_000);
+    assert!(v.get("check_status").is_none(), "not a run record: {v}");
+    assert!(
+        posted(&server, "run").await.is_empty(),
+        "nothing is posted yet"
+    );
+    let id = v["live"].as_str().unwrap().to_string();
+
+    let mut events = LiveStream::open(&served, &id).await;
+    let (name, first) = events.next().await.unwrap();
+    assert_eq!(name, "pin");
+    assert_eq!(
+        first,
+        json!({"t_ms": 0.0, "pin": "GPIO3", "name": "user_led", "net": "mcu.D1", "level": 0})
+    );
+    let (_, edge) = events.next().await.unwrap();
+    assert_eq!(
+        (&edge["t_ms"], &edge["level"]),
+        (&json!(143.324763), &json!(1))
+    );
+    assert_eq!(
+        events.next().await.unwrap(),
+        ("serial".to_string(), json!({"t_ms": 12.0, "line": "hello"}))
+    );
+
+    // The checks: the run record `/run` answers with for the same run.
+    let (checks, _) = events.until("checks").await;
+    assert_eq!(checks["check_status"], "passed", "{checks}");
+    assert_eq!(checks["venue"], "sim86");
+    assert!(
+        checks["verdicts"].is_array() && checks["name"].is_string(),
+        "{checks}"
+    );
+    assert_eq!(checks["events_end_us"], 5_500_000);
+    let runs = posted(&server, "run").await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["payload"]["check_status"], "passed");
+    // sim86 got no time limit of its own, only the stop of last resort.
+    let asked: Value = serde_json::from_str(&m.sim86_saw("got-live-request.json")).unwrap();
+    assert!(asked.get("duration_ms").is_none(), "{asked}");
+    assert_eq!(asked["realtime_ms"], 660_000);
+    assert_eq!(asked["watch"], json!(["mcu.D1"]));
+
+    // The run goes on after the checks, until the page stops it.
+    assert!(!m.sim86_bin().join("got-stop").exists());
+    assert_eq!(
+        served.live_post(&id, "stop", json!({})).await,
+        (200, json!({"ok": true}))
+    );
+    let (ended, _) = events.until("ended").await;
+    assert_eq!(ended, json!({"reason": "user-stop", "detail": ""}));
+    assert_eq!(events.next().await, None, "the stream closes after ended");
+    assert_eq!(m.sim86_saw("got-stop").trim(), "stop");
+
+    // Over: a page that reconnects is told so, and it cannot be extended.
+    let mut late = LiveStream::open(&served, &id).await;
+    assert_eq!(late.next().await.unwrap().0, "ended");
+    let (status, v) = served.live_post(&id, "extend", json!({"add_s": 60})).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (409, Some("ended")),
+        "{v}"
+    );
+    assert_eq!(posted(&server, "run").await.len(), 1, "posted once");
+    assert!(!v.to_string().contains(SIM86_KEY));
+}
+
+/// ter holds the limit: the run ends when its time is up, a minute at a
+/// time more when the page extends it, and never past ten minutes.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_live_run_ends_at_its_limit_which_the_page_can_extend_up_to_the_cap() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = live_machine(GOOD, &live_blinky());
+    let served = m.serve(&server.uri());
+
+    let (status, _, v) = served.run(live_ask(3)).await;
+    assert_eq!(status, 200, "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let (started_at, ends_at) = (
+        v["started_at"].as_u64().unwrap(),
+        v["ends_at"].as_u64().unwrap(),
+    );
+    assert_eq!(ends_at, started_at + 3_000);
+    let mut events = LiveStream::open(&served, &id).await;
+
+    let (status, v) = served.live_post(&id, "extend", json!({"add_s": 2})).await;
+    assert_eq!((status, &v), (200, &json!({"ends_at": ends_at + 2_000})));
+    let (limit, _) = events.until("limit").await;
+    assert_eq!(limit, json!({"ends_at": ends_at + 2_000}));
+    // 5 s so far; 596 more would pass ten minutes.
+    let (status, v) = served.live_post(&id, "extend", json!({"add_s": 596})).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (409, Some("limit_cap")),
+        "{v}"
+    );
+    let (status, v) = served
+        .live_post(&id, "extend", json!({"add_s": "a minute"}))
+        .await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (400, Some("bad_request")),
+        "{v}"
+    );
+    let (status, v) = served.live_post("no-such-run", "stop", json!({})).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (404, Some("not_found")),
+        "{v}"
+    );
+
+    let (ended, before) = events.until("ended").await;
+    assert_eq!(ended["reason"], "limit", "{ended}");
+    assert!(before.contains(&"checks".to_string()), "{before:?}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(now >= ends_at + 2_000, "not before the extended limit");
+    assert_eq!(m.sim86_saw("got-stop").trim(), "stop");
+}
+
+/// A closed tab does not keep a run going, and a new run stops the one
+/// before it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_live_run_nobody_watches_is_stopped_and_a_new_run_replaces_the_one_before() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = live_machine(GOOD, &live_blinky());
+    let mut cmd = m.command(&server.uri(), &["serve", "--port", "0"], m.courses.path());
+    cmd.env("TER_LIVE_UNWATCHED_SECS", "2");
+    let served = m.serve_from(cmd, &server.uri(), &[]);
+
+    // Nobody listens.
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    let first = v["live"].as_str().unwrap().to_string();
+    let stopped = || m.sim86_bin().join("got-stop").exists();
+    for _ in 0..100 {
+        if stopped() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(stopped(), "the run was left going with no listener");
+    let mut events = LiveStream::open(&served, &first).await;
+    let (ended, _) = events.until("ended").await;
+    assert_eq!(ended["reason"], "page-gone");
+    // It ran long enough to be judged, so it is posted as any run.
+    assert_eq!(posted(&server, "run").await.len(), 1);
+
+    // A second run, watched; a third replaces it.
+    let (_, _, v) = served.run(live_ask(60)).await;
+    let second = v["live"].as_str().unwrap().to_string();
+    assert_ne!(second, first);
+    let (status, v) = served.live_post(&first, "stop", json!({})).await;
+    assert_eq!(status, 404, "the run before is gone: {v}");
+    let mut events = LiveStream::open(&served, &second).await;
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    assert_ne!(v["live"], json!(second));
+    let (ended, _) = events.until("ended").await;
+    assert_eq!(ended["reason"], "replaced");
+    let third = v["live"].as_str().unwrap().to_string();
+    assert_eq!(served.live_post(&third, "stop", json!({})).await.0, 200);
+}
+
+/// `ter run --sim sim86 --live`: the board's changes and what it prints,
+/// as they come, until the limit; then the verdicts, as `ter run` prints
+/// them, and the same exit status.
+#[cfg(unix)]
+#[tokio::test]
+async fn ter_run_live_prints_the_run_as_it_happens_then_the_verdicts() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = live_machine(GOOD, &live_blinky());
+
+    let o = m.ter_in(
+        &server.uri(),
+        &["run", "--sim", "sim86", "--live", "--limit", "3"],
+        &m.exercise(),
+    );
+
+    let (out, err) = (
+        String::from_utf8_lossy(&o.stdout).to_string(),
+        String::from_utf8_lossy(&o.stderr).to_string(),
+    );
+    assert!(o.status.success(), "{out}\n{err}");
+    let at = |what: &str| {
+        out.find(what)
+            .unwrap_or_else(|| panic!("no {what:?} in:\n{out}"))
+    };
+    assert!(
+        at("0.000 ms  GPIO3 low") < at("143.325 ms  GPIO3 high"),
+        "{out}"
+    );
+    assert!(
+        at("12.000 ms  | hello") < at("heartbeat"),
+        "the verdicts come last: {out}"
+    );
+    assert!(out.contains("Posted attempt"), "{out}");
+    assert!(err.contains("The run ended (limit)"), "{err}");
+    assert_eq!(m.sim86_saw("got-stop").trim(), "stop");
+    assert_eq!(posted(&server, "run").await.len(), 1);
+
+    // Live is sim86's: asked of Wokwi it is refused before the build.
+    let o = m.ter_in(&server.uri(), &["run", "--sim", "--live"], &m.exercise());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && err.contains("bad_request"), "{err}");
+    assert_eq!(posted(&server, "run").await.len(), 1);
+}
+
+/// A run that ends before the check's time is up is judged on what there
+/// was of it, and one sim86 never started answers `/run` as before.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_live_run_that_ends_early_is_still_judged_and_one_that_never_starts_is_a_run_record() {
+    let server = site("0.1.0", run_answer()).await;
+    // The board stops by itself 1.2 s in: two edges of the heartbeat.
+    let short = format!(
+        "{}\n",
+        r#"{"ev": "recording", "run": "sim86-run-1", "started_ns": 0, "paused_at_start": true, "end_ns": 1200000000, "pins": {"mcu.D1": {"initial": 0, "edges": [[143324763, 1], [243325813, 0]]}}, "serial": [], "applied": []}"#
+    );
+    let m = live_machine(GOOD, &short);
+    std::fs::write(
+        m.sim86_bin().join("live-ends"),
+        "{\"ev\": \"ended\", \"reason\": \"firmware-exit\"}\n",
+    )
+    .unwrap();
+    let served = m.serve(&server.uri());
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    let mut events = LiveStream::open(&served, v["live"].as_str().unwrap()).await;
+    let (checks, _) = events.until("checks").await;
+    assert_eq!(checks["events_end_us"], 1_200_000, "{checks}");
+    // Its windows were not over: the checks say what they saw of them.
+    assert_eq!(checks["check_status"], "failed", "{checks}");
+    assert_eq!(checks["build_status"], "passed");
+    assert!(
+        checks["verdicts"].is_array(),
+        "judged as far as it went: {checks}"
+    );
+    let (ended, _) = events.until("ended").await;
+    assert_eq!(
+        ended,
+        json!({"reason": "firmware-exit", "detail": "firmware-exit"})
+    );
+    drop(served);
+
+    // A build that fails: the run record, and no live run.
+    let m = live_machine(BROKEN, &live_blinky());
+    let served = m.serve(&server.uri());
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["build_status"], "failed", "{v}");
+    assert!(v.get("live").is_none(), "{v}");
+    assert!(!m.sim86_bin().join("got-live-request.json").exists());
+    drop(served);
+
+    // Live is sim86's for now: a Wokwi run asked for live is refused
+    // before anything is built, and a hardware one too.
+    let m = Machine::with_exercise(GOOD, &["simulation", "hardware"]);
+    std::fs::write(m.exercise().join("check.yaml"), SIM86_HEARTBEAT_CHECK).unwrap();
+    let served = m.serve(&server.uri());
+    for ask in [
+        json!({"exercise_id": EXERCISE, "live": {"limit_s": 60}}),
+        json!({"exercise_id": EXERCISE, "mode": "hardware", "live": {}}),
+        json!({"exercise_id": EXERCISE, "venue": "sim86", "live": {"limit_s": 601}}),
+    ] {
+        let (status, _, v) = served.run(ask).await;
+        assert_eq!(
+            (status, v["error"]["code"].as_str()),
+            (400, Some("bad_request")),
+            "{v}"
+        );
+    }
+    assert!(!m.exercise().join(".runs").exists(), "nothing was built");
 }
 
 /// A page that asks for sim86 where it cannot run is told why before

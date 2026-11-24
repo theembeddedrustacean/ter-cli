@@ -2,6 +2,8 @@
 """ter's helper for the sim86 simulator.
 
     ter_sim86.py run <request.json>    run a program and print the recording
+    ter_sim86.py live <request.json>   run a program until told to stop,
+                                       printing what it does as it runs
     ter_sim86.py balance               the account's plan and credits
     ter_sim86.py version               the sim86 package found and whether
                                        it has a key, no network
@@ -10,15 +12,24 @@ Prints exactly one JSON object on standard output, {"ok": true, ...} or
 {"ok": false, "error": {"kind": ..., "message": ...}}, and exits 0 either
 way: ter reads the object, never the exit code or any text.
 
+`live` prints one JSON object a line before that one, each with an "ev":
+"started" (the run exists, paused at 0, and now runs), "pin" and "serial"
+as they happen, "recording" once (the check's window in full, in the shape
+`run` answers with; or what there was of it when the run ends sooner) and
+"ended". It runs with no simulated-time limit and stops the run when it
+reads the line `stop` on standard input, or when standard input closes, so
+a ter that dies never leaves a run going.
+
 Written by `ter install sim86` next to the Python environment that holds
 the sim86 package, and rewritten by ter when it changes. Do not edit it.
 """
 import json
 import sys
+import threading
 import time
 import warnings
 
-HELPER = 2
+HELPER = 3
 
 # A trace comes back exact, every edge with its time, only while it has
 # few enough edges; past that it is a summary. A slice is cut to hold
@@ -28,6 +39,15 @@ EDGES_PER_SLICE = 600
 MIN_SLICE_NS = 1_000
 # How many reads one net may take before ter gives up on it.
 MAX_READS = 4_000
+
+# sim86 answers for at most this long a window at once.
+MAX_WINDOW_NS = 10_000_000_000
+# A live run: how long to wait between two looks at the nets, how far each
+# look reaches back over the one before, and how long past the check's end
+# the board runs before its window is read (as `run` does).
+POLL_S = 0.1
+OVERLAP_NS = 300_000_000
+TAIL_NS = 300_000_000
 
 LOW, HIGH = 1, 2
 
@@ -161,6 +181,20 @@ class Reader:
     def edges(self, whole):
         """`whole` is the trace of 0..end_ns from the one public read."""
         self.read(0, self.end_ns, self.trace(whole))
+        return self.joined()
+
+    def all(self):
+        """Every edge of 0..end_ns, read in windows sim86 answers for."""
+        a = 0
+        while a < self.end_ns:
+            b = min(self.end_ns, a + MAX_WINDOW_NS)
+            self.read(a, b)
+            a = b
+        return self.joined()
+
+    def joined(self):
+        if not self.leaves:
+            return {"initial": None, "edges": [], "reads": self.reads}
         initial = level_of(self.leaves[0][2].get("initialState"))
         level = initial
         seen = set()
@@ -189,12 +223,10 @@ class Reader:
         return {"initial": initial, "edges": out, "reads": self.reads}
 
 
-def record(request):
-    from sim86 import Client, Run, check_board, load_board
+def opened(request):
+    """The request's board with the program in it, and the client."""
+    from sim86 import Client, check_board, load_board
 
-    timeout_ms = int(request["timeout_ms"])
-    end_ns = timeout_ms * 1_000_000
-    watch = list(request.get("watch") or [])
     try:
         board = load_board(request["board"], firmware_overrides=request.get("firmware") or {})
     except Exception as e:  # noqa: BLE001 - a board file sim86 cannot read
@@ -204,6 +236,16 @@ def record(request):
     if problems:
         text = "; ".join(str(p) for p in problems)
         raise Failed("image" if "not a format" in text or "firmware" in text.lower() else "board", text)
+    return board, client
+
+
+def record(request):
+    from sim86 import Run
+
+    timeout_ms = int(request["timeout_ms"])
+    end_ns = timeout_ms * 1_000_000
+    watch = list(request.get("watch") or [])
+    board, client = opened(request)
 
     started = time.monotonic()
     with warnings.catch_warnings():
@@ -240,6 +282,176 @@ def record(request):
         answer["applied"] = [applied(frame) for frame in run.plan_events]
         answer["wall_s"] = round(time.monotonic() - started, 1)
         return answer
+    finally:
+        try:
+            run.stop()
+        except Exception:
+            pass
+
+
+OUT = threading.Lock()
+
+
+def say(event):
+    with OUT:
+        sys.stdout.write(json.dumps(event) + "\n")
+        sys.stdout.flush()
+
+
+class Told(threading.Thread):
+    """Sets `stop` when ter says so, or is no longer there to say it."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.stop = threading.Event()
+
+    def run(self):
+        try:
+            for line in sys.stdin:
+                if line.strip() == "stop":
+                    break
+        finally:
+            self.stop.set()
+
+
+class Tail:
+    """One net of a running board: each look says what changed since the
+    last one. A stretch too busy to come back edge by edge is not shown
+    (`whole` is then False); the recording reads it in slices."""
+
+    def __init__(self, pin):
+        self.pin = pin
+        self.to_ns = 0
+        self.last_ns = -1
+        self.level = None
+        self.begun = False
+        self.whole = True
+        self.initial = None
+        self.edges = []
+
+    def take(self, trace):
+        to_ns = int(trace.get("toNs") or 0)
+        need = max(0, self.to_ns - OVERLAP_NS)
+        exact = (
+            trace.get("mode") == "exact"
+            and not trace.get("buckets")
+            and int(trace.get("fromNs") or 0) <= need
+            and int(trace.get("exactFromNs") or 0) <= need
+            and int(trace.get("availableFromNs") or 0) <= need
+        )
+        if not exact:
+            # What comes next starts from a level the next look gives.
+            self.whole, self.level = False, None
+            self.to_ns = max(self.to_ns, to_ns)
+            return
+        if not self.begun:
+            self.begun = True
+            self.initial = self.level = level_of(trace.get("initialState"))
+            if self.level is not None:
+                say({"ev": "pin", "t_ns": 0, "net": self.pin, "level": self.level})
+        for edge in trace.get("edges") or []:
+            t = int(edge.get("timeNs", -1))
+            new = level_of(edge.get("state"))
+            if new is None or t <= self.last_ns or t > to_ns:
+                continue
+            self.last_ns = t
+            if new != self.level:
+                self.level = new
+                self.edges.append([t, new])
+                say({"ev": "pin", "t_ns": t, "net": self.pin, "level": new})
+        self.to_ns = max(self.to_ns, to_ns)
+
+
+def recording(run, watch, end_ns, pins):
+    return {
+        "ev": "recording",
+        "run": run.id,
+        "started_ns": 0,
+        "paused_at_start": True,
+        "end_ns": end_ns,
+        "pins": pins,
+        "serial": [[float(line.t), str(line.source), str(line.line)] for line in run.serial.lines],
+        "applied": [applied(frame) for frame in run.plan_events],
+    }
+
+
+def live(request):
+    from sim86 import Run, Sim86Error
+
+    end_ns = int(request["timeout_ms"]) * 1_000_000
+    watch = list(request.get("watch") or [])
+    board, client = opened(request)
+    # A board file may carry limits of its own, meant for sim86's command.
+    # ter holds a live run's limit: no simulated-time limit at all.
+    board.limits = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        run = Run.start(
+            board, client,
+            duration=None,
+            realtime=float(request["realtime_ms"]),
+            scenario=request.get("scenario") or None,
+            paused=True,
+        )
+    told = Told()
+    try:
+        halt = run.status()
+        if not halt.paused or halt.time_ns != 0:
+            raise Failed("not_paused", f"the recording starts {halt.time_ns / 1e6:.3f} ms in")
+        if watch:
+            run.watch(*watch)
+        say({"ev": "started", "run": run.id})
+        told.start()
+        run.resume()
+
+        tails = {pin: Tail(pin) for pin in watch}
+        lines_said = 0
+        recorded = False
+        now_ns = 0
+        looked = time.monotonic()
+        while True:
+            told.stop.wait(POLL_S)
+            stopping = told.stop.is_set()
+            try:
+                if run.ended is None:
+                    if stopping and not recorded:
+                        # Hold the board still, so what is read is all of it.
+                        run.pause()
+                    wall = time.monotonic()
+                    if watch:
+                        reach = int((wall - looked) * 1.5e9) + OVERLAP_NS + 500_000_000
+                        snapshot = run._observe(min(MAX_WINDOW_NS, reach))
+                        for wire in snapshot.get("wires", []):
+                            tail = tails.get(wire.get("id"))
+                            trace = wire.get("wireTrace")
+                            if tail is not None and isinstance(trace, dict) and "mode" in trace:
+                                tail.take(trace)
+                        now_ns = min(tail.to_ns for tail in tails.values())
+                    else:
+                        now_ns = run.status().time_ns
+                    looked = wall
+                lines = run.serial.lines
+                for line in lines[lines_said:]:
+                    say({"ev": "serial", "t_ms": float(line.t), "source": str(line.source), "line": str(line.line)})
+                lines_said = len(lines)
+                if not recorded and run.ended is None and (stopping or now_ns >= end_ns + TAIL_NS):
+                    upto = end_ns if now_ns >= end_ns else run.status().time_ns
+                    say(recording(run, watch, upto, {pin: Reader(run, pin, upto).all() for pin in watch}))
+                    recorded = True
+            except Sim86Error:
+                # A run that ended under a request is an ended run.
+                if run.ended is None:
+                    raise
+            if stopping or run.ended is not None:
+                break
+        if not recorded and all(tail.whole and tail.begun for tail in tails.values()):
+            # The run ended by itself before the check's time was up: what
+            # the looks saw, up to the last one.
+            pins = {pin: {"initial": tail.initial, "edges": tail.edges} for pin, tail in tails.items()}
+            say(recording(run, watch, min(now_ns, end_ns), pins))
+        ended = run.ended
+        say({"ev": "ended", "reason": "stopped" if ended in (None, "disconnected") else str(ended)})
+        return {"run": run.id}
     finally:
         try:
             run.stop()
@@ -288,12 +500,15 @@ def main(argv):
         if mode == "run" and len(argv) > 2:
             with open(argv[2], encoding="utf-8") as f:
                 out.update(record(json.load(f)))
+        elif mode == "live" and len(argv) > 2:
+            with open(argv[2], encoding="utf-8") as f:
+                out.update(live(json.load(f)))
         elif mode == "balance":
             out.update(balance())
         elif mode == "version":
             out["key"] = has_key()
         else:
-            raise Failed("internal", "usage: ter_sim86.py run <request.json> | balance | version")
+            raise Failed("internal", "usage: ter_sim86.py run <request.json> | live <request.json> | balance | version")
         out["ok"] = True
     except Failed as e:
         out["error"] = {"kind": e.kind, "message": e.message}
@@ -307,8 +522,7 @@ def main(argv):
         except ImportError:
             pass
         out["error"] = {"kind": kind, "message": f"{e}" or type(e).__name__}
-    sys.stdout.write(json.dumps(out) + "\n")
-    sys.stdout.flush()
+    say(out)
     return 0
 
 

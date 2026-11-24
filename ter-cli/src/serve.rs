@@ -19,8 +19,15 @@
 //! simulator. `/health` lists the simulators and whether this machine is
 //! set up for each.
 //!
+//! A run on sim86 may be asked for live (`"live"` in `/run`): the answer
+//! then names a live run ([`crate::live`]) instead of carrying a posted
+//! one, and the page follows it on `/live/<id>/events`. A failed build,
+//! or a run sim86 did not start, answers as any `/run` does. There is one
+//! live run at a time: any new `/run` stops the one before.
+//!
 //! One run at a time: a second request waits for the first, since both
-//! would build in the same course cache.
+//! would build in the same course cache. A live run holds that turn only
+//! until its board runs.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -28,12 +35,15 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use ter_check::CheckFile;
-use ter_remote::serve::{RunFuture, RunRequest, ServeError, Service, editable, origin_of};
+use ter_remote::serve::{
+    LiveEvents, RunFuture, RunRequest, ServeError, Service, editable, no_live, origin_of,
+};
 use ter_sdk::project::TerToml;
 use ter_telemetry::sim86::Sim86;
 
 use crate::config::Config;
 use crate::exercises;
+use crate::live::{self, Live, Started};
 use crate::output::CliError;
 use crate::remote;
 use crate::run::{self, CHECK_YAML, RunArgs};
@@ -62,6 +72,18 @@ struct Inner {
     turn: Arc<tokio::sync::Mutex<()>>,
     /// The simulators as `/health` last listed them, and when.
     simulators: std::sync::Mutex<Option<(std::time::Instant, Value)>>,
+    /// The live run, going or over, until the next one.
+    live: std::sync::Mutex<Option<Arc<Live>>>,
+}
+
+impl Inner {
+    fn live(&self, id: &str) -> Option<Arc<Live>> {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .filter(|live| live.id == id)
+    }
 }
 
 /// One simulator as `/health` lists it: `ready` when this machine has what
@@ -116,7 +138,25 @@ impl Service for Serve {
             }
         };
         json!({"version": env!("CARGO_PKG_VERSION"), "posts_to_site": posts,
-               "venues": VENUES, "simulators": simulators})
+               "venues": VENUES, "simulators": simulators, "live": true})
+    }
+
+    fn live_events(&self, id: &str) -> Option<LiveEvents> {
+        self.0.live(id).map(|live| live.listen())
+    }
+
+    fn live_extend(&self, id: &str, add_s: u64) -> Result<Value, ServeError> {
+        let live = self.0.live(id).ok_or_else(|| no_live(id))?;
+        let ends_at = live
+            .extend(add_s)
+            .map_err(|e| ServeError::new(&e.code, e.message))?;
+        Ok(json!({"ends_at": ends_at}))
+    }
+
+    fn live_stop(&self, id: &str) -> Result<Value, ServeError> {
+        let live = self.0.live(id).ok_or_else(|| no_live(id))?;
+        live.stop("user-stop");
+        Ok(json!({"ok": true}))
     }
 
     fn run(&self, request: RunRequest) -> RunFuture {
@@ -125,7 +165,19 @@ impl Service for Serve {
     }
 }
 
+/// How long a new run waits for the live run before it to stop.
+const REPLACE_PATIENCE: Duration = Duration::from_secs(20);
+/// What starting a live run adds to a build: the upload to sim86 and the
+/// wait for a free simulator.
+const LIVE_START_ALLOWANCE: Duration = Duration::from_secs(480);
+
 async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFailure> {
+    // One live run at a time, and none left running under another run.
+    let before = inner.live.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(before) = before.filter(|live| !live.ended()) {
+        before.stop("replaced");
+        let _ = tokio::time::timeout(REPLACE_PATIENCE, before.over()).await;
+    }
     let turn = inner.turn.clone().lock_owned().await;
     let session = Session::open()?;
     let user = session
@@ -174,21 +226,45 @@ async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFa
         bench: request.bench.clone(),
         wait: bench_queue(),
     };
+    let args = RunArgs {
+        dir: Some(dir),
+        mode: Some(mode),
+        venue,
+        bench,
+        no_check: false,
+    };
+    let live_limit = request.live;
+    if live_limit.is_some() {
+        run::only_sim86(&args)?;
+    }
+    let limit = match live_limit {
+        Some(_) => BUILD_ALLOWANCE + LIVE_START_ALLOWANCE,
+        None => limit,
+    };
 
     // The run goes on in its own task, holding the turn, so a timeout
     // answers the page without leaving a second build to start under it.
     let task = tokio::spawn(async move {
-        let done = run::execute(
-            RunArgs {
-                dir: Some(dir),
-                mode: Some(mode),
-                venue,
-                bench,
-                no_check: false,
+        let done = match live_limit {
+            None => run::execute(args, true)
+                .await
+                .map(|done| Ok(Box::new(done))),
+            Some(limit_s) => match run::build(args, true).await {
+                Ok(built) => live::start(built, limit_s)
+                    .await
+                    .map(|started| match started {
+                        Started::Posted(done) => Ok(done),
+                        // The page listens from here on; with no listener the
+                        // run stops by itself.
+                        Started::Live(live, _events) => {
+                            let answer = live.answer();
+                            *inner.live.lock().unwrap_or_else(|e| e.into_inner()) = Some(live);
+                            Err(answer)
+                        }
+                    }),
+                Err(e) => Err(e),
             },
-            true,
-        )
-        .await;
+        };
         drop(turn);
         done
     });
@@ -206,6 +282,19 @@ async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFa
                 ),
             )
             .into());
+        }
+    };
+    let done = match done {
+        Ok(done) => done,
+        Err(mut live) => {
+            if !not_written.is_empty() {
+                live["not_written"] = json!(not_written);
+            }
+            eprintln!(
+                "Live run {} started on sim86",
+                live["live"].as_str().unwrap_or("?")
+            );
+            return Ok(live);
         }
     };
     let mut answer = done.answer;
@@ -440,6 +529,7 @@ pub async fn serve(
     let service = Arc::new(Serve(Arc::new(Inner {
         turn,
         simulators: std::sync::Mutex::new(None),
+        live: std::sync::Mutex::new(None),
     })));
     ter_remote::serve::serve(listener, service, &page, dev)
         .await
@@ -465,6 +555,7 @@ mod tests {
             venue: None,
             bench: None,
             user: None,
+            live: None,
         }
     }
 

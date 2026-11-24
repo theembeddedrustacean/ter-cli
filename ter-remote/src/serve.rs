@@ -7,6 +7,13 @@
 //! CORS, the origin and host guards and body validation. What a run does
 //! is the [`Service`] ter-cli plugs in.
 //!
+//! A run on a simulator that can show it as it happens may be asked for
+//! live (`"live": {"limit_s": 60}` in `/run`): the answer then names a live
+//! run, and the page follows it on `/live/<id>/events` (Server-Sent
+//! Events), lengthens it with `/live/<id>/extend` and ends it with
+//! `/live/<id>/stop`. `/health` says `"live": true` when the service does
+//! this.
+//!
 //! Only the lesson page's origin gets an answer a browser will read (and
 //! the fork's dev server, when `ter serve --dev` asks for it), and any
 //! other origin is refused before anything runs. The lesson page's origin
@@ -19,13 +26,16 @@
 //! `Host` that is not this loopback address is refused as well, so a site
 //! that rebinds its own name to 127.0.0.1 cannot reach the service.
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -80,7 +90,27 @@ pub struct RunRequest {
     pub bench: Option<String>,
     /// The page's signed-in user, when the page sends it.
     pub user: Option<String>,
+    /// Set when the page wants to watch the run as it happens: how many
+    /// seconds it may last before it is extended.
+    pub live: Option<u64>,
 }
+
+/// How long a live run lasts when the page does not say.
+pub const LIVE_LIMIT_S: u64 = 60;
+/// The longest a live run may last in total, extensions included.
+pub const LIVE_CAP_S: u64 = 600;
+
+/// One event of a live run, as `/live/<id>/events` sends it: `name` is
+/// the SSE event's name (`pin`, `serial`, `checks`, `limit`, `ended`) and
+/// `data` its one JSON object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveEvent {
+    pub name: &'static str,
+    pub data: Value,
+}
+
+/// A live run's events from now on; it closes after `ended`.
+pub type LiveEvents = tokio::sync::mpsc::Receiver<LiveEvent>;
 
 /// A failure `ter serve` answers with, as `{"error": {code, message}}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +145,7 @@ impl ServeError {
             "not_found" | "unknown_bench" => StatusCode::NOT_FOUND,
             "unsupported_media_type" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "timeout" => StatusCode::GATEWAY_TIMEOUT,
-            "busy" | "bench_busy" => StatusCode::CONFLICT,
+            "busy" | "bench_busy" | "limit_cap" | "ended" => StatusCode::CONFLICT,
             "outdated" => StatusCode::UPGRADE_REQUIRED,
             "venue_unavailable" | "bench_offline" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -142,6 +172,27 @@ pub trait Service: Send + Sync + 'static {
     /// Run the request; `Ok` is the run as posted (its build or check may
     /// have failed), `Err` a run that was not posted.
     fn run(&self, request: RunRequest) -> RunFuture;
+    /// The events of live run `id` from now on; `None` when there is no
+    /// such run.
+    fn live_events(&self, _id: &str) -> Option<LiveEvents> {
+        None
+    }
+    /// Let live run `id` go on `add_s` seconds longer: `{"ends_at"}`.
+    fn live_extend(&self, id: &str, _add_s: u64) -> Result<Value, ServeError> {
+        Err(no_live(id))
+    }
+    /// Stop live run `id`: `{"ok": true}`.
+    fn live_stop(&self, id: &str) -> Result<Value, ServeError> {
+        Err(no_live(id))
+    }
+}
+
+/// The answer for a live run this service does not have.
+pub fn no_live(id: &str) -> ServeError {
+    ServeError::new(
+        "not_found",
+        format!("ter serve has no live run {id:?}. A new run replaces the one before."),
+    )
 }
 
 impl RunRequest {
@@ -233,6 +284,30 @@ impl RunRequest {
             }
         };
         let user = text("user")?;
+        let live = match obj.get("live") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(live)) => match live.get("limit_s") {
+                None | Some(Value::Null) => Some(LIVE_LIMIT_S),
+                Some(v) => match v.as_u64() {
+                    Some(s) if (1..=LIVE_CAP_S).contains(&s) => Some(s),
+                    _ => {
+                        return Err(ServeError::bad_request(format!(
+                            "live.limit_s must be a whole number of seconds from 1 to {LIVE_CAP_S}."
+                        )));
+                    }
+                },
+            },
+            Some(_) => {
+                return Err(ServeError::bad_request(
+                    "live must be an object, {\"limit_s\": 60}.",
+                ));
+            }
+        };
+        if live.is_some() && (mode.as_deref() == Some("hardware") || bench.is_some()) {
+            return Err(ServeError::bad_request(
+                "A live run is a simulation on sim86 for now; hardware runs answer as before.",
+            ));
+        }
         Ok(Self {
             exercise_id,
             files,
@@ -240,6 +315,7 @@ impl RunRequest {
             venue,
             bench,
             user,
+            live,
         })
     }
 }
@@ -309,6 +385,9 @@ pub fn router(service: Arc<dyn Service>, port: u16, site_origin: &str, dev: bool
         .route("/", get(health))
         .route("/run", post(run))
         .route("/run/", post(run))
+        .route("/live/{id}/events", get(live_events))
+        .route("/live/{id}/extend", post(live_extend))
+        .route("/live/{id}/stop", post(live_stop))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(ctx.clone(), guard))
         .with_state(ctx)
@@ -347,8 +426,80 @@ async fn run(State(ctx): State<Ctx>, headers: HeaderMap, body: Bytes) -> Respons
     }
 }
 
+/// How often a quiet event stream sends a comment line, so a page that
+/// went away is noticed.
+const KEEP_ALIVE: Duration = Duration::from_secs(5);
+
+/// A live run's events as the body of an SSE response.
+struct EventStream {
+    events: LiveEvents,
+    beat: tokio::time::Interval,
+}
+
+impl futures_core::Stream for EventStream {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.events.poll_recv(cx) {
+            Poll::Ready(Some(event)) => Poll::Ready(Some(Ok(Bytes::from(format!(
+                "event: {}\ndata: {}\n\n",
+                event.name, event.data
+            ))))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => match self.beat.poll_tick(cx) {
+                Poll::Ready(_) => Poll::Ready(Some(Ok(Bytes::from_static(b": ter\n\n")))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
+async fn live_events(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    let Some(events) = ctx.service.live_events(&id) else {
+        return no_live(&id).into_response();
+    };
+    let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + KEEP_ALIVE, KEEP_ALIVE);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut r = Response::new(Body::from_stream(EventStream { events, beat }));
+    let h = r.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    r
+}
+
+async fn live_extend(State(ctx): State<Ctx>, Path(id): Path<String>, body: Bytes) -> Response {
+    let add_s = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("add_s").and_then(Value::as_u64))
+        .filter(|s| *s >= 1);
+    let Some(add_s) = add_s else {
+        return ServeError::bad_request(
+            "Send {\"add_s\": 60}: a whole number of seconds, 1 or more.",
+        )
+        .into_response();
+    };
+    match ctx.service.live_extend(&id, add_s) {
+        Ok(answer) => axum::Json(answer).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn live_stop(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    match ctx.service.live_stop(&id) {
+        Ok(answer) => axum::Json(answer).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn not_found() -> Response {
-    ServeError::new("not_found", "ter serve answers /health and /run.").into_response()
+    ServeError::new(
+        "not_found",
+        "ter serve answers /health, /run and /live/<id>/events, /extend and /stop.",
+    )
+    .into_response()
 }
 
 /// `127.0.0.1:<port>` or `localhost:<port>`: the names this service is
@@ -393,7 +544,9 @@ async fn guard(State(ctx): State<Ctx>, request: Request, next: Next) -> Response
             ),
         )
         .into_response()
-    } else if origin.is_none() && matches!(path.as_str(), "/run" | "/run/") {
+    } else if origin.is_none()
+        && (matches!(path.as_str(), "/run" | "/run/") || path.starts_with("/live/"))
+    {
         ServeError::new(
             "origin_refused",
             format!(
@@ -929,6 +1082,120 @@ mod tests {
         ] {
             assert!(check_path(kept).is_ok(), "{kept}");
             assert!(!editable(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn a_run_can_be_asked_for_live_with_a_limit_in_seconds() {
+        let parse = |live: &str| {
+            RunRequest::parse(
+                format!(r#"{{"exercise_id": "e", "venue": "sim86", "live": {live}}}"#).as_bytes(),
+            )
+        };
+        assert_eq!(parse(r#"{"limit_s": 90}"#).unwrap().live, Some(90));
+        assert_eq!(parse("{}").unwrap().live, Some(LIVE_LIMIT_S));
+        assert_eq!(parse("null").unwrap().live, None);
+        assert_eq!(RunRequest::parse(BODY.as_bytes()).unwrap().live, None);
+        for bad in [
+            r#"{"limit_s": 0}"#,
+            r#"{"limit_s": 601}"#,
+            r#"{"limit_s": "60"}"#,
+            "true",
+        ] {
+            assert_eq!(parse(bad).unwrap_err().code, "bad_request", "{bad}");
+        }
+        // Hardware answers as before; it has no live run yet.
+        let hw = RunRequest::parse(br#"{"exercise_id": "e", "mode": "hardware", "live": {}}"#);
+        assert_eq!(hw.unwrap_err().code, "bad_request");
+    }
+
+    /// A service with one live run, `l1`, that sends two events and ends.
+    struct Watched;
+
+    impl Service for Watched {
+        fn health(&self) -> Value {
+            json!({"live": true})
+        }
+        fn run(&self, _: RunRequest) -> RunFuture {
+            Box::pin(async { Ok(json!({"live": "l1"})) })
+        }
+        fn live_events(&self, id: &str) -> Option<LiveEvents> {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            for (name, data) in [
+                ("pin", json!({"t_ms": 1.5, "pin": "PA5", "level": 1})),
+                ("ended", json!({"reason": "limit", "detail": ""})),
+            ] {
+                tx.try_send(LiveEvent { name, data }).unwrap();
+            }
+            (id == "l1").then_some(rx)
+        }
+        fn live_extend(&self, id: &str, add_s: u64) -> Result<Value, ServeError> {
+            match id {
+                "l1" if add_s > 60 => Err(ServeError::new("limit_cap", "ten minutes at most")),
+                "l1" => Ok(json!({"ends_at": add_s})),
+                _ => Err(no_live(id)),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_run_is_followed_extended_and_stopped_by_the_lesson_page_only() {
+        let app = router(Arc::new(Watched), PORT, SITE_ORIGIN, false);
+
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/live/l1/events", Some(SITE), ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], SITE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "event: pin\ndata: {\"level\":1,\"pin\":\"PA5\",\"t_ms\":1.5}\n\n\
+             event: ended\ndata: {\"detail\":\"\",\"reason\":\"limit\"}\n\n"
+        );
+
+        let (status, _, v) = send(
+            &app,
+            req("POST", "/live/l1/extend", Some(SITE), r#"{"add_s": 60}"#),
+        )
+        .await;
+        assert_eq!((status, v), (StatusCode::OK, json!({"ends_at": 60})));
+        let (status, _, v) = send(
+            &app,
+            req("POST", "/live/l1/extend", Some(SITE), r#"{"add_s": 61}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(v["error"]["code"], "limit_cap");
+        for body in ["", "{}", r#"{"add_s": 0}"#, r#"{"add_s": -5}"#] {
+            let (status, _, v) = send(&app, req("POST", "/live/l1/extend", Some(SITE), body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {v}");
+        }
+
+        // No such run, and a service with no live runs at all.
+        for path in ["/live/l2/events", "/live/l2/extend", "/live/l1/stop"] {
+            let method = if path.ends_with("events") {
+                "GET"
+            } else {
+                "POST"
+            };
+            let (status, _, v) = send(&app, req(method, path, Some(SITE), r#"{"add_s": 1}"#)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {v}");
+            assert_eq!(v["error"]["code"], "not_found");
+        }
+
+        // Another page, or no page at all, gets nothing and stops nothing.
+        for origin in [Some(OTHER), None] {
+            for (method, path) in [("GET", "/live/l1/events"), ("POST", "/live/l1/stop")] {
+                let (status, _, v) = send(&app, req(method, path, origin, "")).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{origin:?} {path}");
+                assert_eq!(v["error"]["code"], "origin_refused");
+            }
         }
     }
 }

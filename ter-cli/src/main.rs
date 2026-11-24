@@ -12,6 +12,7 @@ mod exercises;
 mod hint;
 mod hw;
 mod install;
+mod live;
 mod llm;
 mod login;
 mod new;
@@ -110,6 +111,14 @@ enum Command {
         /// Build only: post the attempt without running or checking it.
         #[arg(long)]
         no_check: bool,
+        /// Watch the run as it happens (sim86 only): prints serial and
+        /// pin changes until Ctrl-C or the limit, then the verdicts.
+        #[arg(long, conflicts_with_all = ["hw", "no_check"])]
+        live: bool,
+        /// How long a `--live` run may last, in seconds (600 at most).
+        /// sim86 charges your account for every minute it runs.
+        #[arg(long, requires = "live", value_name = "SECONDS")]
+        limit: Option<u64>,
     },
     /// Your exercises and their last runs; --disk for disk use per course.
     Status {
@@ -435,6 +444,8 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
             hw,
             venue,
             no_check,
+            live,
+            limit,
         } => {
             let (dir, venue) = sim_names(sim.as_deref(), dir, venue)?;
             let mode = match (sim.is_some(), hw) {
@@ -442,17 +453,19 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
                 (_, true) => Some("hardware"),
                 _ => None,
             };
-            run::run(
-                run::RunArgs {
-                    dir,
-                    mode,
-                    venue,
-                    bench: Default::default(),
-                    no_check,
-                },
-                json,
-            )
-            .await
+            let args = run::RunArgs {
+                dir,
+                mode,
+                venue,
+                bench: Default::default(),
+                no_check,
+            };
+            if live {
+                let limit = limit.unwrap_or(ter_remote::serve::LIVE_LIMIT_S);
+                live::run(args, limit, json).await
+            } else {
+                run::run(args, json).await
+            }
         }
         Command::Status { disk: true } => status::disk(json),
         Command::Status { disk: false } => status::status(json).await,

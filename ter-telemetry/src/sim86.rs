@@ -45,7 +45,7 @@ pub const PINS_FILE: &str = "sim86/pins.json";
 pub const HELPER: &str = include_str!("sim86_helper.py");
 pub const HELPER_FILE: &str = "ter_sim86.py";
 /// The `helper` number in the script's answers.
-pub const HELPER_VERSION: u64 = 2;
+pub const HELPER_VERSION: u64 = 3;
 /// What `pip install` is asked for.
 pub const PACKAGE: &str = "sim86>=0.1.4,<0.2";
 /// The package version this ter was tested with.
@@ -547,6 +547,19 @@ pub fn events(
     stimuli: &[Stimulus],
     timeout_ms: u64,
 ) -> Result<Vec<Event>, Failure> {
+    events_until(answer, plan, stimuli, timeout_ms, false).map(|(events, _)| events)
+}
+
+/// As [`events`], with where the recording ends, in ns. With `short`, a
+/// recording that stops before `timeout_ms` (a live run that was stopped,
+/// or ended by itself) is taken as far as it goes instead of refused.
+pub fn events_until(
+    answer: &Answer,
+    plan: &Plan,
+    stimuli: &[Stimulus],
+    timeout_ms: u64,
+    short: bool,
+) -> Result<(Vec<Event>, u64), Failure> {
     let fail = |kind, message: String| Err(Failure::new(kind, message));
     if answer.paused_at_start != Some(true) || answer.started_ns != Some(0) {
         return fail(
@@ -557,18 +570,22 @@ pub fn events(
             },
         );
     }
-    let end_ns = timeout_ms * 1_000_000;
-    if answer.end_ns != Some(end_ns) {
-        return fail(
-            FailureKind::Ended,
-            format!("the recording does not reach {timeout_ms} ms"),
-        );
-    }
+    let whole_ns = timeout_ms * 1_000_000;
+    let end_ns = match answer.end_ns {
+        Some(ns) if ns == whole_ns => ns,
+        Some(ns) if short && ns < whole_ns => ns,
+        _ => {
+            return fail(
+                FailureKind::Ended,
+                format!("the recording does not reach {timeout_ms} ms"),
+            );
+        }
+    };
     let pressed = |s: &Stimulus| match &s.kind {
         StimulusKind::Press { name } | StimulusKind::Release { name } => Some(name.clone()),
         StimulusKind::Reset | StimulusKind::Power { .. } => None,
     };
-    for s in stimuli.iter().filter(|s| s.at_ms < timeout_ms) {
+    for s in stimuli.iter().filter(|s| s.at_ms * 1_000_000 < end_ns) {
         let Some(name) = pressed(s) else { continue };
         let wanted = stimuli
             .iter()
@@ -633,7 +650,97 @@ pub fn events(
         });
     }
     out.sort_by_key(|e| e.t_us);
-    Ok(out)
+    Ok((out, end_ns))
+}
+
+/// One line the helper's `live` mode prints while a run goes on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiveLine {
+    /// The run exists and the board now runs from 0.
+    Started { run: String },
+    /// A net's level at `t_ns` of simulated time.
+    Pin { t_ns: u64, net: String, level: u8 },
+    /// A line a part printed, at `t_ms` of simulated time.
+    Serial {
+        t_ms: f64,
+        source: String,
+        line: String,
+    },
+    /// The check's window, or what there was of it: the shape a `run`
+    /// answers with.
+    Recording(Box<Answer>),
+    /// The run is over: sim86's reason, or `stopped` when ter asked.
+    Ended { reason: String },
+    /// The helper's last line.
+    Done(Result<(), Failure>),
+}
+
+/// Read one line of the helper's `live` mode; `None` for anything else.
+pub fn live_line(line: &str) -> Option<LiveLine> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    match v.get("ev").and_then(Value::as_str) {
+        Some("started") => Some(LiveLine::Started { run: text("run")? }),
+        Some("pin") => Some(LiveLine::Pin {
+            t_ns: v.get("t_ns")?.as_u64()?,
+            net: text("net")?,
+            level: u8::from(v.get("level")?.as_u64()? != 0),
+        }),
+        Some("serial") => Some(LiveLine::Serial {
+            t_ms: v.get("t_ms")?.as_f64()?,
+            source: text("source")?,
+            line: text("line")?,
+        }),
+        Some("recording") => serde_json::from_value(v)
+            .ok()
+            .map(|answer| LiveLine::Recording(Box::new(answer))),
+        Some("ended") => Some(LiveLine::Ended {
+            reason: text("reason").unwrap_or_default(),
+        }),
+        Some(_) => None,
+        None if v.get("ok").is_some() => Some(LiveLine::Done(parse(line).map(|_| ()))),
+        None => None,
+    }
+}
+
+/// Which of a live run's serial lines are the program's, each once: the
+/// rule [`events`] applies to a recording, for lines as they come.
+#[derive(Debug, Clone)]
+pub struct ProgramLines {
+    mcu: String,
+    /// The last few lines let through: time in µs, source, text.
+    seen: std::collections::VecDeque<(u64, String, String)>,
+}
+
+impl ProgramLines {
+    pub fn new(plan: &Plan) -> Self {
+        Self {
+            mcu: plan.mcu.clone(),
+            seen: Default::default(),
+        }
+    }
+
+    /// Whether to show this line: the programmed part's, and not the same
+    /// line again from another of its ports.
+    pub fn take(&mut self, t_ms: f64, source: &str, line: &str) -> bool {
+        if source != self.mcu && !source.starts_with(&format!("{}:", self.mcu)) {
+            return false;
+        }
+        let t_us = (t_ms.max(0.0) * 1_000.0) as u64;
+        if self
+            .seen
+            .iter()
+            .any(|(t, s, l)| *t == t_us && l == line && s != source)
+        {
+            return false;
+        }
+        if self.seen.len() == 64 {
+            self.seen.pop_front();
+        }
+        self.seen
+            .push_back((t_us, source.to_string(), line.to_string()));
+        true
+    }
 }
 
 /// The Python that holds the sim86 package, ter's helper beside it, and
@@ -654,17 +761,7 @@ impl Helper {
         budget: Duration,
         log: Option<&Path>,
     ) -> Result<Answer, Failure> {
-        let mut cmd = Command::new(&self.python);
-        cmd.arg(&self.script)
-            .args(args)
-            .env("SIM86_TELEMETRY", "0")
-            .env("PYTHONIOENCODING", "utf-8");
-        if let Some(key) = &self.key {
-            cmd.env(KEY_ENV, key);
-        }
-        if let Some(dir) = log {
-            cmd.current_dir(dir);
-        }
+        let mut cmd = self.command(args, log);
         let output = run_with_budget(&mut cmd, budget).map_err(|e| {
             Failure::new(
                 FailureKind::Missing,
@@ -693,6 +790,22 @@ impl Helper {
             }
             failure
         })
+    }
+
+    /// The helper with `args`, run in `dir` when given; not started.
+    pub fn command(&self, args: &[OsString], dir: Option<&Path>) -> Command {
+        let mut cmd = Command::new(&self.python);
+        cmd.arg(&self.script)
+            .args(args)
+            .env("SIM86_TELEMETRY", "0")
+            .env("PYTHONIOENCODING", "utf-8");
+        if let Some(key) = &self.key {
+            cmd.env(KEY_ENV, key);
+        }
+        if let Some(dir) = dir {
+            cmd.current_dir(dir);
+        }
+        cmd
     }
 
     /// The package and Python versions, and whether the package finds a
@@ -763,7 +876,43 @@ impl Sim86 {
         })
     }
 
-    fn failure(&self, failure: &Failure) -> VenueError {
+    /// What the helper's `live` mode is asked to run: no simulated-time
+    /// limit, and `realtime_ms` on sim86's own clock as the stop of last
+    /// resort, for a run ter is no longer there to stop.
+    pub fn live_request(&self, stimuli: &[Stimulus], program: &Path, realtime_ms: u64) -> Value {
+        let mut request = self.request(stimuli, program);
+        if let Some(fields) = request.as_object_mut() {
+            fields.remove("duration_ms");
+            fields.insert("realtime_ms".into(), json!(realtime_ms));
+        }
+        request
+    }
+
+    /// The recording of a run the helper answered with. `short`: a run
+    /// that stopped before the check's time was up is recorded as far as
+    /// it went.
+    pub fn recording(
+        &self,
+        answer: &Answer,
+        stimuli: &[Stimulus],
+        started_at: String,
+        short: bool,
+    ) -> Result<Recording, Failure> {
+        let (events, end_ns) = events_until(answer, &self.plan, stimuli, self.timeout_ms, short)?;
+        let mut capture = self.capture.clone();
+        capture.venue = "sim86".into();
+        capture.provides = self.provides();
+        capture.pins = self.plan.watch.iter().map(|w| w.pin.clone()).collect();
+        capture.stimuli = stimuli.to_vec();
+        capture.end_us = end_ns / 1_000;
+        capture.started_at = started_at;
+        capture.ended_at = crate::rfc3339_now();
+        Ok(Recording { capture, events })
+    }
+
+    /// A helper failure as the venue's, with what the helper left in the
+    /// run folder.
+    pub fn failure(&self, failure: &Failure) -> VenueError {
         let read = |f| std::fs::read_to_string(self.run_dir.join(f)).unwrap_or_default();
         VenueError::unavailable(
             failure.explain(),
@@ -841,19 +990,9 @@ impl Venue for Sim86 {
         // The image is made from the program in the build cache; a copy
         // per run would only fill the disk.
         let _ = std::fs::remove_file(self.run_dir.join(FIRMWARE));
-        let events = answered
-            .and_then(|answer| events(&answer, &self.plan, stimuli, self.timeout_ms))
-            .map_err(|failure| self.failure(&failure))?;
-
-        let mut capture = self.capture.clone();
-        capture.venue = "sim86".into();
-        capture.provides = self.provides();
-        capture.pins = self.plan.watch.iter().map(|w| w.pin.clone()).collect();
-        capture.stimuli = stimuli.to_vec();
-        capture.end_us = self.timeout_ms * 1_000;
-        capture.started_at = started_at;
-        capture.ended_at = crate::rfc3339_now();
-        Ok(Recording { capture, events })
+        answered
+            .and_then(|answer| self.recording(&answer, stimuli, started_at, false))
+            .map_err(|failure| self.failure(&failure))
     }
 
     fn recover(&mut self) -> Recovery {
@@ -1235,5 +1374,112 @@ mod tests {
         // It stops every run it starts, whatever happens in between.
         assert!(HELPER.contains("finally:") && HELPER.contains("run.stop()"));
         assert!(HELPER.contains("paused=True"));
+    }
+
+    #[test]
+    fn the_helpers_live_lines_read() {
+        assert_eq!(
+            live_line(r#"{"ev": "started", "run": "r1"}"#),
+            Some(LiveLine::Started { run: "r1".into() })
+        );
+        assert_eq!(
+            live_line(r#"{"ev": "pin", "t_ns": 1513000, "net": "mcu.D13", "level": 1}"#),
+            Some(LiveLine::Pin {
+                t_ns: 1_513_000,
+                net: "mcu.D13".into(),
+                level: 1
+            })
+        );
+        assert_eq!(
+            live_line(r#"{"ev": "serial", "t_ms": 12.0, "source": "mcu:uart0", "line": "hi"}"#),
+            Some(LiveLine::Serial {
+                t_ms: 12.0,
+                source: "mcu:uart0".into(),
+                line: "hi".into()
+            })
+        );
+        assert_eq!(
+            live_line(r#"{"ev": "ended", "reason": "user-stop"}"#),
+            Some(LiveLine::Ended {
+                reason: "user-stop".into()
+            })
+        );
+        let Some(LiveLine::Recording(answer)) = live_line(
+            r#"{"ev": "recording", "run": "r1", "started_ns": 0, "paused_at_start": true,
+                "end_ns": 3000000000, "pins": {"mcu.D13": {"initial": 0, "edges": [[1513000, 1]]}},
+                "serial": [], "applied": []}"#,
+        ) else {
+            panic!("a recording");
+        };
+        assert_eq!(answer.end_ns, Some(3_000_000_000));
+        assert_eq!(answer.pins["mcu.D13"].edges, [(1_513_000, 1)]);
+        assert_eq!(
+            live_line(r#"{"helper": 3, "ok": true, "run": "r1"}"#),
+            Some(LiveLine::Done(Ok(())))
+        );
+        let Some(LiveLine::Done(Err(failure))) =
+            live_line(r#"{"ok": false, "error": {"kind": "credits", "message": "none left"}}"#)
+        else {
+            panic!("a failure");
+        };
+        assert_eq!(failure.kind, FailureKind::Credits);
+        for other in [
+            "",
+            "sim86: waiting",
+            r#"{"ev": "new"}"#,
+            r#"{"ev": "pin"}"#,
+            "[]",
+        ] {
+            assert_eq!(live_line(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_live_run_that_stopped_early_is_recorded_as_far_as_it_went() {
+        let plan = nucleo_plan();
+        let answer = Answer {
+            end_ns: Some(1_200_000_000),
+            pins: [(
+                "mcu.D13".to_string(),
+                Net {
+                    initial: Some(0),
+                    edges: vec![(1_513_000, 1), (1_001_513_000, 0)],
+                },
+            )]
+            .into(),
+            ..parse(NUCLEO_RUN).unwrap()
+        };
+        // `ter run` never judges a run that did not reach the check's end.
+        let refused = events(&answer, &plan, &[], 3000).unwrap_err();
+        assert_eq!(refused.kind, FailureKind::Ended);
+        let (events, end_ns) = events_until(&answer, &plan, &[], 3000, true).unwrap();
+        assert_eq!(end_ns, 1_200_000_000);
+        assert_eq!(events.last().unwrap().t_us, 1_001_513);
+        // A press planned for after it stopped was never due.
+        let late = [press(2000, "user_button")];
+        assert!(events_until(&answer, &plan, &late, 3000, true).is_ok());
+        // Longer than the check is not a recording of it either way.
+        let long = Answer {
+            end_ns: Some(3_000_000_001),
+            ..answer
+        };
+        assert!(events_until(&long, &plan, &[], 3000, true).is_err());
+    }
+
+    #[test]
+    fn a_live_runs_serial_is_the_programs_once_a_line() {
+        let mut lines = ProgramLines::new(&nucleo_plan());
+        assert!(lines.take(1.0, "mcu:uart0", "boot"));
+        assert!(
+            !lines.take(1.0, "mcu:usb", "boot"),
+            "the same line on a second port"
+        );
+        assert!(
+            lines.take(1.0, "mcu:uart0", "boot"),
+            "printed twice on one port"
+        );
+        assert!(lines.take(2.0, "mcu:usb", "boot"));
+        assert!(!lines.take(2.0, "node", "ready"));
+        assert!(!lines.take(2.0, "mcu2:uart0", "other"));
     }
 }

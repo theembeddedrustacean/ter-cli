@@ -35,12 +35,19 @@ or newer and your own sim86 account. `ter ex show` lists the simulators
 that can run an exercise. A lesson page that shows the exercise on a sim86
 board asks `ter serve` for that run on sim86.
 
+A run on sim86 can be watched as it happens. The lesson page shows the
+board live; in a terminal, `ter run --sim sim86 --live` prints the pin
+changes and the serial output as they come, until Ctrl-C or the limit
+(`--limit <seconds>`, 60 unless given, 600 at most), then the verdicts.
+sim86 charges your account for every minute a board runs, so ter stops a
+live run when its time is up, and when the page that started it is closed.
+
 ## Commands
 
 ```
 ter login | logout | whoami      pairing and account
 ter ex list | fetch | show | clean | remove
-ter run [--hw | --sim [sim86] | --no-check]
+ter run [--hw | --sim [sim86] [--live] | --no-check]
 ter status                       your exercises and their last runs
 ter hint [--llm]                 a hint from the course, or from your own model
 ter llm setup                    choose that model and store your key

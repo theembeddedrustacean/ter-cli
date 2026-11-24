@@ -2144,6 +2144,219 @@ fn live_serve_runs_the_pages_run_on_sim86_and_answers_with_its_events() {
     );
 }
 
+/// The lesson page watches a run on sim86 as it happens: `/run` answers
+/// with a live run as soon as the board runs, the LED's changes arrive
+/// while it blinks and about when it blinks, the check is judged from the
+/// recording and posted while the board runs on, the page extends the
+/// limit and then stops the run. Set up as the test above; about 15 s of
+/// sim86 time.
+#[test]
+#[ignore = "live site and sim86"]
+fn live_serve_shows_a_run_on_sim86_as_it_happens_and_stops_it() {
+    use std::io::BufRead;
+    let Some(pilot) = sim86_ready() else {
+        return;
+    };
+    let Ok(curriculum) = std::env::var("TER_CURRICULUM") else {
+        eprintln!("skipped: set TER_CURRICULUM");
+        return;
+    };
+    let m = LiveMachine::new();
+    let (ok, v) = m.json(&["ex", "fetch", LIVE_OPEN], m.courses.path());
+    assert!(ok, "{v}");
+    let dir = std::path::PathBuf::from(v["path"].as_str().unwrap());
+    lay_solution_over(&curriculum, &dir);
+    std::fs::create_dir_all(dir.join("sim86")).unwrap();
+    for (from, to) in [
+        ("uferris-c3.json", "sim86/board.json"),
+        ("uferris-c3.pins.json", "sim86/pins.json"),
+    ] {
+        std::fs::copy(pilot.join("boards").join(from), dir.join(to)).unwrap();
+    }
+    let tools = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["install", "sim86", "--json"])
+        .env("TER_TOOLS_DIR", tools.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["serve", "--port", "0", "--dev"])
+        .env("TER_CONFIG_DIR", m.config.path())
+        .env("TER_TOKEN", &m.token)
+        .env("TER_KEYCHAIN", "off")
+        .env("TER_TOOLS_DIR", tools.path())
+        .env_remove("TER_SITE_URL")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    stdout.read_line(&mut line).unwrap();
+    let url = line
+        .strip_prefix("ter serve on ")
+        .and_then(|l| l.split(',').next())
+        .unwrap()
+        .to_string();
+
+    const PAGE: &str = "http://localhost:8080";
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    // Each event with when it arrived, in ms since the board started.
+    type Seen = Vec<(u64, String, Value)>;
+    let (health, live, seen, extended, stopped): (Value, Value, Seen, Value, Value) = {
+        let _turn = take_turn();
+        block_on(async {
+            let page = reqwest::Client::new();
+            let health = page
+                .get(format!("{url}/health"))
+                .header("origin", PAGE)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let r = page
+                .post(format!("{url}/run"))
+                .header("origin", PAGE)
+                .json(&serde_json::json!({
+                    "exercise_id": LIVE_OPEN, "mode": "simulation", "venue": "sim86",
+                    "live": {"limit_s": 60}
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            let live: Value = r.json().await.unwrap();
+            let id = live["live"].as_str().unwrap_or_else(|| panic!("{live}"));
+            let started_at = live["started_at"].as_u64().unwrap();
+
+            let mut stream = page
+                .get(format!("{url}/live/{id}/events"))
+                .header("origin", PAGE)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(stream.status(), 200);
+            let post = |what: &'static str, body: Value| {
+                let request = page
+                    .post(format!("{url}/live/{id}/{what}"))
+                    .header("origin", PAGE)
+                    .json(&body);
+                async move { request.send().await.unwrap().json::<Value>().await.unwrap() }
+            };
+            let mut seen: Seen = Vec::new();
+            let mut text = String::new();
+            let (mut extended, mut stopped) = (Value::Null, Value::Null);
+            let mut after_checks = 0;
+            'stream: loop {
+                let chunk =
+                    tokio::time::timeout(std::time::Duration::from_secs(90), stream.chunk())
+                        .await
+                        .expect("an event within 90 s")
+                        .unwrap();
+                let Some(chunk) = chunk else { break };
+                text.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(end) = text.find("\n\n") {
+                    let block: String = text.drain(..end + 2).collect();
+                    let field = |name: &str| {
+                        block
+                            .lines()
+                            .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+                    };
+                    let (Some(name), Some(data)) = (field("event:"), field("data:")) else {
+                        continue;
+                    };
+                    let data: Value = serde_json::from_str(&data).unwrap();
+                    seen.push((now_ms().saturating_sub(started_at), name.clone(), data));
+                    let checked = seen.iter().any(|(_, n, _)| n == "checks");
+                    if name == "checks" {
+                        extended = post("extend", serde_json::json!({"add_s": 60})).await;
+                    } else if name == "pin" && checked {
+                        // The board runs on after the checks: a few more
+                        // changes of the LED, then Stop.
+                        after_checks += 1;
+                        if after_checks == 4 {
+                            stopped = post("stop", serde_json::json!({})).await;
+                        }
+                    } else if name == "ended" {
+                        break 'stream;
+                    }
+                }
+            }
+            (health, live, seen, extended, stopped)
+        })
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let key = std::env::var("SIM86_API_KEY").unwrap();
+    let all = format!("{health}{live}{seen:?}");
+    assert!(!all.contains(&key));
+    assert_eq!(health["live"], true, "{health}");
+    let (started_at, ends_at) = (
+        live["started_at"].as_u64().unwrap(),
+        live["ends_at"].as_u64().unwrap(),
+    );
+    assert_eq!(ends_at, started_at + 60_000, "{live}");
+    assert!(
+        live["sim86_run"].as_str().is_some_and(|r| r.len() > 8),
+        "{live}"
+    );
+
+    let named = |name: &str| -> Vec<&(u64, String, Value)> {
+        seen.iter().filter(|(_, n, _)| n == name).collect()
+    };
+    let pins = named("pin");
+    assert!(
+        pins.len() > 16,
+        "a heartbeat, 4 flashes a second: {}",
+        pins.len()
+    );
+    assert_eq!(pins[0].2["pin"], "GPIO3", "{:?}", pins[0]);
+    assert_eq!(pins[0].2["net"], "mcu.D1");
+    // Each change arrives after it happened and not long after: the board
+    // runs at about real speed and ter passes its changes on as they come.
+    let mut worst = 0.0f64;
+    for (arrived, _, data) in pins.iter().skip(1) {
+        let happened = data["t_ms"].as_f64().unwrap();
+        let late = *arrived as f64 - happened;
+        assert!(
+            late > -250.0,
+            "an edge at {happened} ms seen {arrived} ms in"
+        );
+        worst = worst.max(late);
+    }
+    assert!(worst < 3_000.0, "an edge arrived {worst} ms late");
+    assert!(!named("serial").is_empty(), "the chip's boot lines");
+
+    let checks = &named("checks")[0].2;
+    assert_eq!(checks["venue"], "sim86", "{checks}");
+    assert_eq!(checks["check_status"], "passed", "{checks}");
+    assert!(checks["site"]["attempt"].as_u64().is_some(), "{checks}");
+    assert!(checks["events"].as_array().is_some_and(|e| e.len() > 16));
+    assert_eq!(named("checks").len(), 1);
+    assert_eq!(extended["ends_at"], ends_at + 60_000, "{extended}");
+    assert_eq!(named("limit")[0].2["ends_at"], ends_at + 60_000);
+    assert_eq!(stopped, serde_json::json!({"ok": true}));
+    let (ended_after, _, ended) = named("ended")[0];
+    assert_eq!(ended["reason"], "user-stop", "{ended}");
+    eprintln!(
+        "live sim86 run {}: {} pin events, the latest {worst:.0} ms after it happened; \
+         posted {} attempt {}; ended {} ms in",
+        live["sim86_run"],
+        pins.len(),
+        checks["name"],
+        checks["site"]["attempt"],
+        ended_after
+    );
+}
+
 /// `ter install sim86` into a tools folder of the test's own, then the
 /// venue itself on sim86: the heartbeat on the XIAO ESP32-C3 board passes
 /// its two pin checks from a recording that holds the first edge, and a

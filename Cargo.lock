@@ -2412,6 +2412,7 @@ version = "0.1.7"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "futures-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -2496,6 +2497,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

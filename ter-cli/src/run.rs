@@ -99,7 +99,28 @@ pub fn venue_for(mode: &str, asked: Option<&str>, dir: &Path) -> Result<&'static
 }
 
 pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
-    let done = execute(args, json).await?;
+    report(execute(args, json).await?, json)
+}
+
+/// A live run is on sim86 for now: refuse any other before the build.
+pub fn only_sim86(args: &RunArgs) -> Result<(), CliError> {
+    let dir = exercise_dir(args.dir.clone())?;
+    let ter = TerToml::load(&dir)?;
+    let mode = args.mode.unwrap_or(&ter.mode);
+    let venue = venue_for(mode, args.venue.as_deref().or(ter.venue.as_deref()), &dir)?;
+    if mode == "simulation" && venue == "sim86" {
+        return Ok(());
+    }
+    Err(CliError::new(
+        "bad_request",
+        format!(
+            "A live run is a simulation on sim86 for now, and this run would go to {venue} ({mode}). In a terminal: `ter run --sim sim86 --live`."
+        ),
+    ))
+}
+
+/// Print a posted run, and fail as `ter run` does when it did not pass.
+pub fn report(done: Done, json: bool) -> Result<(), CliError> {
     if json {
         print_json(&done.answer);
     } else {
@@ -116,6 +137,37 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
 
 /// Build, run, judge and post; `quiet` prints nothing but errors.
 pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
+    let mut built = build(args, quiet).await?;
+    let outcome = built.on_venue()?;
+    built.finish(outcome).await
+}
+
+/// A run whose build is over, failed or not, before anything ran: all
+/// that running it on its venue and posting it need.
+pub struct Built {
+    dir: PathBuf,
+    ter: TerToml,
+    mode: String,
+    venue: &'static str,
+    sim_allowed: bool,
+    plan: Plan,
+    session: Session,
+    user: String,
+    bench: Option<remote::BenchReady>,
+    number: u32,
+    recording: PathBuf,
+    started: Instant,
+    build: crate::build::Build,
+    log_path: PathBuf,
+    previous: Option<LastRun>,
+    elf_sha256: Option<String>,
+    quiet: bool,
+    ran_in: Option<(Duration, &'static str)>,
+}
+
+/// Everything up to and including the build: the plan for the venue, the
+/// account, the run folder, cargo.
+pub async fn build(args: RunArgs, quiet: bool) -> Result<Built, CliError> {
     let json = quiet;
     let dir = exercise_dir(args.dir)?;
     let ter = TerToml::load(&dir)?;
@@ -237,187 +289,298 @@ pub async fn execute(args: RunArgs, quiet: bool) -> Result<Done, CliError> {
     let previous =
         LastRun::load(&dir)?.filter(|last| last.user == user && last.site == client.site_url());
     let elf_sha256 = build.elf.as_deref().map(file_sha256).transpose()?;
-    let mut ran_in = None;
-    let outcome = match (&plan, &build.elf) {
-        _ if !build.ok => Outcome::BuildFailed {
-            log: build.log.clone(),
-        },
-        (Plan::BuildOnly, _) => Outcome::Built,
-        (Plan::NoCheck, _) => Outcome::NoCheck,
-        (Plan::Wokwi(_) | Plan::Sim86(_) | Plan::Local(_) | Plan::Bench(_), None) => {
-            Outcome::Infra {
-                failure: Infra::VenueUnavailable,
-                output: "cargo built no program to run".into(),
-            }
-        }
-        (Plan::Sim86(sim), Some(elf)) => {
-            let Checked { file, text, ready } = sim.as_ref();
-            if !json {
-                eprintln!(
-                    "Running {} ms on sim86 (sending the program and starting the board takes a few seconds more)",
-                    file.timeout_ms
-                );
-            }
-            let t = Instant::now();
-            let mut venue = Sim86 {
+    Ok(Built {
+        dir,
+        ter,
+        mode,
+        venue,
+        sim_allowed,
+        plan,
+        session,
+        user,
+        bench,
+        number,
+        recording,
+        started,
+        build,
+        log_path,
+        previous,
+        elf_sha256,
+        quiet,
+        ran_in: None,
+    })
+}
+
+/// A sim86 run that can be watched as it happens: the check, its text,
+/// the venue ready to run it, the program and the run folder.
+pub struct LiveParts<'a> {
+    pub file: &'a CheckFile,
+    pub text: &'a str,
+    pub venue: Sim86,
+    pub elf: &'a Path,
+    pub recording: &'a Path,
+    pub ter: &'a TerToml,
+}
+
+impl Built {
+    /// What a live run needs, when this one is a checked run on sim86
+    /// whose build gave a program. Any other run goes [`Self::on_venue`].
+    pub fn live_parts(&self) -> Option<LiveParts<'_>> {
+        let (Plan::Sim86(sim), true, Some(elf)) = (&self.plan, self.build.ok, &self.build.elf)
+        else {
+            return None;
+        };
+        let Checked { file, text, ready } = sim.as_ref();
+        Some(LiveParts {
+            file,
+            text,
+            venue: Sim86 {
                 helper: ready.helper.clone(),
                 board: ready.board.clone(),
-                run_dir: recording.to_path_buf(),
+                run_dir: self.recording.clone(),
                 plan: ready.plan.clone(),
                 image: ready.image.clone(),
                 timeout_ms: file.timeout_ms,
-                capture: capture(&ter, client.cli_version(), &elf_sha256),
+                capture: capture(
+                    &self.ter,
+                    self.session.client.cli_version(),
+                    &self.elf_sha256,
+                ),
                 program: None,
-            };
-            let budget = Sim86::budget(file.timeout_ms);
-            let outcome = record_and_judge(&mut venue, file, text, elf, budget, &recording)?;
-            ran_in = Some((t.elapsed(), "on sim86"));
-            outcome
-        }
-        (Plan::Wokwi(sim), Some(elf)) => {
-            let Checked { file, text, ready } = sim.as_ref();
-            if !json {
-                eprintln!(
-                    "Running {} ms in Wokwi (a few seconds more than that)",
-                    file.timeout_ms
-                );
-            }
-            let t = Instant::now();
-            let mut wokwi = Wokwi {
-                cli: ready.cli.clone(),
-                token: ready.token.clone(),
-                run_dir: recording.to_path_buf(),
-                plan: ready.plan.clone(),
-                timeout_ms: file.timeout_ms,
-                capture: capture(&ter, client.cli_version(), &elf_sha256),
-            };
-            let budget = wokwi_budget(file.timeout_ms);
-            let outcome = record_and_judge(&mut wokwi, file, text, elf, budget, &recording)?;
-            ran_in = Some((t.elapsed(), "in Wokwi"));
-            outcome
-        }
-        (Plan::Local(hw), Some(elf)) => {
-            let Checked { file, text, ready } = hw.as_ref();
-            if !json {
-                match &ready.drive {
-                    Some(d) => eprintln!(
-                        "Copying the program to {}, then {} ms of serial",
-                        d.path.display(),
-                        file.timeout_ms
-                    ),
-                    None => eprintln!(
-                        "Flashing with {} on {}, then {} ms of serial",
-                        ready.tool.program(),
-                        ready.port.path,
-                        file.timeout_ms
-                    ),
+            },
+            elf,
+            recording: &self.recording,
+            ter: &self.ter,
+        })
+    }
+
+    /// Say where the run ran and for how long, for the text `ter run`
+    /// prints.
+    pub fn ran(&mut self, took: Duration, on: &'static str) {
+        self.ran_in = Some((took, on));
+    }
+
+    /// Run the program on the plan's venue and judge the recording; a
+    /// failed build, or a run with nothing to check, is its own outcome.
+    pub fn on_venue(&mut self) -> Result<Outcome, CliError> {
+        let bench = self.bench.take();
+        let json = self.quiet;
+        let (plan, build, recording, ter, elf_sha256) = (
+            &self.plan,
+            &self.build,
+            &self.recording,
+            &self.ter,
+            &self.elf_sha256,
+        );
+        let client = &self.session.client;
+        let mut ran_in = None;
+        let outcome = match (plan, &build.elf) {
+            _ if !build.ok => Outcome::BuildFailed {
+                log: build.log.clone(),
+            },
+            (Plan::BuildOnly, _) => Outcome::Built,
+            (Plan::NoCheck, _) => Outcome::NoCheck,
+            (Plan::Wokwi(_) | Plan::Sim86(_) | Plan::Local(_) | Plan::Bench(_), None) => {
+                Outcome::Infra {
+                    failure: Infra::VenueUnavailable,
+                    output: "cargo built no program to run".into(),
                 }
             }
-            let t = Instant::now();
-            let mut local = Local::new(
-                ready.tool.clone(),
-                ready.program.clone(),
-                ready.port.clone(),
-                recording.to_path_buf(),
-                file.timeout_ms,
-            );
-            local.capture = capture(&ter, client.cli_version(), &elf_sha256);
-            local.drive = ready.drive.clone();
-            let budget = board_budget(file.timeout_ms);
-            let outcome = record_and_judge(&mut local, file, text, elf, budget, &recording)?;
-            ran_in = Some((t.elapsed(), "on the board"));
-            outcome
-        }
-        (Plan::Bench(b), Some(elf)) => {
-            let Checked { file, text, .. } = b.as_ref();
-            let bench = bench.expect("a bench plan has a bench");
-            if !json {
-                eprintln!(
-                    "Sending the program to {} at {}, then {} ms of serial",
-                    bench.link.label, bench.url, file.timeout_ms
-                );
+            (Plan::Sim86(sim), Some(elf)) => {
+                let Checked { file, text, ready } = sim.as_ref();
+                if !json {
+                    eprintln!(
+                        "Running {} ms on sim86 (sending the program and starting the board takes a few seconds more)",
+                        file.timeout_ms
+                    );
+                }
+                let t = Instant::now();
+                let mut venue = Sim86 {
+                    helper: ready.helper.clone(),
+                    board: ready.board.clone(),
+                    run_dir: recording.to_path_buf(),
+                    plan: ready.plan.clone(),
+                    image: ready.image.clone(),
+                    timeout_ms: file.timeout_ms,
+                    capture: capture(ter, client.cli_version(), elf_sha256),
+                    program: None,
+                };
+                let budget = Sim86::budget(file.timeout_ms);
+                let outcome = record_and_judge(&mut venue, file, text, elf, budget, recording)?;
+                ran_in = Some((t.elapsed(), "on sim86"));
+                outcome
             }
-            let t = Instant::now();
-            let mut venue = bench.venue(&ter, file.timeout_ms, recording.to_path_buf());
-            venue.capture = capture(&ter, client.cli_version(), &elf_sha256);
-            let budget = board_budget(file.timeout_ms);
-            let outcome = record_and_judge(&mut venue, file, text, elf, budget, &recording)?;
-            ran_in = Some((t.elapsed(), "on the bench"));
-            outcome
-        }
-    };
-    let record = assemble(
-        RunContext {
-            ter: &ter,
-            mode: &mode,
-            venue: matches!(
-                plan,
-                Plan::Wokwi(_) | Plan::Sim86(_) | Plan::Local(_) | Plan::Bench(_)
-            )
-            .then_some(venue),
+            (Plan::Wokwi(sim), Some(elf)) => {
+                let Checked { file, text, ready } = sim.as_ref();
+                if !json {
+                    eprintln!(
+                        "Running {} ms in Wokwi (a few seconds more than that)",
+                        file.timeout_ms
+                    );
+                }
+                let t = Instant::now();
+                let mut wokwi = Wokwi {
+                    cli: ready.cli.clone(),
+                    token: ready.token.clone(),
+                    run_dir: recording.to_path_buf(),
+                    plan: ready.plan.clone(),
+                    timeout_ms: file.timeout_ms,
+                    capture: capture(ter, client.cli_version(), elf_sha256),
+                };
+                let budget = wokwi_budget(file.timeout_ms);
+                let outcome = record_and_judge(&mut wokwi, file, text, elf, budget, recording)?;
+                ran_in = Some((t.elapsed(), "in Wokwi"));
+                outcome
+            }
+            (Plan::Local(hw), Some(elf)) => {
+                let Checked { file, text, ready } = hw.as_ref();
+                if !json {
+                    match &ready.drive {
+                        Some(d) => eprintln!(
+                            "Copying the program to {}, then {} ms of serial",
+                            d.path.display(),
+                            file.timeout_ms
+                        ),
+                        None => eprintln!(
+                            "Flashing with {} on {}, then {} ms of serial",
+                            ready.tool.program(),
+                            ready.port.path,
+                            file.timeout_ms
+                        ),
+                    }
+                }
+                let t = Instant::now();
+                let mut local = Local::new(
+                    ready.tool.clone(),
+                    ready.program.clone(),
+                    ready.port.clone(),
+                    recording.to_path_buf(),
+                    file.timeout_ms,
+                );
+                local.capture = capture(ter, client.cli_version(), elf_sha256);
+                local.drive = ready.drive.clone();
+                let budget = board_budget(file.timeout_ms);
+                let outcome = record_and_judge(&mut local, file, text, elf, budget, recording)?;
+                ran_in = Some((t.elapsed(), "on the board"));
+                outcome
+            }
+            (Plan::Bench(b), Some(elf)) => {
+                let Checked { file, text, .. } = b.as_ref();
+                let bench = bench.expect("a bench plan has a bench");
+                if !json {
+                    eprintln!(
+                        "Sending the program to {} at {}, then {} ms of serial",
+                        bench.link.label, bench.url, file.timeout_ms
+                    );
+                }
+                let t = Instant::now();
+                let mut venue = bench.venue(ter, file.timeout_ms, recording.to_path_buf());
+                venue.capture = capture(ter, client.cli_version(), elf_sha256);
+                let budget = board_budget(file.timeout_ms);
+                let outcome = record_and_judge(&mut venue, file, text, elf, budget, recording)?;
+                ran_in = Some((t.elapsed(), "on the bench"));
+                outcome
+            }
+        };
+        self.ran_in = ran_in;
+        Ok(outcome)
+    }
+
+    /// Post the run with `outcome` and keep it as the exercise's last run.
+    pub async fn finish(self, outcome: Outcome) -> Result<Done, CliError> {
+        let Built {
+            dir,
+            ter,
+            mode,
+            venue,
+            sim_allowed,
+            plan,
+            session,
+            user,
+            number,
+            recording,
+            started,
+            build,
+            log_path,
+            previous,
             elf_sha256,
-            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            hints_used: previous.as_ref().map_or(0, |p| p.hints.used),
-            cli_version: client.cli_version(),
-        },
-        &outcome,
-    );
+            ran_in,
+            ..
+        } = self;
+        let client = &session.client;
+        let record = assemble(
+            RunContext {
+                ter: &ter,
+                mode: &mode,
+                venue: matches!(
+                    plan,
+                    Plan::Wokwi(_) | Plan::Sim86(_) | Plan::Local(_) | Plan::Bench(_)
+                )
+                .then_some(venue),
+                elf_sha256,
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                hints_used: previous.as_ref().map_or(0, |p| p.hints.used),
+                cli_version: client.cli_version(),
+            },
+            &outcome,
+        );
 
-    let relative = PathBuf::from(ter_sdk::project::RUNS_DIR).join(number.to_string());
-    let answer = client.post_run(&record).await.map_err(|e| {
-        let mut err = session.forget_dead_token(e.into());
-        err.message.push_str(&format!(
-            " The run was not recorded on the site; its build log is in {}.",
-            log_path.display()
-        ));
-        err
-    })?;
-    LastRun {
-        user,
-        site: client.site_url().to_string(),
-        record: record.clone(),
-        answer: answer.clone(),
-        posted_at: rfc3339_utc(SystemTime::now()),
-        recording: relative,
-        hints: Default::default(),
-        last_hint: None,
-    }
-    .save(&dir)?;
+        let relative = PathBuf::from(ter_sdk::project::RUNS_DIR).join(number.to_string());
+        let answer = client.post_run(&record).await.map_err(|e| {
+            let mut err = session.forget_dead_token(e.into());
+            err.message.push_str(&format!(
+                " The run was not recorded on the site; its build log is in {}.",
+                log_path.display()
+            ));
+            err
+        })?;
+        LastRun {
+            user,
+            site: client.site_url().to_string(),
+            record: record.clone(),
+            answer: answer.clone(),
+            posted_at: rfc3339_utc(SystemTime::now()),
+            recording: relative,
+            hints: Default::default(),
+            last_hint: None,
+        }
+        .save(&dir)?;
 
-    let failure = failure(&outcome, &log_path, &recording);
-    // What the venue recorded, for whoever shows the run. Read back from
-    // the run folder, like the verdicts.
-    let shown = matches!(outcome, Outcome::Checked { .. })
-        .then(|| Recording::read(&recording).ok())
-        .flatten()
-        .map(|rec| {
-            let nets = match &plan {
-                Plan::Sim86(sim) => sim
-                    .ready
-                    .plan
-                    .watch
-                    .iter()
-                    .map(|w| (w.pin.clone(), w.net.clone()))
-                    .collect(),
-                _ => Default::default(),
-            };
-            events::shown(&rec, &ter.pins, &nets)
-        });
-    let mut answer_json = answer_json(&record, &answer, &outcome, &recording, failure.as_ref());
-    if let Some(shown) = shown {
-        shown.put_into(&mut answer_json);
+        let failure = failure(&outcome, &log_path, &recording);
+        // What the venue recorded, for whoever shows the run. Read back from
+        // the run folder, like the verdicts.
+        let shown = matches!(outcome, Outcome::Checked { .. })
+            .then(|| Recording::read(&recording).ok())
+            .flatten()
+            .map(|rec| {
+                let nets = match &plan {
+                    Plan::Sim86(sim) => sim
+                        .ready
+                        .plan
+                        .watch
+                        .iter()
+                        .map(|w| (w.pin.clone(), w.net.clone()))
+                        .collect(),
+                    _ => Default::default(),
+                };
+                events::shown(&rec, &ter.pins, &nets)
+            });
+        let mut answer_json = answer_json(&record, &answer, &outcome, &recording, failure.as_ref());
+        if let Some(shown) = shown {
+            shown.put_into(&mut answer_json);
+        }
+        Ok(Done {
+            answer: answer_json,
+            failure,
+            record,
+            site: answer,
+            outcome,
+            built_in: build.duration,
+            ran_in,
+            local: matches!(plan, Plan::Local(_) | Plan::Bench(_)),
+            sim_allowed,
+        })
     }
-    Ok(Done {
-        answer: answer_json,
-        failure,
-        record,
-        site: answer,
-        outcome,
-        built_in: build.duration,
-        ran_in,
-        local: matches!(plan, Plan::Local(_) | Plan::Bench(_)),
-        sim_allowed,
-    })
 }
 
 /// How long Wokwi may take for `timeout_ms` of simulated time: wokwi-cli
@@ -465,15 +628,22 @@ fn record_and_judge(
         .prepare(elf)
         .and_then(|()| venue.reset())
         .and_then(|()| venue.run(&file.stimuli(), budget));
-    let rec = match recorded {
-        Ok(rec) => rec,
-        Err(e) => {
-            return Ok(Outcome::Infra {
-                failure: e.failure.into(),
-                output: format!("{}\n{}", e.message, e.output),
-            });
-        }
-    };
+    match recorded {
+        Ok(rec) => judge(&rec, text, recording),
+        Err(e) => Ok(infra(&e)),
+    }
+}
+
+/// A venue's failure as a run's outcome: posted as not run.
+pub fn infra(e: &ter_telemetry::VenueError) -> Outcome {
+    Outcome::Infra {
+        failure: e.failure.into(),
+        output: format!("{}\n{}", e.message, e.output),
+    }
+}
+
+/// Write `rec` into the run folder `recording` and judge it there.
+pub fn judge(rec: &Recording, text: &str, recording: &Path) -> Result<Outcome, CliError> {
     let events = recording.join(ter_telemetry::recording::EVENTS_FILE);
     rec.write(&events).map_err(|e| {
         CliError::new(
