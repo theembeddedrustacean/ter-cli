@@ -3365,6 +3365,7 @@ async fn sim86_not_installed_no_key_or_no_credits_stops_before_the_build() {
     std::fs::remove_dir_all(m.tools.path().join("sim86")).unwrap();
     let msg = sim86_refused(&m, "venue_unavailable").await;
     assert!(msg.contains("ter install sim86"), "{msg}");
+    assert!(msg.contains("needs Python 3.9 or newer"), "{msg}");
 
     let balance = |m: &Machine, text: &str| {
         std::fs::write(m.sim86_bin().join("balance.json"), text).unwrap();

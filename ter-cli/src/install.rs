@@ -234,7 +234,7 @@ struct Sim86Installed {
 }
 
 /// The oldest Python the sim86 package runs on.
-const MIN_PYTHON: (u32, u32) = (3, 9);
+pub const MIN_PYTHON: (u32, u32) = (3, 9);
 
 /// `Python 3.12.3` as `(3, 12)`.
 fn python_version(said: &str) -> Option<(u32, u32)> {

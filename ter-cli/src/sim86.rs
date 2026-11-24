@@ -203,9 +203,10 @@ pub fn account(answer: Result<Balance, Failure>) -> Result<Option<Balance>, CliE
 /// cannot be used on this machine.
 fn helper() -> Result<Helper, CliError> {
     let helper = installed().ok_or_else(|| {
-        unavailable(
-            "sim86 is not installed. `ter install sim86` installs it; it runs on your own sim86 account.",
-        )
+        let (major, minor) = crate::install::MIN_PYTHON;
+        unavailable(format!(
+            "sim86 is not installed. `ter install sim86` installs it, and needs Python {major}.{minor} or newer on this machine; it runs on your own sim86 account."
+        ))
     })?;
     write_helper(&helper).map_err(|e| {
         CliError::new(

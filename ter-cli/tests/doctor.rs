@@ -532,7 +532,7 @@ fn venues_still_answers_in_the_same_shape() {
     assert_eq!(sim86["ready"], false);
     assert_eq!(
         sim86["reason"],
-        "sim86 is not installed. `ter install sim86` installs it; it runs on your own sim86 account."
+        "sim86 is not installed. `ter install sim86` installs it, and needs Python 3.9 or newer on this machine; it runs on your own sim86 account."
     );
     assert_no_token(&out);
 }
