@@ -5,6 +5,8 @@
     ter_sim86.py live <request.json>   run a program until told to stop,
                                        printing what it does as it runs
     ter_sim86.py balance               the account's plan and credits
+    ter_sim86.py view <run>            the address of sim86's own page
+                                       for a run, signed in, no network
     ter_sim86.py version               the sim86 package found and whether
                                        it has a key, no network
 
@@ -29,7 +31,7 @@ import threading
 import time
 import warnings
 
-HELPER = 3
+HELPER = 4
 
 # A trace comes back exact, every edge with its time, only while it has
 # few enough edges; past that it is a summary. A slice is cut to hold
@@ -467,6 +469,21 @@ def balance():
     return {"balance": {"credits": int(credits), "plan": str(details.get("plan") or "")}}
 
 
+def view(run_id):
+    """The address of sim86's own page for a run, signed in the way the
+    package's `open_live` does it: the key rides in the #fragment, which a
+    browser never sends to a server."""
+    import urllib.parse
+
+    from sim86 import Client
+
+    client = Client()
+    key = client.api_key
+    if not key:
+        raise Failed("no_key", "sim86 has no key on this machine")
+    return {"view": f"{client.live_url(run_id)}#{urllib.parse.urlencode({'key': key})}"}
+
+
 def has_key():
     """Whether the package finds a key (the environment, a token.env, or
     the one `sim86 login` stored). The key itself stays with the package."""
@@ -492,10 +509,12 @@ def main(argv):
                 out.update(live(json.load(f)))
         elif mode == "balance":
             out.update(balance())
+        elif mode == "view" and len(argv) > 2:
+            out.update(view(argv[2]))
         elif mode == "version":
             out["key"] = has_key()
         else:
-            raise Failed("internal", "usage: ter_sim86.py run <request.json> | live <request.json> | balance | version")
+            raise Failed("internal", "usage: ter_sim86.py run <request.json> | live <request.json> | balance | view <run> | version")
         out["ok"] = True
     except Failed as e:
         out["error"] = {"kind": e.kind, "message": e.message}

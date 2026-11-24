@@ -99,7 +99,7 @@ exit 42
 "#;
 
 /// Plays the Python that holds the sim86 package, running ter's helper:
-/// `python <helper> version|balance|run <request>`. It answers with the
+/// `python <helper> version|balance|view <run>|run <request>|live <request>`. It answers with the
 /// JSON beside it (`balance.json`, `run.json`: what the real helper
 /// printed, recorded) and keeps what it was given for the test to look at.
 /// Its package has a key of its own once `has-key` is beside it.
@@ -110,7 +110,7 @@ cp "$1" "$here/got-helper.py"
 case "$2" in
   version)
     key=false; [ -f "$here/has-key" ] && key=true
-    echo "{\"helper\": 3, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"0.1.4\", \"key\": $key}" ;;
+    echo "{\"helper\": 4, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"0.1.4\", \"key\": $key}" ;;
   balance) cat "$here/balance.json" ;;
   run)
     cp "$3" "$here/got-request.json"
@@ -133,7 +133,9 @@ case "$2" in
       echo "${word:-gone}" >> "$here/got-stop"
       echo '{"ev": "ended", "reason": "stopped"}'
     fi
-    echo '{"helper": 3, "ok": true, "run": "sim86-run-1"}' ;;
+    echo '{"helper": 4, "ok": true, "run": "sim86-run-1"}' ;;
+  view)
+    echo "{\"helper\": 4, \"ok\": true, \"view\": \"https://app.sim86.com/live/$3#key=$SIM86_API_KEY\"}" ;;
 esac
 "#;
 
@@ -2656,6 +2658,25 @@ impl Served {
             .as_u16()
     }
 
+    /// What `/live/<id>/view` answers the frame in the lesson page with:
+    /// the status and where it sends the browser. A frame names no origin.
+    async fn live_view(&self, id: &str) -> (u16, String) {
+        let r = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!("{}/live/{id}/view", self.url))
+            .send()
+            .await
+            .unwrap();
+        let to = r
+            .headers()
+            .get("location")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        (r.status().as_u16(), to)
+    }
+
     async fn live_post(&self, id: &str, what: &str, body: Value) -> (u16, Value) {
         let r = reqwest::Client::new()
             .post(format!("{}/live/{id}/{what}", self.url))
@@ -2700,6 +2721,7 @@ async fn serve_shows_a_sim86_run_live_and_stops_it_when_told() {
         "nothing is posted yet"
     );
     let id = v["live"].as_str().unwrap().to_string();
+    assert_eq!(id.len(), 32, "an id nobody can guess: {id}");
 
     let mut events = LiveStream::open(&served, &id).await;
     let (name, first) = events.next().await.unwrap();
@@ -2708,6 +2730,17 @@ async fn serve_shows_a_sim86_run_live_and_stops_it_when_told() {
         first,
         json!({"t_ms": 0.0, "pin": "GPIO3", "name": "user_led", "net": "mcu.D1", "level": 0})
     );
+
+    // The frame in the page is sent on to sim86's own page for the run,
+    // signed in with the learner's key, which only the browser gets.
+    assert_eq!(
+        served.live_view(&id).await,
+        (
+            302,
+            format!("https://app.sim86.com/live/sim86-run-1#key={SIM86_KEY}")
+        )
+    );
+    assert_eq!(served.live_view("0123").await.0, 404);
     let (_, edge) = events.next().await.unwrap();
     assert_eq!(
         (&edge["t_ms"], &edge["level"]),
@@ -2750,6 +2783,7 @@ async fn serve_shows_a_sim86_run_live_and_stops_it_when_told() {
     // Over: a browser that reconnects the closed stream by itself gets no
     // new one, and the run cannot be extended.
     assert_eq!(served.live_status(&id).await, 404);
+    assert_eq!(served.live_view(&id).await, (404, String::new()));
     let (status, v) = served.live_post(&id, "extend", json!({"add_s": 60})).await;
     assert_eq!(
         (status, v["error"]["code"].as_str()),

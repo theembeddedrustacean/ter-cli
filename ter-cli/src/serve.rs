@@ -159,6 +159,11 @@ impl Service for Serve {
         Ok(json!({"ok": true}))
     }
 
+    fn live_view(&self, id: &str) -> Result<String, ServeError> {
+        let live = self.0.live(id).ok_or_else(|| no_live(id))?;
+        live.view().map_err(|e| ServeError::new(&e.code, e.message))
+    }
+
     fn run(&self, request: RunRequest) -> RunFuture {
         let inner = self.0.clone();
         Box::pin(async move { handle(inner, request).await.map_err(|f| f.0) })

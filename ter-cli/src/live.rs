@@ -18,6 +18,7 @@
 //! goes away.
 
 use std::collections::BTreeMap;
+use std::hash::{BuildHasher, Hasher};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,6 +64,18 @@ fn unix_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// A name for a run that cannot be guessed: whoever has it may see the
+/// run and its sim86 page. From the randomness the standard library seeds
+/// its hash maps with.
+fn new_id() -> String {
+    let word = || {
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    };
+    format!("{:016x}{:016x}", word(), word())
+}
+
 struct State {
     /// When ter stops the run, in Unix ms.
     ends_at: u64,
@@ -82,6 +95,7 @@ pub struct Live {
     pub sim86_run: String,
     /// When the board started, in Unix ms.
     pub started_at: u64,
+    helper: sim86::Helper,
     state: Mutex<State>,
     events: broadcast::Sender<LiveEvent>,
     stop: mpsc::UnboundedSender<&'static str>,
@@ -99,6 +113,27 @@ impl Live {
 
     pub fn ended(&self) -> bool {
         self.state().ended.is_some()
+    }
+
+    /// The address of sim86's own page for the run, signed in as the
+    /// learner, while the run is on. The key is in it: it is handed to
+    /// the learner's browser and never printed or kept.
+    pub fn view(&self) -> Result<String, CliError> {
+        if self.ended() {
+            return Err(CliError::new(
+                "not_found",
+                format!("Live run {:?} is over.", self.id),
+            ));
+        }
+        self.helper.view(&self.sim86_run).map_err(|failure| {
+            CliError::new(
+                "venue_unavailable",
+                format!(
+                    "sim86's page for the run could not be shown: {}.",
+                    failure.message
+                ),
+            )
+        })
     }
 
     /// What `/run` answers with.
@@ -337,9 +372,10 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
     let (stop, stop_rx) = mpsc::unbounded_channel();
     let (over_tx, over) = watch::channel(false);
     let live = Arc::new(Live {
-        id: format!("{:x}", started_at ^ (u64::from(std::process::id()) << 44)),
+        id: new_id(),
         sim86_run,
         started_at,
+        helper: venue.helper.clone(),
         state: Mutex::new(State {
             ends_at: started_at + limit_s.min(LIVE_CAP_S) * 1_000,
             ended: None,

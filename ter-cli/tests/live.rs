@@ -2243,6 +2243,30 @@ fn live_serve_shows_a_run_on_sim86_as_it_happens_and_stops_it() {
                 .await
                 .unwrap();
             assert_eq!(stream.status(), 200);
+
+            // The frame in the page: sent on to sim86's own page for this
+            // run, with the key after the `#`. The address is never
+            // printed here.
+            let frame = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap()
+                .get(format!("{url}/live/{id}/view"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(frame.status(), 302);
+            let to = frame.headers()["location"].to_str().unwrap().to_string();
+            let (address, key) = to.split_once("#key=").expect("a key after the #");
+            assert_eq!(
+                address,
+                format!(
+                    "https://app.sim86.com/live/{}",
+                    live["sim86_run"].as_str().unwrap()
+                )
+            );
+            assert!(key.len() > 8, "a key of {} characters", key.len());
+
             let post = |what: &'static str, body: Value| {
                 let request = page
                     .post(format!("{url}/live/{id}/{what}"))

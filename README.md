@@ -36,9 +36,12 @@ that can run an exercise. A lesson page that shows the exercise on a sim86
 board asks `ter serve` for that run on sim86.
 
 A run on sim86 can be watched as it happens. The lesson page shows the
-board live; in a terminal, `ter run --sim sim86 --live` prints the pin
-changes and the serial output as they come, until Ctrl-C or the limit
-(`--limit <seconds>`, 60 unless given, 600 at most), then the verdicts.
+board live, in sim86's own view of the run, which `ter serve` opens signed
+in with your sim86 key (the key goes from ter to your browser and to
+sim86, never to the lesson site). In a terminal, `ter run --sim sim86
+--live` prints the pin changes and the serial output as they come, until
+Ctrl-C or the limit (`--limit <seconds>`, 60 unless given, 600 at most),
+then the verdicts.
 sim86 charges your account for every minute a board runs, so ter stops a
 live run when its time is up, and when the page that started it is closed.
 

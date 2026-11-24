@@ -185,6 +185,14 @@ pub trait Service: Send + Sync + 'static {
     fn live_stop(&self, id: &str) -> Result<Value, ServeError> {
         Err(no_live(id))
     }
+    /// The address of the simulator's own page for live run `id`, signed
+    /// in as the learner, for `/live/<id>/view` to send the browser to.
+    /// It may hold the learner's key: it goes into the `Location` of the
+    /// answer and nowhere else. May take a moment (it is called off the
+    /// async threads).
+    fn live_view(&self, id: &str) -> Result<String, ServeError> {
+        Err(no_live(id))
+    }
 }
 
 /// The answer for a live run this service does not have.
@@ -388,6 +396,7 @@ pub fn router(service: Arc<dyn Service>, port: u16, site_origin: &str, dev: bool
         .route("/live/{id}/events", get(live_events))
         .route("/live/{id}/extend", post(live_extend))
         .route("/live/{id}/stop", post(live_stop))
+        .route("/live/{id}/view", get(live_view))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(ctx.clone(), guard))
         .with_state(ctx)
@@ -494,10 +503,49 @@ async fn live_stop(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
     }
 }
 
+/// The lesson page frames this address; the browser goes on to the
+/// simulator's own page for the run. The frame's request names no origin,
+/// so what guards it is the run's id, which only the page that started
+/// the run was told.
+async fn live_view(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    let service = ctx.service.clone();
+    let asked = id.clone();
+    let found = tokio::task::spawn_blocking(move || service.live_view(&asked))
+        .await
+        .unwrap_or_else(|_| Err(no_live(&id)));
+    let to = match found.map(|to| HeaderValue::from_str(&to)) {
+        Ok(Ok(to)) => to,
+        Ok(Err(_)) => {
+            return ServeError::new("venue_unavailable", "The simulator gave no page to show.")
+                .into_response();
+        }
+        Err(e) => return e.into_response(),
+    };
+    let mut r = Response::new(Body::empty());
+    *r.status_mut() = StatusCode::FOUND;
+    let h = r.headers_mut();
+    h.insert(header::LOCATION, to);
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    r
+}
+
+/// `/live/<id>/view`: the one `/live` path a frame asks for, not a script.
+fn is_view(method: &Method, path: &str) -> bool {
+    method == Method::GET
+        && path
+            .strip_prefix("/live/")
+            .and_then(|rest| rest.strip_suffix("/view"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
 async fn not_found() -> Response {
     ServeError::new(
         "not_found",
-        "ter serve answers /health, /run and /live/<id>/events, /extend and /stop.",
+        "ter serve answers /health, /run and /live/<id>/events, /extend, /stop and /view.",
     )
     .into_response()
 }
@@ -546,6 +594,7 @@ async fn guard(State(ctx): State<Ctx>, request: Request, next: Next) -> Response
         .into_response()
     } else if origin.is_none()
         && (matches!(path.as_str(), "/run" | "/run/") || path.starts_with("/live/"))
+        && !is_view(&method, &path)
     {
         ServeError::new(
             "origin_refused",
@@ -1136,6 +1185,11 @@ mod tests {
                 _ => Err(no_live(id)),
             }
         }
+        fn live_view(&self, id: &str) -> Result<String, ServeError> {
+            (id == "l1")
+                .then(|| "https://sim.example/live/r1#key=k".to_string())
+                .ok_or_else(|| no_live(id))
+        }
     }
 
     #[tokio::test]
@@ -1202,6 +1256,33 @@ mod tests {
             assert_eq!(h[header::ACCESS_CONTROL_ALLOW_HEADERS], "Content-Type");
             assert_eq!(h["access-control-allow-private-network"], "true");
         }
+
+        // The frame in the lesson page is sent on to the simulator's own
+        // page. A frame names no origin; a script of another page is
+        // refused as everywhere, and cannot read where a frame went.
+        for origin in [None, Some(SITE)] {
+            let (status, h, _) = send(&app, req("GET", "/live/l1/view", origin, "")).await;
+            assert_eq!(status, StatusCode::FOUND, "{origin:?}");
+            assert_eq!(h[header::LOCATION], "https://sim.example/live/r1#key=k");
+            assert_eq!(h[header::CACHE_CONTROL], "no-store");
+            assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+        }
+        let (status, _, v) = send(&app, req("GET", "/live/l2/view", None, "")).await;
+        assert_eq!(
+            (status, &v["error"]["code"]),
+            (StatusCode::NOT_FOUND, &json!("not_found"))
+        );
+        let (status, _, v) = send(&app, req("GET", "/live/l1/view", Some(OTHER), "")).await;
+        assert_eq!(
+            (status, &v["error"]["code"]),
+            (StatusCode::FORBIDDEN, &json!("origin_refused"))
+        );
+        let (status, _, _) = send(&app, req("POST", "/live/l1/view", None, "")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "only a GET goes without an origin"
+        );
 
         // Another page, or no page at all, gets nothing and stops nothing.
         for origin in [Some(OTHER), None] {

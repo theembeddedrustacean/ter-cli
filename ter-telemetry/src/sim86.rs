@@ -45,7 +45,7 @@ pub const PINS_FILE: &str = "sim86/pins.json";
 pub const HELPER: &str = include_str!("sim86_helper.py");
 pub const HELPER_FILE: &str = "ter_sim86.py";
 /// The `helper` number in the script's answers.
-pub const HELPER_VERSION: u64 = 3;
+pub const HELPER_VERSION: u64 = 4;
 /// What `pip install` is asked for.
 pub const PACKAGE: &str = "sim86>=0.1.4,<0.2";
 /// The package version this ter was tested with.
@@ -510,6 +510,9 @@ pub struct Answer {
     /// Whether the package finds a key, from the helper's `version`.
     #[serde(default)]
     pub key: Option<bool>,
+    /// From the helper's `view`. It holds the key: never print or keep it.
+    #[serde(default)]
+    pub view: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -802,6 +805,15 @@ impl Helper {
         self.call(&["balance".into()], Duration::from_secs(60), None)?
             .balance
             .ok_or_else(|| Failure::new(FailureKind::Api, "sim86 gave no balance"))
+    }
+
+    /// The address of sim86's own page for run `run`, signed in: the key
+    /// is in its `#fragment`, so it goes to the learner's browser and
+    /// nowhere else. Never print or keep it. Asks sim86 nothing.
+    pub fn view(&self, run: &str) -> Result<String, Failure> {
+        self.call(&["view".into(), run.into()], Duration::from_secs(30), None)?
+            .view
+            .ok_or_else(|| Failure::new(FailureKind::Helper, "it gave no address"))
     }
 }
 
