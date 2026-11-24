@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "ter-check"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -2361,7 +2361,7 @@ dependencies = [
 
 [[package]]
 name = "ter-cli"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "apple-native-keyring-store",
  "clap",
@@ -2392,7 +2392,7 @@ dependencies = [
 
 [[package]]
 name = "ter-flash"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serialport",
  "tempfile",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "ter-gen"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "tempfile",
  "toml",
@@ -2408,7 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "ter-remote"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2423,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "ter-sdk"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base64 0.23.1",
  "reqwest",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "ter-telemetry"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
