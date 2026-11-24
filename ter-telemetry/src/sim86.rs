@@ -547,19 +547,6 @@ pub fn events(
     stimuli: &[Stimulus],
     timeout_ms: u64,
 ) -> Result<Vec<Event>, Failure> {
-    events_until(answer, plan, stimuli, timeout_ms, false).map(|(events, _)| events)
-}
-
-/// As [`events`], with where the recording ends, in ns. With `short`, a
-/// recording that stops before `timeout_ms` (a live run that was stopped,
-/// or ended by itself) is taken as far as it goes instead of refused.
-pub fn events_until(
-    answer: &Answer,
-    plan: &Plan,
-    stimuli: &[Stimulus],
-    timeout_ms: u64,
-    short: bool,
-) -> Result<(Vec<Event>, u64), Failure> {
     let fail = |kind, message: String| Err(Failure::new(kind, message));
     if answer.paused_at_start != Some(true) || answer.started_ns != Some(0) {
         return fail(
@@ -570,22 +557,18 @@ pub fn events_until(
             },
         );
     }
-    let whole_ns = timeout_ms * 1_000_000;
-    let end_ns = match answer.end_ns {
-        Some(ns) if ns == whole_ns => ns,
-        Some(ns) if short && ns < whole_ns => ns,
-        _ => {
-            return fail(
-                FailureKind::Ended,
-                format!("the recording does not reach {timeout_ms} ms"),
-            );
-        }
-    };
+    let end_ns = timeout_ms * 1_000_000;
+    if answer.end_ns != Some(end_ns) {
+        return fail(
+            FailureKind::Ended,
+            format!("the recording does not reach {timeout_ms} ms"),
+        );
+    }
     let pressed = |s: &Stimulus| match &s.kind {
         StimulusKind::Press { name } | StimulusKind::Release { name } => Some(name.clone()),
         StimulusKind::Reset | StimulusKind::Power { .. } => None,
     };
-    for s in stimuli.iter().filter(|s| s.at_ms * 1_000_000 < end_ns) {
+    for s in stimuli.iter().filter(|s| s.at_ms < timeout_ms) {
         let Some(name) = pressed(s) else { continue };
         let wanted = stimuli
             .iter()
@@ -650,7 +633,7 @@ pub fn events_until(
         });
     }
     out.sort_by_key(|e| e.t_us);
-    Ok((out, end_ns))
+    Ok(out)
 }
 
 /// One line the helper's `live` mode prints while a run goes on.
@@ -666,7 +649,7 @@ pub enum LiveLine {
         source: String,
         line: String,
     },
-    /// The check's window, or what there was of it: the shape a `run`
+    /// The check's window, once its time is up: the shape a `run`
     /// answers with.
     Recording(Box<Answer>),
     /// The run is over: sim86's reason, or `stopped` when ter asked.
@@ -888,23 +871,20 @@ impl Sim86 {
         request
     }
 
-    /// The recording of a run the helper answered with. `short`: a run
-    /// that stopped before the check's time was up is recorded as far as
-    /// it went.
+    /// The recording of a run the helper answered with.
     pub fn recording(
         &self,
         answer: &Answer,
         stimuli: &[Stimulus],
         started_at: String,
-        short: bool,
     ) -> Result<Recording, Failure> {
-        let (events, end_ns) = events_until(answer, &self.plan, stimuli, self.timeout_ms, short)?;
+        let events = events(answer, &self.plan, stimuli, self.timeout_ms)?;
         let mut capture = self.capture.clone();
         capture.venue = "sim86".into();
         capture.provides = self.provides();
         capture.pins = self.plan.watch.iter().map(|w| w.pin.clone()).collect();
         capture.stimuli = stimuli.to_vec();
-        capture.end_us = end_ns / 1_000;
+        capture.end_us = self.timeout_ms * 1_000;
         capture.started_at = started_at;
         capture.ended_at = crate::rfc3339_now();
         Ok(Recording { capture, events })
@@ -991,7 +971,7 @@ impl Venue for Sim86 {
         // per run would only fill the disk.
         let _ = std::fs::remove_file(self.run_dir.join(FIRMWARE));
         answered
-            .and_then(|answer| self.recording(&answer, stimuli, started_at, false))
+            .and_then(|answer| self.recording(&answer, stimuli, started_at))
             .map_err(|failure| self.failure(&failure))
     }
 
@@ -1432,38 +1412,6 @@ mod tests {
         ] {
             assert_eq!(live_line(other), None, "{other}");
         }
-    }
-
-    #[test]
-    fn a_live_run_that_stopped_early_is_recorded_as_far_as_it_went() {
-        let plan = nucleo_plan();
-        let answer = Answer {
-            end_ns: Some(1_200_000_000),
-            pins: [(
-                "mcu.D13".to_string(),
-                Net {
-                    initial: Some(0),
-                    edges: vec![(1_513_000, 1), (1_001_513_000, 0)],
-                },
-            )]
-            .into(),
-            ..parse(NUCLEO_RUN).unwrap()
-        };
-        // `ter run` never judges a run that did not reach the check's end.
-        let refused = events(&answer, &plan, &[], 3000).unwrap_err();
-        assert_eq!(refused.kind, FailureKind::Ended);
-        let (events, end_ns) = events_until(&answer, &plan, &[], 3000, true).unwrap();
-        assert_eq!(end_ns, 1_200_000_000);
-        assert_eq!(events.last().unwrap().t_us, 1_001_513);
-        // A press planned for after it stopped was never due.
-        let late = [press(2000, "user_button")];
-        assert!(events_until(&answer, &plan, &late, 3000, true).is_ok());
-        // Longer than the check is not a recording of it either way.
-        let long = Answer {
-            end_ns: Some(3_000_000_001),
-            ..answer
-        };
-        assert!(events_until(&long, &plan, &[], 3000, true).is_err());
     }
 
     #[test]

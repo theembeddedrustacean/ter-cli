@@ -122,6 +122,7 @@ case "$2" in
     # it runs until ter says stop or goes away, unless live-ends has it
     # end by itself.
     cp "$3" "$here/got-live-request.json"
+    if [ -f "$here/live-fails" ]; then cat "$here/live-fails"; exit 0; fi
     echo '{"ev": "started", "run": "sim86-run-1"}'
     sleep 1
     cat "$here/live.jsonl"
@@ -2901,6 +2902,21 @@ async fn ter_run_live_prints_the_run_as_it_happens_then_the_verdicts() {
     assert_eq!(m.sim86_saw("got-stop").trim(), "stop");
     assert_eq!(posted(&server, "run").await.len(), 1);
 
+    // Its time is up before the check's is: nothing is scored or posted.
+    std::fs::write(m.sim86_bin().join("live.jsonl"), live_before_the_checks()).unwrap();
+    let o = m.ter_in(
+        &server.uri(),
+        &["run", "--sim", "sim86", "--live", "--limit", "2"],
+        &m.exercise(),
+    );
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.contains("GPIO3 high") && out.contains("nothing was scored or posted"),
+        "{out}"
+    );
+    assert_eq!(posted(&server, "run").await.len(), 1);
+
     // Live is sim86's: asked of Wokwi it is refused before the build.
     let o = m.ter_in(&server.uri(), &["run", "--sim", "--live"], &m.exercise());
     let err = String::from_utf8_lossy(&o.stderr);
@@ -2908,41 +2924,108 @@ async fn ter_run_live_prints_the_run_as_it_happens_then_the_verdicts() {
     assert_eq!(posted(&server, "run").await.len(), 1);
 }
 
-/// A run that ends before the check's time is up is judged on what there
-/// was of it, and one sim86 never started answers `/run` as before.
+/// The two pin changes of [`live_blinky`], and no more: a run whose
+/// check window has not come round yet.
+#[cfg(unix)]
+fn live_before_the_checks() -> String {
+    live_blinky()
+        .lines()
+        .take(2)
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+/// A run that ends before the check's time is up is not an attempt,
+/// whatever ended it: no checks, only why it ended, and nothing posted.
+/// One sim86 never started answers `/run` as before, except that no free
+/// simulator is an error to try again on.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_live_run_that_ends_early_is_still_judged_and_one_that_never_starts_is_a_run_record() {
+async fn a_live_run_that_ends_before_its_checks_is_not_posted_and_one_that_never_starts_is_a_run_record()
+ {
     let server = site("0.1.0", run_answer()).await;
-    // The board stops by itself 1.2 s in: two edges of the heartbeat.
-    let short = format!(
-        "{}\n",
-        r#"{"ev": "recording", "run": "sim86-run-1", "started_ns": 0, "paused_at_start": true, "end_ns": 1200000000, "pins": {"mcu.D1": {"initial": 0, "edges": [[143324763, 1], [243325813, 0]]}}, "serial": [], "applied": []}"#
-    );
-    let m = live_machine(GOOD, &short);
-    std::fs::write(
-        m.sim86_bin().join("live-ends"),
-        "{\"ev\": \"ended\", \"reason\": \"firmware-exit\"}\n",
-    )
-    .unwrap();
+    let m = live_machine(GOOD, &live_before_the_checks());
     let served = m.serve(&server.uri());
+
+    // The page stops it.
     let (status, _, v) = served.run(live_ask(60)).await;
     assert_eq!(status, 200, "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let mut events = LiveStream::open(&served, &id).await;
+    let (_, before) = events.until("pin").await;
+    assert!(before.is_empty());
+    assert_eq!(served.live_post(&id, "stop", json!({})).await.0, 200);
+    let (ended, before) = events.until("ended").await;
+    assert_eq!(ended, json!({"reason": "user-stop", "detail": ""}));
+    assert!(!before.contains(&"checks".to_string()), "{before:?}");
+
+    // Its limit is shorter than the check.
+    let (_, _, v) = served.run(live_ask(2)).await;
     let mut events = LiveStream::open(&served, v["live"].as_str().unwrap()).await;
-    let (checks, _) = events.until("checks").await;
-    assert_eq!(checks["events_end_us"], 1_200_000, "{checks}");
-    // Its windows were not over: the checks say what they saw of them.
-    assert_eq!(checks["check_status"], "failed", "{checks}");
-    assert_eq!(checks["build_status"], "passed");
+    let (ended, before) = events.until("ended").await;
+    assert_eq!(ended["reason"], "limit");
+    assert!(!before.contains(&"checks".to_string()), "{before:?}");
+
+    // The board stops by itself, and sim86 fails under it.
+    for (said, reason, detail) in [
+        ("firmware-exit", "firmware-exit", "firmware-exit"),
+        (
+            "sim-exception: a non-electrical pin value on 'D13'",
+            "sim-error",
+            "a non-electrical pin value on 'D13'",
+        ),
+        ("duration", "limit", "duration"),
+    ] {
+        std::fs::write(
+            m.sim86_bin().join("live-ends"),
+            format!("{}\n", json!({"ev": "ended", "reason": said})),
+        )
+        .unwrap();
+        let (status, _, v) = served.run(live_ask(60)).await;
+        assert_eq!(status, 200, "{v}");
+        let mut events = LiveStream::open(&served, v["live"].as_str().unwrap()).await;
+        let (ended, before) = events.until("ended").await;
+        assert_eq!(ended, json!({"reason": reason, "detail": detail}));
+        assert!(!before.contains(&"checks".to_string()), "{before:?}");
+    }
     assert!(
-        checks["verdicts"].is_array(),
-        "judged as far as it went: {checks}"
+        posted(&server, "run").await.is_empty(),
+        "none of them is an attempt"
     );
-    let (ended, _) = events.until("ended").await;
+    assert!(
+        ter_sdk::run::LastRun::load(&m.exercise())
+            .unwrap()
+            .is_none(),
+        "nor the exercise's last run"
+    );
+
+    // sim86 has no simulator free: an error, nothing posted, no live run.
+    let fails = m.sim86_bin().join("live-fails");
+    std::fs::write(&fails, sim86_error("busy", "run refused: no-capacity")).unwrap();
+    let (status, _, v) = served.run(live_ask(60)).await;
     assert_eq!(
-        ended,
-        json!({"reason": "firmware-exit", "detail": "firmware-exit"})
+        (status, v["error"]["code"].as_str()),
+        (503, Some("venue_unavailable")),
+        "{v}"
     );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no free capacity"),
+        "{v}"
+    );
+    assert!(posted(&server, "run").await.is_empty());
+    // Any other refusal at the start is a run posted as not run.
+    std::fs::write(&fails, sim86_error("board", "unknown part type 'Ledd'")).unwrap();
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(
+        (&v["check_status"], v.get("live")),
+        (&json!("not_run"), None),
+        "{v}"
+    );
+    assert_eq!(posted(&server, "run").await.len(), 1);
     drop(served);
 
     // A build that fails: the run record, and no live run.

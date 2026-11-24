@@ -10,8 +10,8 @@
 //! The checks are not judged from the stream. Once the check's window has
 //! run, its recording is read back in full, written to the run folder,
 //! judged and posted, exactly as `ter run --sim sim86` does; the board
-//! then carries on. A run that ends before the window is over is judged
-//! on what there was of it.
+//! then carries on. A run that ends before the window is over, whatever
+//! ended it, is not an attempt: nothing is judged and nothing is posted.
 //!
 //! ter's helper does the talking to sim86 (`live` mode): it prints a line
 //! per pin change and serial line, and stops the run when ter says so or
@@ -184,6 +184,14 @@ impl Live {
     fn take_done(&self) -> Option<Box<Done>> {
         self.state().done.take()
     }
+
+    /// Why the run ended and what was said about it, once it is over.
+    fn ended_as(&self) -> Option<(String, String)> {
+        let state = self.state();
+        let ended = state.ended.as_ref()?;
+        let text = |k: &str| ended[k].as_str().unwrap_or_default().to_string();
+        Some((text("reason"), text("detail")))
+    }
 }
 
 /// What asking for a live run came to.
@@ -192,7 +200,9 @@ pub enum Started {
     /// someone else will listen.
     Live(Arc<Live>, LiveEvents),
     /// Nothing runs: the build failed, there is nothing to check, or
-    /// sim86 did not start the run. Posted as any run is.
+    /// sim86 did not start the run. Posted as any run is. (When sim86 has
+    /// no simulator free, nothing is posted: that is an error to try
+    /// again on.)
     Posted(Box<Done>),
 }
 
@@ -312,6 +322,12 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
             let _ = child.wait().await;
             let _ = std::fs::write(recording.join(OUTPUT_LOG), &said);
             let _ = std::fs::remove_file(recording.join(FIRMWARE));
+            if failure.kind == FailureKind::Busy {
+                return Err(CliError::new(
+                    "venue_unavailable",
+                    "sim86 has no free capacity right now. Try again in a minute.",
+                ));
+            }
             return posted(built, run::infra(&venue.failure(&failure))).await;
         }
     };
@@ -454,17 +470,9 @@ impl Drive {
         let _ = std::fs::write(self.venue.run_dir.join(OUTPUT_LOG), &self.said);
         let _ = std::fs::remove_file(self.venue.run_dir.join(FIRMWARE));
 
-        if let Some(built) = self.built.take() {
-            // Nothing of the run came back to judge: not run, as when
-            // sim86 fails a run of `ter run`.
-            let failure = failure.clone().unwrap_or(Failure {
-                kind: FailureKind::Ended,
-                message: "the run ended before any of it was read back".into(),
-            });
-            let outcome = run::infra(&self.venue.failure(&failure));
-            let checks = self.posted(built.finish(outcome).await);
-            self.live.send("checks", checks);
-        }
+        // A run that ended before the check's time was up is not an
+        // attempt: it is dropped unposted.
+        drop(self.built.take());
         let (reason, detail) = ended_as(asked.map(|(reason, _)| reason), failure, sim_reason);
         eprintln!("Live run {} ended: {reason}", self.live.id);
         let data = json!({"reason": reason, "detail": detail});
@@ -482,7 +490,7 @@ impl Drive {
         let _ = std::fs::write(self.venue.run_dir.join(OUTPUT_LOG), &self.said);
         let recorded = self
             .venue
-            .recording(answer, &self.stimuli, self.started_text.clone(), true);
+            .recording(answer, &self.stimuli, self.started_text.clone());
         let outcome = match recorded {
             Ok(rec) => run::judge(&rec, &self.text, &self.venue.run_dir),
             Err(failure) => Ok(run::infra(&self.venue.failure(&failure))),
@@ -535,7 +543,10 @@ fn ended_as(
         {
             ("limit", reason)
         }
-        Some(reason) => ("sim-error", reason),
+        Some(reason) => {
+            let said = reason.strip_prefix("sim-exception:").unwrap_or(&reason);
+            ("sim-error", said.trim().to_string())
+        }
         None => (
             "sim-error",
             "ter's sim86 helper stopped without saying why".into(),
@@ -609,12 +620,23 @@ pub async fn run(args: RunArgs, limit_s: u64, json: bool) -> Result<(), CliError
                 }
             }
             live.over().await;
-            match live.take_done() {
-                Some(done) => run::report(*done, json),
-                None => Err(CliError::new(
+            match (live.take_done(), live.ended_as()) {
+                (Some(done), _) => run::report(*done, json),
+                (None, Some((reason, detail))) if reason == "sim-error" => Err(CliError::new(
                     "venue_unavailable",
-                    "The live run ended and no run was posted.",
+                    format!(
+                        "sim86 ended the run before the checks finished ({detail}). Nothing was scored or posted."
+                    ),
                 )),
+                (None, _) => {
+                    let said = "Stopped before the checks finished: nothing was scored or posted.";
+                    if json {
+                        crate::output::print_json(&json!({"posted": false, "message": said}));
+                    } else {
+                        println!("{said}");
+                    }
+                    Ok(())
+                }
             }
         }
     }
@@ -650,6 +672,11 @@ mod tests {
         assert_eq!(
             ended_as(None, None, Some("node-lost".into())),
             ("sim-error", "node-lost".into())
+        );
+        assert_eq!(ended_as(None, None, Some("duration".into())).0, "limit");
+        assert_eq!(
+            ended_as(None, None, Some("sim-exception: bad pin value".into())),
+            ("sim-error", "bad pin value".into())
         );
         assert_eq!(ended_as(None, None, None).0, "sim-error");
     }

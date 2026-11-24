@@ -14,9 +14,9 @@ way: ter reads the object, never the exit code or any text.
 
 `live` prints one JSON object a line before that one, each with an "ev":
 "started" (the run exists, paused at 0, and now runs), "pin" and "serial"
-as they happen, "recording" once (the check's window in full, in the shape
-`run` answers with; or what there was of it when the run ends sooner) and
-"ended". It runs with no simulated-time limit and stops the run when it
+as they happen, "recording" once the check's time is up (its window in
+full, in the shape `run` answers with; a run that ends sooner has none)
+and "ended". It runs with no simulated-time limit and stops the run when it
 reads the line `stop` on standard input, or when standard input closes, so
 a ter that dies never leaves a run going.
 
@@ -316,8 +316,8 @@ class Told(threading.Thread):
 
 class Tail:
     """One net of a running board: each look says what changed since the
-    last one. A stretch too busy to come back edge by edge is not shown
-    (`whole` is then False); the recording reads it in slices."""
+    last one. A stretch too busy to come back edge by edge is not shown;
+    the recording reads it in slices."""
 
     def __init__(self, pin):
         self.pin = pin
@@ -325,9 +325,6 @@ class Tail:
         self.last_ns = -1
         self.level = None
         self.begun = False
-        self.whole = True
-        self.initial = None
-        self.edges = []
 
     def take(self, trace):
         to_ns = int(trace.get("toNs") or 0)
@@ -341,12 +338,12 @@ class Tail:
         )
         if not exact:
             # What comes next starts from a level the next look gives.
-            self.whole, self.level = False, None
+            self.level = None
             self.to_ns = max(self.to_ns, to_ns)
             return
         if not self.begun:
             self.begun = True
-            self.initial = self.level = level_of(trace.get("initialState"))
+            self.level = level_of(trace.get("initialState"))
             if self.level is not None:
                 say({"ev": "pin", "t_ns": 0, "net": self.pin, "level": self.level})
         for edge in trace.get("edges") or []:
@@ -357,7 +354,6 @@ class Tail:
             self.last_ns = t
             if new != self.level:
                 self.level = new
-                self.edges.append([t, new])
                 say({"ev": "pin", "t_ns": t, "net": self.pin, "level": new})
         self.to_ns = max(self.to_ns, to_ns)
 
@@ -410,13 +406,10 @@ def live(request):
         now_ns = 0
         looked = time.monotonic()
         while True:
-            told.stop.wait(POLL_S)
-            stopping = told.stop.is_set()
+            if told.stop.wait(POLL_S):
+                break
             try:
                 if run.ended is None:
-                    if stopping and not recorded:
-                        # Hold the board still, so what is read is all of it.
-                        run.pause()
                     wall = time.monotonic()
                     if watch:
                         reach = int((wall - looked) * 1.5e9) + OVERLAP_NS + 500_000_000
@@ -434,21 +427,15 @@ def live(request):
                 for line in lines[lines_said:]:
                     say({"ev": "serial", "t_ms": float(line.t), "source": str(line.source), "line": str(line.line)})
                 lines_said = len(lines)
-                if not recorded and run.ended is None and (stopping or now_ns >= end_ns + TAIL_NS):
-                    upto = end_ns if now_ns >= end_ns else run.status().time_ns
-                    say(recording(run, watch, upto, {pin: Reader(run, pin, upto).all() for pin in watch}))
+                if not recorded and run.ended is None and now_ns >= end_ns + TAIL_NS:
+                    say(recording(run, watch, end_ns, {pin: Reader(run, pin, end_ns).all() for pin in watch}))
                     recorded = True
             except Sim86Error:
                 # A run that ended under a request is an ended run.
                 if run.ended is None:
                     raise
-            if stopping or run.ended is not None:
+            if run.ended is not None:
                 break
-        if not recorded and all(tail.whole and tail.begun for tail in tails.values()):
-            # The run ended by itself before the check's time was up: what
-            # the looks saw, up to the last one.
-            pins = {pin: {"initial": tail.initial, "edges": tail.edges} for pin, tail in tails.items()}
-            say(recording(run, watch, min(now_ns, end_ns), pins))
         ended = run.ended
         say({"ev": "ended", "reason": "stopped" if ended in (None, "disconnected") else str(ended)})
         return {"run": run.id}
