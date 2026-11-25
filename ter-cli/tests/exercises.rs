@@ -317,6 +317,8 @@ async fn fetch_writes_the_scaffold_and_ter_toml_in_the_course_folder() {
     let (ok, v) = m.json(&site.uri(), &["ex", "fetch", BLINKY]);
     assert!(ok, "{v}");
     assert_eq!(v["updated"], json!([]), "{v}");
+    assert_eq!(v["removed"], json!([]), "{v}");
+    assert!(dir.join(".ter/site-files.json").is_file());
     assert_eq!(v["mode"], "simulation", "the learner's mode stays: {v}");
 
     // A folder that holds another exercise is still refused.

@@ -809,6 +809,9 @@ async fn a_run_rewrites_the_sites_files_that_changed_and_keeps_the_learners_code
     let dir = m.exercise();
     std::fs::create_dir_all(dir.join("sim86")).unwrap();
     std::fs::write(dir.join("sim86/pins.json"), "{\"user_led\": \"mcu.D1\"}\n").unwrap();
+    // Fetched before ter listed the site's files: nothing it holds goes.
+    std::fs::write(dir.join("wokwi.toml"), "[wokwi]\n").unwrap();
+    assert!(!dir.join(".ter/site-files.json").exists());
     let cargo_toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
     let file =
         |path: &str, content: &str| json!({"path": path, "content": content, "encoding": "utf8"});
@@ -848,12 +851,47 @@ async fn a_run_rewrites_the_sites_files_that_changed_and_keeps_the_learners_code
     assert!(ter.contains("user_led = \"GPIO10\""), "{ter}");
     assert!(ter.contains("mode = \"hardware\""), "{ter}");
     assert_eq!(posted(&server, "run").await.len(), 1);
+    assert!(dir.join("wokwi.toml").is_file());
+    assert!(dir.join(".ter/site-files.json").is_file());
 
     // Nothing changed since: nothing to say.
     let o = m.ter_in(&server.uri(), &["run", "--no-check", "--sim"], &dir);
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success(), "{err}");
     assert!(!err.contains("Updated from the site"), "{err}");
+
+    // The site drops sim86/pins.json: it goes, the learner's files stay.
+    std::fs::write(dir.join("notes.md"), "mine\n").unwrap();
+    std::fs::write(dir.join("src/extra.rs"), "// mine\n").unwrap();
+    Mock::given(method("GET"))
+        .and(path(format!("{API}.exercise")))
+        .respond_with(ok(json!({
+            "exercise_id": EXERCISE, "title": "Heartbeat", "target": "xiao-esp32c3-nostd",
+            "modes": ["hardware", "simulation"], "pins": {"user_led": "GPIO10"},
+            "files": [
+                file("Cargo.toml", &cargo_toml),
+                file(".cargo/config.toml", "[target.riscv32imc-unknown-none-elf]\nrunner = \"espflash flash --monitor\"\n"),
+                file("diagram.json", UFERRIS),
+            ]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let o = m.ter_in(&server.uri(), &["run", "--no-check", "--sim"], &dir);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(
+        err.contains("Updated from the site: removed sim86/pins.json.\n"),
+        "{err}"
+    );
+    assert!(!dir.join("sim86").exists(), "left empty, so it goes too");
+    assert!(dir.join("notes.md").is_file());
+    assert!(dir.join("wokwi.toml").is_file());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/main.rs")).unwrap(),
+        GOOD
+    );
+    assert!(dir.join("src/extra.rs").is_file());
 }
 
 #[tokio::test]

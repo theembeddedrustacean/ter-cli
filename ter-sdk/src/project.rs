@@ -41,6 +41,10 @@ pub const GITIGNORE: &str = ".gitignore";
 /// cargo's build output.
 const IGNORED: [&str; 3] = [".ter/", ".runs/", "target/"];
 
+/// The site's files `ter` wrote into an exercise folder, under
+/// [`STATE_DIR`]: a refresh deletes the ones the site no longer sends.
+pub const SITE_FILES: &str = "site-files.json";
+
 const GITIGNORE_HEADER: &str = "# Added by ter: its own state, run recordings and build output.\n";
 
 /// Build output inside an exercise: cargo's own `target/` when something
@@ -376,6 +380,7 @@ impl Scaffold {
             }
             std::fs::write(&path, bytes).map_err(|e| ProjectError::io("write", &path, e))?;
         }
+        save_site_files(dir, &self.site_files())?;
         // Before the hash, so the file as ter leaves it is the fetched one.
         ensure_gitignore(dir)?;
         let ter = TerToml {
@@ -393,12 +398,28 @@ impl Scaffold {
         Ok(ter)
     }
 
+    /// The files of the scaffold that are the site's: all but the
+    /// learner's `src/` and `.gitignore`.
+    pub fn site_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = self
+            .files
+            .iter()
+            .map(|(rel, _)| rel.clone())
+            .filter(|rel| !learner_owned(rel) && rel != Path::new(GITIGNORE))
+            .collect();
+        files.sort();
+        files
+    }
+
     /// Bring a folder this exercise was fetched to earlier up to date: the
     /// site's files, everything outside `src/` and ter.toml's target, modes
-    /// and pins, are rewritten where the scaffold differs. The learner's
+    /// and pins, are rewritten where the scaffold differs, and a file the
+    /// site sent before (listed in [`SITE_FILES`]) but sends no more is
+    /// deleted. Nothing under `src/` and nothing that list does not name is
+    /// ever deleted; a folder with no list yet only gets one. The learner's
     /// `src/`, `.gitignore` and ter.toml's `mode` (while still allowed) and
-    /// `venue` are kept. Returns the files it changed.
-    pub fn refresh(&self, dir: &Path, modes: Vec<String>) -> Result<Vec<PathBuf>> {
+    /// `venue` are kept.
+    pub fn refresh(&self, dir: &Path, modes: Vec<String>) -> Result<Refreshed> {
         if modes.is_empty() {
             return Err(ProjectError::authoring(
                 &self.exercise_id,
@@ -427,6 +448,24 @@ impl Scaffold {
         let fresh = self.write_into(&staging, &old.course, modes);
         let _ = std::fs::remove_dir_all(&staging);
         let fresh = fresh?;
+
+        let now = self.site_files();
+        let mut removed = Vec::new();
+        for rel in load_site_files(dir).unwrap_or_default() {
+            if now.contains(&rel) {
+                continue;
+            }
+            let path = dir.join(&rel);
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if !m.is_dir() => {
+                    std::fs::remove_file(&path)
+                        .map_err(|e| ProjectError::io("remove", &path, e))?;
+                    remove_empty_parents(dir, &path);
+                    removed.push(rel);
+                }
+                _ => {}
+            }
+        }
 
         let mut changed = Vec::new();
         for (rel, bytes) in &self.files {
@@ -462,7 +501,83 @@ impl Scaffold {
             }
             ter.save(dir)?;
         }
-        Ok(changed)
+        save_site_files(dir, &now)?;
+        changed.sort();
+        removed.sort();
+        Ok(Refreshed {
+            updated: changed,
+            removed,
+        })
+    }
+}
+
+/// What [`Scaffold::refresh`] did to a folder, each list sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Refreshed {
+    /// The site's files it wrote because they differed or were missing,
+    /// and `ter.toml` when its site side or mode changed.
+    pub updated: Vec<PathBuf>,
+    /// The site's files it deleted because the site no longer sends them.
+    pub removed: Vec<PathBuf>,
+}
+
+impl Refreshed {
+    pub fn is_empty(&self) -> bool {
+        self.updated.is_empty() && self.removed.is_empty()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SiteFileList {
+    files: Vec<String>,
+}
+
+fn site_files_path(dir: &Path) -> PathBuf {
+    dir.join(STATE_DIR).join(SITE_FILES)
+}
+
+/// The site's files listed in `dir`, `None` when there is no list or it
+/// cannot be read. Only safe paths outside `src/` and ter's own names
+/// count, so a list edited by hand can never point a refresh elsewhere.
+pub fn load_site_files(dir: &Path) -> Option<Vec<PathBuf>> {
+    let text = std::fs::read_to_string(site_files_path(dir)).ok()?;
+    let list: SiteFileList = serde_json::from_str(&text).ok()?;
+    Some(
+        list.files
+            .iter()
+            .filter_map(|f| safe_relative(f))
+            .filter(|rel| {
+                !learner_owned(rel)
+                    && rel != Path::new(GITIGNORE)
+                    && !NOT_SOURCE.contains(&top_level(rel))
+            })
+            .collect(),
+    )
+}
+
+fn save_site_files(dir: &Path, files: &[PathBuf]) -> Result<()> {
+    let path = site_files_path(dir);
+    let parent = path.parent().expect("has a parent");
+    std::fs::create_dir_all(parent).map_err(|e| ProjectError::io("create", parent, e))?;
+    let list = SiteFileList {
+        files: files
+            .iter()
+            .map(|f| f.to_string_lossy().replace('\\', "/"))
+            .collect(),
+    };
+    let body = serde_json::to_string_pretty(&list).expect("a list of names serializes");
+    std::fs::write(&path, body + "\n").map_err(|e| ProjectError::io("write", &path, e))
+}
+
+/// Delete the folders above `path` that the deletion left empty, up to
+/// `dir` itself (kept).
+fn remove_empty_parents(dir: &Path, path: &Path) {
+    let mut at = path.parent();
+    while let Some(p) = at {
+        if p == dir || !p.starts_with(dir) || std::fs::remove_dir(p).is_err() {
+            break;
+        }
+        at = p.parent();
     }
 }
 
@@ -1085,16 +1200,16 @@ mod tests {
         new.files.push(file("src/bin/main.rs.orig", "starter\n"));
         new.pins = BTreeMap::from([("user_led".into(), "GPIO10".into())]);
         let s = Scaffold::check(&new).unwrap();
-        let mut changed = s.refresh(&f.dir, vec!["simulation".into()]).unwrap();
-        changed.sort();
+        let r = s.refresh(&f.dir, vec!["simulation".into()]).unwrap();
         assert_eq!(
-            changed,
+            r.updated,
             [
                 PathBuf::from("check.yaml"),
                 PathBuf::from("sim86/pins.json"),
                 PathBuf::from(TER_TOML)
             ]
         );
+        assert!(r.removed.is_empty());
         assert_eq!(
             std::fs::read_to_string(f.dir.join("sim86/pins.json")).unwrap(),
             "{\"user_led\": \"mcu.D10\"}\n"
@@ -1128,6 +1243,130 @@ mod tests {
             .refresh(&f.dir, default_modes())
             .unwrap_err();
         assert_eq!(err.code, "already_fetched");
+    }
+
+    fn names(list: &[&str]) -> Vec<PathBuf> {
+        list.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_fetch_lists_the_sites_files_outside_src() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ex = scaffold();
+        ex.files.push(file(".gitignore", "notes/\n"));
+        let f = fetch(&Layout::new(root.path()), &ex);
+        assert_eq!(
+            load_site_files(&f.dir).unwrap(),
+            names(&[".cargo/config.toml", "Cargo.toml", "check.yaml"])
+        );
+        assert!(!f.is_edited().unwrap(), "ter's own list is not an edit");
+    }
+
+    #[test]
+    fn a_refresh_deletes_what_the_site_no_longer_sends_and_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        let mut old = scaffold();
+        old.files.push(file("sim86/board.json", "{}\n"));
+        old.files.push(file("sim86/pins.json", "{}\n"));
+        old.files.push(file("wokwi/diagram.json", "{}\n"));
+        old.files.push(file("src/lib.rs", "// starter\n"));
+        let f = fetch(&Layout::new(root.path()), &old);
+        // The learner's own files and edits.
+        std::fs::write(f.dir.join("src/bin/main.rs"), "fn main() { loop {} }\n").unwrap();
+        std::fs::write(f.dir.join("src/extra.rs"), "// mine\n").unwrap();
+        std::fs::write(f.dir.join("notes.md"), "mine\n").unwrap();
+        std::fs::write(f.dir.join("sim86/mine.json"), "{}\n").unwrap();
+
+        // The site drops pins.json, the Wokwi folder and src/lib.rs.
+        let mut new = scaffold();
+        new.files.push(file("sim86/board.json", "{}\n"));
+        let s = Scaffold::check(&new).unwrap();
+        let r = s.refresh(&f.dir, default_modes()).unwrap();
+        assert_eq!(r.removed, names(&["sim86/pins.json", "wokwi/diagram.json"]));
+        assert!(r.updated.is_empty(), "{r:?}");
+        assert!(!f.dir.join("sim86/pins.json").exists());
+        assert!(!f.dir.join("wokwi").exists(), "left empty, so it goes too");
+        assert!(f.dir.join("sim86/board.json").is_file());
+        assert!(f.dir.join("sim86/mine.json").is_file());
+        assert!(f.dir.join("notes.md").is_file());
+        assert!(f.dir.join("src/extra.rs").is_file());
+        assert!(f.dir.join("src/lib.rs").is_file(), "src/ is never deleted");
+        assert_eq!(
+            std::fs::read_to_string(f.dir.join("src/bin/main.rs")).unwrap(),
+            "fn main() { loop {} }\n"
+        );
+        assert_eq!(
+            load_site_files(&f.dir).unwrap(),
+            names(&[
+                ".cargo/config.toml",
+                "Cargo.toml",
+                "check.yaml",
+                "sim86/board.json"
+            ])
+        );
+        assert!(s.refresh(&f.dir, default_modes()).unwrap().is_empty());
+
+        // A file the learner deleted already is not reported.
+        let mut newer = new.clone();
+        newer.files.retain(|f| f.path != "sim86/board.json");
+        std::fs::remove_file(f.dir.join("sim86/board.json")).unwrap();
+        let r = Scaffold::check(&newer)
+            .unwrap()
+            .refresh(&f.dir, default_modes())
+            .unwrap();
+        assert!(r.is_empty(), "{r:?}");
+        assert!(f.dir.join("sim86/mine.json").is_file());
+    }
+
+    #[test]
+    fn a_folder_with_no_list_gets_one_and_loses_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut old = scaffold();
+        old.files.push(file("sim86/pins.json", "{}\n"));
+        let f = fetch(&Layout::new(root.path()), &old);
+        std::fs::remove_file(site_files_path(&f.dir)).unwrap();
+
+        let s = Scaffold::check(&scaffold()).unwrap();
+        let r = s.refresh(&f.dir, default_modes()).unwrap();
+        assert!(r.is_empty(), "{r:?}");
+        assert!(f.dir.join("sim86/pins.json").is_file());
+        assert_eq!(
+            load_site_files(&f.dir).unwrap(),
+            names(&[".cargo/config.toml", "Cargo.toml", "check.yaml"])
+        );
+        assert!(s.refresh(&f.dir, default_modes()).unwrap().is_empty());
+        assert!(f.dir.join("sim86/pins.json").is_file());
+    }
+
+    #[test]
+    fn a_list_edited_by_hand_cannot_delete_the_learners_files() {
+        let root = tempfile::tempdir().unwrap();
+        let f = fetch(&Layout::new(root.path()), &scaffold());
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, "x\n").unwrap();
+        std::fs::write(
+            site_files_path(&f.dir),
+            r#"{"files": ["src/bin/main.rs", "../../outside.txt", "ter.toml", ".gitignore", ".ter/last-run.json", "/etc/hosts"]}"#,
+        )
+        .unwrap();
+        let r = Scaffold::check(&scaffold())
+            .unwrap()
+            .refresh(&f.dir, default_modes())
+            .unwrap();
+        assert!(r.is_empty(), "{r:?}");
+        assert!(f.dir.join("src/bin/main.rs").is_file());
+        assert!(f.dir.join(TER_TOML).is_file());
+        assert!(f.dir.join(GITIGNORE).is_file());
+        assert!(outside.is_file());
+
+        std::fs::write(site_files_path(&f.dir), "not json").unwrap();
+        assert!(load_site_files(&f.dir).is_none());
+        let r = Scaffold::check(&scaffold())
+            .unwrap()
+            .refresh(&f.dir, default_modes())
+            .unwrap();
+        assert!(r.is_empty(), "{r:?}");
+        assert!(load_site_files(&f.dir).is_some(), "written anew");
     }
 
     #[test]

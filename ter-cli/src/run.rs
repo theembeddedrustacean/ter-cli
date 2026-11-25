@@ -107,15 +107,15 @@ pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
 }
 
 /// Before a run from the terminal: bring the exercise's site files up to
-/// date ([`exercises::refresh`]), saying so when one changed. With no
+/// date ([`exercises::refresh`]), saying so when one changed or went. With no
 /// exercise folder or no session, the run itself says what is wrong.
 pub async fn refresh(args: &RunArgs, quiet: bool) -> Result<(), CliError> {
     let (Ok(dir), Ok(session)) = (exercise_dir(args.dir.clone()), Session::open()) else {
         return Ok(());
     };
-    let updated = exercises::refresh(&session, &dir).await?;
-    if !quiet && !updated.is_empty() {
-        eprintln!("{}", exercises::updated_line(&updated));
+    let refreshed = exercises::refresh(&session, &dir).await?;
+    if !quiet && !refreshed.is_empty() {
+        eprintln!("{}", exercises::updated_line(&refreshed));
     }
     Ok(())
 }

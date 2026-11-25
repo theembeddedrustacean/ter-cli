@@ -358,8 +358,9 @@ enum ExCommand {
     /// `ter ex fetch <id> <dir>`.
     ///
     /// Fetching one that is already there rewrites the files the site owns
-    /// (everything outside src/) and leaves your code alone. Every `ter run`
-    /// does the same.
+    /// (everything outside src/), deletes the ones it no longer sends, and
+    /// leaves your code and your own files alone. Every `ter run` does the
+    /// same.
     ///
     /// The other commands look for fetched exercises under the same root,
     /// so set it once in the environment or the config rather than passing

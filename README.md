@@ -94,8 +94,10 @@ time.
   exercise in a folder of your choice.
 - Fetching an exercise again, and every `ter run`, rewrites the files
   the site owns (everything outside `src/`, and the pins and modes in
-  `ter.toml`) with the site's current ones. Your code in `src/` is never
-  touched.
+  `ter.toml`) with the site's current ones, and deletes a file the site
+  sent before but no longer sends (ter lists the site's files in
+  `.ter/site-files.json`). Your code in `src/` and files you created are
+  never touched.
 - A board run reads serial only, so it can complete an exercise only
   when every check is a serial check with no button presses. Pin checks
   (a blink rate, a pulse width) are graded in simulation: your board

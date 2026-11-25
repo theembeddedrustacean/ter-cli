@@ -263,9 +263,9 @@ async fn handle(
 
     let dir = match exercises::fetched_dir(&request.exercise_id)? {
         Some(dir) => {
-            let updated = exercises::refresh(&session, &dir).await?;
-            if !updated.is_empty() {
-                eprintln!("{}", exercises::updated_line(&updated));
+            let refreshed = exercises::refresh(&session, &dir).await?;
+            if !refreshed.is_empty() {
+                eprintln!("{}", exercises::updated_line(&refreshed));
             }
             dir
         }
