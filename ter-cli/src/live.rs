@@ -648,14 +648,19 @@ impl Drive {
                 line = self.lines.next_line() => {
                     let Ok(Some(line)) = line else { break };
                     match sim86::live_line(&line) {
-                        Some(LiveLine::Pin { t_ns, net, level }) => {
+                        Some(LiveLine::Pin { t_ns, net, level, volts }) => {
                             // A net left out as a pin already shown is not sent.
                             if let Some((name, pin)) = self.nets.get(&net).cloned() {
-                                self.live.send("pin", json!({
+                                let mut event = json!({
                                     "t_ms": t_ns as f64 / 1e6,
                                     "pin": pin.unwrap_or_else(|| name.clone()),
                                     "name": name, "net": net, "level": level,
-                                }));
+                                });
+                                // Only an analog net has volts.
+                                if let Some(volts) = volts {
+                                    event["volts"] = json!(volts);
+                                }
+                                self.live.send("pin", event);
                             }
                         }
                         Some(LiveLine::Serial { t_ms, source, line }) => {
@@ -1145,13 +1150,17 @@ fn print_event(event: &LiveEvent) {
     let t_ms = event.data["t_ms"].as_f64().unwrap_or(0.0);
     match event.name {
         "pin" => println!(
-            "{t_ms:>11.3} ms  {} {}",
+            "{t_ms:>11.3} ms  {} {}{}",
             event.data["pin"].as_str().unwrap_or("?"),
             if event.data["level"] == 1 {
                 "high"
             } else {
                 "low"
-            }
+            },
+            event.data["volts"]
+                .as_f64()
+                .map(|v| format!(" {v:.3} V"))
+                .unwrap_or_default()
         ),
         "serial" => println!(
             "{t_ms:>11.3} ms  | {}",

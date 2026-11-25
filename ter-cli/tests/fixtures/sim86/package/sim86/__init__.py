@@ -14,6 +14,9 @@ change what it does:
     slow-start    how many seconds a run takes to be made
     catalog       the pins of every part type, as the catalog gives them
     parts         catalog entries by part type, {"Ldr": {...}}
+    analog        an analog net's volts as steps, {"mcu.A0": [[t_ns, volts], ...]};
+                  its level follows them (high from 2.31 V, low to 0.99 V),
+                  and every other net reads 0 V
 
 and where it writes `runs` (a line per run made), `stopped` (a line per
 run stopped through the account, as `stop_run` does), `events` (a line
@@ -118,6 +121,9 @@ class Board:
         self.name = data.get("name", "")
         self.limits = data.get("limits") or {}
         self.parts = [Part(p) for p in data.get("parts") or []]
+        self.wires = [
+            tuple(tuple(str(end).split(".", 1)) for end in wire) for wire in data.get("wires") or []
+        ]
 
     def part(self, part_id):
         for p in self.parts:
@@ -172,6 +178,46 @@ def _level(t):
         if into >= at:
             level = new
     return level
+
+
+VIH, VIL = 2.31, 0.99
+
+
+def _held(steps, t):
+    """The step of `steps` that holds at time t."""
+    held = steps[0]
+    for step in steps:
+        if step[0] <= t:
+            held = step
+    return held
+
+
+def _analog_level(steps, t):
+    level = LOW
+    for at, volts in steps:
+        if at > t:
+            break
+        if volts >= VIH:
+            level = HIGH
+        elif volts <= VIL:
+            level = LOW
+    return level
+
+
+def _analog(steps, start, to):
+    """An analog net's samples over [start, to], as sim86 gives them: the
+    value that holds at start, stamped with when it began, each step after
+    as two points at its time, and the value at `to`."""
+    held = _held(steps, start)
+    points = [[float(held[0]), held[1]]]
+    last = held[1]
+    for at, volts in steps:
+        if start < at <= to:
+            points += [[float(at), last], [float(at), volts]]
+            last = volts
+    points.append([float(to), last])
+    return {"mode": "exact", "fromNs": start, "toNs": to, "availableFromNs": start, "buckets": None,
+            "points": points, "receiver": {"vdd": 3.3, "vih": VIH, "vil": VIL}}
 
 
 def _edges(a, b):
@@ -306,18 +352,31 @@ class Run:
         to = now if end_ns is None else min(int(end_ns), now)
         start = max(0, to - int(window_ns))
         held = max(self._since_ns or 0, now - KEEPS_NS)
+        analog = json.loads(_setting("analog") or "{}")
         wires = []
         for pin in self._observed:
             beat = pin == "mcu.D1"
+            steps = analog.get(pin)
+            if steps:
+                initial = _analog_level(steps, start)
+                edges, level = [], initial
+                for at, _ in steps:
+                    new = _analog_level(steps, at)
+                    if start < at <= to and new != level:
+                        edges.append({"timeNs": at, "state": new})
+                        level = new
+            else:
+                initial = HIGH if beat and _level(start) else LOW
+                edges = _edges(start, to) if beat else []
             wires.append({"id": pin, "wireTrace": {
                 "mode": "exact",
                 "fromNs": start,
                 "toNs": to,
                 "exactFromNs": held,
                 "availableFromNs": held,
-                "initialState": HIGH if beat and _level(start) else LOW,
-                "edges": _edges(start, to) if beat else [],
-            }})
+                "initialState": initial,
+                "edges": edges,
+            }, "analog": _analog(steps or [[0, 0.0]], start, to)})
         return {"simulationTimeNs": now, "wires": wires}
 
     def stop(self):

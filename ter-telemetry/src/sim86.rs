@@ -45,7 +45,7 @@ pub const PINS_FILE: &str = "sim86/pins.json";
 pub const HELPER: &str = include_str!("sim86_helper.py");
 pub const HELPER_FILE: &str = "ter_sim86.py";
 /// The `helper` number in the script's answers.
-pub const HELPER_VERSION: u64 = 8;
+pub const HELPER_VERSION: u64 = 9;
 /// What `pip install` is asked for: [`OLDEST`] up to before [`BELOW`].
 pub const PACKAGE: &str = "sim86>=0.2.0,<0.3";
 /// The oldest package version the helper works with. An older install is
@@ -737,8 +737,15 @@ pub enum LiveLine {
         signals: BTreeMap<String, String>,
         controls: Vec<Value>,
     },
-    /// A net's level at `t_ns` of simulated time.
-    Pin { t_ns: u64, net: String, level: u8 },
+    /// A net's level at `t_ns` of simulated time, and on an analog net
+    /// its voltage (said when it changes, at most every 50 ms of
+    /// simulated time).
+    Pin {
+        t_ns: u64,
+        net: String,
+        level: u8,
+        volts: Option<f64>,
+    },
     /// A line a part printed, at `t_ms` of simulated time.
     Serial {
         t_ms: f64,
@@ -794,6 +801,7 @@ pub fn live_line(line: &str) -> Option<LiveLine> {
             t_ns: v.get("t_ns")?.as_u64()?,
             net: text("net")?,
             level: u8::from(v.get("level")?.as_u64()? != 0),
+            volts: v.get("volts").and_then(Value::as_f64),
         }),
         Some("serial") => Some(LiveLine::Serial {
             t_ms: v.get("t_ms")?.as_f64()?,
@@ -1663,7 +1671,17 @@ mod tests {
             Some(LiveLine::Pin {
                 t_ns: 1_513_000,
                 net: "mcu.D13".into(),
-                level: 1
+                level: 1,
+                volts: None
+            })
+        );
+        assert_eq!(
+            live_line(r#"{"ev": "pin", "t_ns": 0, "net": "mcu.A0", "level": 0, "volts": 1.65}"#),
+            Some(LiveLine::Pin {
+                t_ns: 0,
+                net: "mcu.A0".into(),
+                level: 0,
+                volts: Some(1.65)
             })
         );
         assert_eq!(

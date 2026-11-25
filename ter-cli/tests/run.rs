@@ -4534,6 +4534,87 @@ async fn a_long_live_run_is_read_as_it_goes_and_stopped_on_sim86() {
     assert!(m.sim86_saw("stopped").contains("fake-run-1"));
 }
 
+/// A live run's analog net (a potentiometer's wiper on A0) carries its
+/// volts on each pin event: said when they change, at most once per 50 ms
+/// of board time, with the level they read as. A digital net has none.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_live_runs_analog_net_carries_its_volts_at_most_every_50_ms() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = live_machine(GOOD, "").with_sim86_package();
+    std::fs::write(
+        m.exercise().join("sim86/board.json"),
+        r#"{"name": "ter-uferris-c3-pot",
+ "parts": [{"id": "mcu", "type": "XiaoESP32C3", "firmware": "fw.bin"},
+           {"id": "led1", "type": "Led", "config": {"color": "red"}},
+           {"id": "rv1", "type": "Potentiometer"}],
+ "wires": [["mcu.D1", "led1.+"], ["led1.-", "mcu.GND"],
+           ["rv1.1", "mcu.GND"], ["rv1.W", "mcu.A0"], ["rv1.3", "mcu.3V3"]]}
+"#,
+    )
+    .unwrap();
+    let bin = m.sim86_bin();
+    std::fs::write(
+        bin.join("parts"),
+        r#"{"Potentiometer": {"name": "Potentiometer",
+  "inputs": [{"name": "position", "label": "Position", "min": 0, "max": 1, "step": 0.01}],
+  "pins": [{"name": "1"}, {"name": "W"}, {"name": "3"}]}}"#,
+    )
+    .unwrap();
+    // 1.65 V, then three steps 10 ms apart from 1.2 s: only the first and
+    // the last are said, the last 50 ms after the first.
+    std::fs::write(
+        bin.join("analog"),
+        r#"{"mcu.A0": [[0, 1.65], [1200000000, 2.9436], [1210000000, 3.0], [1220000000, 3.1]]}"#,
+    )
+    .unwrap();
+    std::fs::write(bin.join("speed"), "4").unwrap();
+    let served = m.serve(&server.uri());
+
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let mut events = LiveStream::open(&served, &id).await;
+    let mut a0 = Vec::new();
+    let mut digital = 0;
+    while a0.last().is_none_or(|e: &Value| e["volts"] != 3.1) {
+        let (pin, _) = events.until("pin").await;
+        if pin["net"] == "mcu.A0" {
+            a0.push(pin);
+        } else {
+            assert!(
+                pin.get("volts").is_none(),
+                "a digital net has no volts: {pin}"
+            );
+            digital += 1;
+        }
+    }
+    assert!(digital > 0, "the heartbeat is shown too");
+    let said: Vec<(f64, f64, u64)> = a0
+        .iter()
+        .map(|e| {
+            (
+                e["t_ms"].as_f64().unwrap(),
+                e["volts"].as_f64().unwrap(),
+                e["level"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        said,
+        [(0.0, 1.65, 0), (1200.0, 2.944, 1), (1250.0, 3.1, 1)],
+        "{a0:?}"
+    );
+    assert_eq!(a0[0]["name"], "A0", "{a0:?}");
+
+    assert_eq!(
+        served.live_post(&id, "stop", json!({})).await,
+        (200, json!({"ok": true}))
+    );
+    events.until("ended").await;
+    assert!(m.sim86_saw("stopped").contains("fake-run-1"));
+}
+
 fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

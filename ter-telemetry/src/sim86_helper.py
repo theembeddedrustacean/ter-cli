@@ -18,7 +18,9 @@ way: ter reads the object, never the exit code or any text.
 "started" (the run exists, paused at 0, and now runs; with the programmed
 part's chip signal names when sim86's catalog gives them, and the
 "controls" of every part with inputs or events), "pin" and
-"serial" as they happen (pins of the request's "watch" and "show" nets),
+"serial" as they happen (pins of the request's "watch" and "show" nets;
+on an analog net each "pin" also carries its "volts", said when they
+change and at most once per 50 ms of simulated time),
 "recording" once the check's time is up (its window in full, in the shape
 `run` answers with; a run that ends sooner has none) and "ended". It runs with no simulated-time limit and stops the run when it
 reads the line `stop` on standard input, or when standard input closes, so
@@ -56,7 +58,7 @@ import threading
 import time
 import warnings
 
-HELPER = 8
+HELPER = 9
 
 # A trace comes back exact, every edge with its time, only while it has
 # few enough edges; past that it is a summary. A slice is cut to hold
@@ -95,6 +97,19 @@ EVENT_DEFAULTS = {"HCSR04": {"distance_cm": 100}}
 UNITS = {"cm", "mm", "m", "in", "us", "ms", "s", "hz", "khz", "mv", "v", "ma", "lux", "deg", "pct", "rpm"}
 
 LOW, HIGH = 1, 2
+
+# An analog net's volts: said at most once per this much simulated time,
+# to this many decimals.
+VOLTS_EVERY_NS = 50_000_000
+VOLTS_DECIMALS = 3
+
+# Pin names that are a supply or a ground, as ter's own list is.
+POWER = {"3V3", "3.3V", "5V", "U5V", "E5V", "VIN", "VCC", "VDD", "VDDA", "VBAT", "VBUS", "AVDD", "IOREF", "AREF", "VREF"}
+
+
+def is_power(pin):
+    pin = str(pin).upper()
+    return pin.startswith("GND") or pin.endswith("GND") or pin in POWER
 
 
 class Failed(Exception):
@@ -644,17 +659,94 @@ def do(run, asked, events):
     raise Failed("internal", f"the helper cannot {what!r}")
 
 
+def analog_nets(board, client, pins):
+    """Which of these nets are analog: the net a wire joins it to holds a
+    pin of a part that senses a continuous input (a potentiometer's
+    position, a light or temperature sensor) and has no supply pin of its
+    own, so the net carries the part's voltage rather than a digital
+    signal. A part with a supply pin speaks a protocol; a divider of plain
+    resistors is not told from a digital net."""
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in getattr(board, "wires", None) or []:
+        ra, rb = find(f"{a[0]}.{a[1]}"), find(f"{b[0]}.{b[1]}")
+        if ra != rb:
+            parent[ra] = rb
+    sensing = set()
+    for part in board.parts:
+        try:
+            entry = catalog(client, part.type)
+        except Exception:  # noqa: BLE001 - an unknown part is not analog
+            continue
+        if any(is_power(p.get("name")) for p in entry.get("pins") or [] if isinstance(p, dict)):
+            continue
+        continuous = [
+            spec for spec in entry.get("inputs") or []
+            if isinstance(spec, dict)
+            and isinstance(spec.get("min"), (int, float))
+            and isinstance(spec.get("max"), (int, float))
+            and not spec.get("widget")
+            and not spec.get("axes")
+            and not spec.get("event")
+        ]
+        if continuous:
+            sensing.add(part.id)
+    found = set()
+    for pin in pins:
+        if pin not in parent:
+            continue
+        root = find(pin)
+        if any(find(other) == root and other.split(".", 1)[0] in sensing for other in list(parent)):
+            found.add(pin)
+    return found
+
+
 class Tail:
     """One net of a running board: each look says what changed since the
     last one. A stretch too busy to come back edge by edge is not shown;
-    the recording reads it in slices."""
+    the recording reads it in slices. A quiet tail says nothing: it keeps
+    the levels for the net's volts to carry."""
 
-    def __init__(self, pin):
+    def __init__(self, pin, quiet=False):
         self.pin = pin
         self.to_ns = 0
         self.last_ns = -1
         self.level = None
         self.begun = False
+        self.quiet = quiet
+        # A quiet tail's levels, [(t_ns, level)], oldest first.
+        self.changes = []
+
+    def said(self, t, level):
+        if self.quiet:
+            self.changes.append((t, level))
+        else:
+            say({"ev": "pin", "t_ns": t, "net": self.pin, "level": level})
+
+    def level_at(self, t):
+        """The level the net had at `t`, as far as the looks said; None
+        when they did not."""
+        found = None
+        for when, level in self.changes:
+            if when > t:
+                break
+            found = level
+        return found
+
+    def forget(self, before):
+        """Drop the levels no time from `before` on needs."""
+        keep = 0
+        for i, (when, _) in enumerate(self.changes):
+            if when <= before:
+                keep = i
+        del self.changes[:keep]
 
     def take(self, trace):
         to_ns = int(trace.get("toNs") or 0)
@@ -675,7 +767,7 @@ class Tail:
             self.begun = True
             self.level = level_of(trace.get("initialState"))
             if self.level is not None:
-                say({"ev": "pin", "t_ns": 0, "net": self.pin, "level": self.level})
+                self.said(0, self.level)
         for edge in trace.get("edges") or []:
             t = int(edge.get("timeNs", -1))
             new = level_of(edge.get("state"))
@@ -684,8 +776,88 @@ class Tail:
             self.last_ns = t
             if new != self.level:
                 self.level = new
-                say({"ev": "pin", "t_ns": t, "net": self.pin, "level": new})
+                self.said(t, new)
         self.to_ns = max(self.to_ns, to_ns)
+
+
+class Volts:
+    """An analog net's voltage while the board runs: each look's exact
+    samples, said as a "pin" event with "volts" when they change, at most
+    once per VOLTS_EVERY_NS of simulated time. A change inside that time
+    waits for its end, and only the newest such change is said."""
+
+    def __init__(self, tail):
+        self.tail = tail
+        self.seen_ns = -1
+        self.seen = None
+        self.said_ns = None
+        self.said = None
+        self.pending = None
+        self.receiver = {}
+
+    def take(self, analog):
+        if analog.get("mode") != "exact" or analog.get("buckets"):
+            return
+        if isinstance(analog.get("receiver"), dict):
+            self.receiver = analog["receiver"]
+        steps = {}
+        for point in analog.get("points") or []:
+            try:
+                t, v = int(point[0]), round(float(point[1]), VOLTS_DECIMALS)
+            except (TypeError, ValueError, IndexError):
+                continue
+            if t >= self.seen_ns:
+                # The newest value at a time is the one that holds.
+                steps.pop(t, None)
+                steps[t] = v
+        for t in sorted(steps):
+            v = steps[t]
+            if v != self.seen:
+                self.change(t, v)
+            self.seen_ns, self.seen = t, v
+        to_ns = int(analog.get("toNs") or 0)
+        self.flush(to_ns)
+        self.tail.forget(self.pending[0] if self.pending is not None else min(self.seen_ns, to_ns))
+
+    def slot(self):
+        t, _ = self.pending
+        return t if self.said_ns is None else max(t, self.said_ns + VOLTS_EVERY_NS)
+
+    def change(self, t, v):
+        if self.pending is not None and self.slot() <= t:
+            self.say(self.slot(), self.pending[1])
+            self.pending = None
+        if self.said_ns is None or t >= self.said_ns + VOLTS_EVERY_NS:
+            self.pending = None
+            self.say(t, v)
+        else:
+            self.pending = (t, v)
+
+    def flush(self, to_ns):
+        if self.pending is not None and self.slot() <= to_ns:
+            self.say(self.slot(), self.pending[1])
+            self.pending = None
+
+    def level(self, t, v):
+        level = self.tail.level_at(t)
+        if level is not None:
+            return level
+        try:
+            if v >= float(self.receiver["vih"]):
+                return 1
+            if v <= float(self.receiver["vil"]):
+                return 0
+        except (KeyError, TypeError, ValueError):
+            pass
+        return self.said[1] if self.said is not None else 0
+
+    def say(self, t, v):
+        level = self.level(t, v)
+        if (v, level) == self.said:
+            return
+        say({"ev": "pin", "t_ns": t, "net": self.tail.pin, "level": level, "volts": v})
+        self.said = (v, level)
+        self.said_ns = t
 
 
 def recording(run, watch, end_ns, pins):
@@ -735,6 +907,10 @@ def live(request):
     board.limits = {}
     names = signals(request, client) if shown else {}
     controls = part_controls(board, client, starts)
+    try:
+        analog = analog_nets(board, client, watch + shown)
+    except Exception:  # noqa: BLE001 - volts are a nicety
+        analog = set()
     if told.stop.is_set():
         raise Failed("stopped", "ter stopped the run before it started")
 
@@ -778,9 +954,11 @@ def live(request):
         run.resume()
 
         def fresh():
-            return {pin: Tail(pin) for pin in observed}, {pin: Reader(run, pin, end_ns) for pin in watch}
+            tails = {pin: Tail(pin, quiet=pin in analog) for pin in observed}
+            volts = {pin: Volts(tails[pin]) for pin in observed if pin in analog}
+            return tails, volts, {pin: Reader(run, pin, end_ns) for pin in watch}
 
-        tails, readers = fresh()
+        tails, volts, readers = fresh()
         read_to = 0
         lines_said = 0
         recorded = False
@@ -808,7 +986,7 @@ def live(request):
                 observed = watch + shown
                 say({"ev": "reset", "id": reset, "run": run.id})
                 run.resume()
-                tails, readers = fresh()
+                tails, volts, readers = fresh()
                 read_to = 0
                 lines_said = 0
                 recorded = False
@@ -821,11 +999,17 @@ def live(request):
                     if observed:
                         reach = int((wall - looked) * 1.5e9) + OVERLAP_NS + 500_000_000
                         snapshot = run._observe(min(MAX_WINDOW_NS, reach))
-                        for wire in snapshot.get("wires", []):
+                        wires = snapshot.get("wires", [])
+                        for wire in wires:
                             tail = tails.get(wire.get("id"))
                             trace = wire.get("wireTrace")
                             if tail is not None and isinstance(trace, dict) and "mode" in trace:
                                 tail.take(trace)
+                        # After every level of the look is in.
+                        for wire in wires:
+                            net = volts.get(wire.get("id"))
+                            if net is not None and isinstance(wire.get("analog"), dict):
+                                net.take(wire["analog"])
                     # How far the board is: the watched nets' looks, so a
                     # shown net that never comes back holds nothing up.
                     if watch:

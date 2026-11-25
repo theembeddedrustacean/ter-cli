@@ -2916,6 +2916,216 @@ fn live_sim86_input_changes_what_the_light_sensor_reads() {
     );
 }
 
+/// An analog net's volts follow a part's input while the board runs: ter's
+/// helper in `live` mode runs the Nucleo voltmeter assignment (a
+/// potentiometer's wiper on A0, LEDs on D12, D11, D7 and D8), the wiper
+/// starting at half by the board file's `config.inputs`, and moves it to
+/// 0.9. A0's pin events carry volts, about 1.65 V then about 2.97 V, at
+/// most one per 50 ms of board time; D12's carry none. Needs the solution
+/// built into the pilot's `elf/`; a few seconds of sim86 time.
+#[test]
+#[ignore = "live sim86"]
+fn live_sim86_analog_net_carries_volts_that_follow_the_potentiometer() {
+    use std::io::{BufRead, Write};
+    use ter_telemetry::Venue;
+    use ter_telemetry::sim86::{self, Helper, Image, LiveLine, Sim86};
+
+    let Some(pilot) = sim86_ready() else {
+        return;
+    };
+    let elf =
+        pilot.join("elf/solution--stm32-adc-asg-voltmeter-bar--nucleo-f401re-nostd--debug.elf");
+    let tools = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["install", "sim86", "--json"])
+        .env("TER_TOOLS_DIR", tools.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let home = tools.path().join("sim86");
+    let helper = Helper {
+        python: home.join("venv/bin/python"),
+        script: home.join(sim86::HELPER_FILE),
+        key: None,
+    };
+
+    let mut parts =
+        vec![serde_json::json!({"id": "mcu", "type": "NucleoF401RE", "firmware": "firmware.elf"})];
+    let mut wires = Vec::new();
+    for (i, (pin, color)) in [
+        ("D12", "green"),
+        ("D11", "green"),
+        ("D7", "yellow"),
+        ("D8", "red"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let n = i + 1;
+        parts.push(
+            serde_json::json!({"id": format!("r{n}"), "type": "Resistor", "config": {"ohms": 220}}),
+        );
+        parts.push(serde_json::json!({"id": format!("d{n}"), "type": "Led",
+                                      "config": {"color": color, "resistor": false}}));
+        wires.push(serde_json::json!([format!("mcu.{pin}"), format!("r{n}.1")]));
+        wires.push(serde_json::json!([format!("r{n}.2"), format!("d{n}.+")]));
+        wires.push(serde_json::json!([format!("d{n}.-"), "mcu.GND"]));
+    }
+    parts.push(serde_json::json!({"id": "rv1", "type": "Potentiometer",
+                                  "config": {"ohms": 10000, "inputs": {"position": 0.5}}}));
+    wires.extend([
+        serde_json::json!(["rv1.1", "mcu.GND"]),
+        serde_json::json!(["rv1.W", "mcu.A0"]),
+        serde_json::json!(["rv1.3", "mcu.3V3"]),
+    ]);
+    let board =
+        serde_json::json!({"name": "ter-nucleo-voltmeter-bar", "parts": parts, "wires": wires});
+    let dir = tempfile::tempdir().unwrap();
+    let board_file = dir.path().join("board.json");
+    std::fs::write(&board_file, board.to_string()).unwrap();
+    let plan = sim86::plan(
+        &board.to_string(),
+        r#"{"adc_a0": "mcu.A0", "bar_1": "mcu.D12"}"#,
+        &["bar_1".to_string()],
+        &[],
+    )
+    .unwrap();
+    let mut venue = Sim86 {
+        helper: helper.clone(),
+        board: board_file,
+        run_dir: dir.path().join("run"),
+        plan,
+        image: Image::Elf,
+        timeout_ms: 60_000,
+        capture: ter_telemetry::Capture::default(),
+        program: None,
+    };
+    std::fs::create_dir_all(&venue.run_dir).unwrap();
+    venue.prepare(&elf).unwrap();
+    let program = venue.program.clone().unwrap_or(elf);
+    // sim86 stops it after 90 s of its own clock whatever happens here.
+    let request = venue.run_dir.join("request.json");
+    std::fs::write(
+        &request,
+        venue
+            .live_request(&[], &program, 90_000, &["mcu.A0".to_string()])
+            .to_string(),
+    )
+    .unwrap();
+    let mut child = helper
+        .command(&["live".into(), request.into()], Some(&venue.run_dir))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut runs = OwnRuns {
+        python: helper.python.clone(),
+        ids: Vec::new(),
+    };
+    let mut ask = child.stdin.take().unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut next = || -> LiveLine {
+        loop {
+            let line = lines.next().expect("the helper goes on").unwrap();
+            if let Some(line) = sim86::live_line(&line) {
+                return line;
+            }
+        }
+    };
+
+    let LiveLine::Started { run, .. } = next() else {
+        panic!("the run starts first")
+    };
+    runs.ids.push(run.clone());
+
+    // A0's volts as said, (t_ms, volts); D12's events, with or without.
+    let mut a0: Vec<(f64, f64)> = Vec::new();
+    let mut d12_volts = Vec::new();
+    let mut d12 = 0;
+    let mut set_at: Option<f64> = None;
+    let mut asked = false;
+    let mut board_ms = 0.0;
+    loop {
+        match next() {
+            LiveLine::Pin {
+                t_ns, net, volts, ..
+            } => {
+                let t_ms = t_ns as f64 / 1e6;
+                board_ms = f64::max(board_ms, t_ms);
+                if net == "mcu.A0" {
+                    a0.push((t_ms, volts.expect("an analog net carries its volts")));
+                } else {
+                    d12 += 1;
+                    if volts.is_some() {
+                        d12_volts.push(volts);
+                    }
+                }
+            }
+            LiveLine::Serial { t_ms, .. } => board_ms = f64::max(board_ms, t_ms),
+            LiveLine::Reply { id: 1, answer } => {
+                let answer = answer.unwrap_or_else(|e| panic!("refused: {e}"));
+                assert_eq!(answer["ev"], "input", "{answer}");
+                set_at = Some(answer["t_ns"].as_u64().unwrap() as f64 / 1e6);
+            }
+            LiveLine::Ended { reason } => panic!("ended: {reason}"),
+            LiveLine::Done(done) => panic!("done: {done:?}"),
+            _ => {}
+        }
+        if !asked && board_ms > 1000.0 && !a0.is_empty() {
+            writeln!(
+                ask,
+                "{}",
+                serde_json::json!({"id": 1, "do": "input", "part": "rv1", "name": "position", "value": 0.9})
+            )
+            .unwrap();
+            ask.flush().unwrap();
+            asked = true;
+        }
+        if let Some(at) = set_at
+            && (a0.last().is_some_and(|&(t, v)| t >= at && v > 2.8) || board_ms > at + 3000.0)
+        {
+            break;
+        }
+    }
+    writeln!(ask, "stop").unwrap();
+    ask.flush().unwrap();
+    let mut ended = String::new();
+    loop {
+        match next() {
+            LiveLine::Ended { reason } => ended = reason,
+            LiveLine::Done(_) => break,
+            _ => {}
+        }
+    }
+    drop(ask);
+    let _ = child.wait();
+
+    let statuses = runs.none_left();
+    eprintln!(
+        "voltmeter: A0 {a0:?}, set at {set_at:?}, D12 {d12} events; ended {ended}; {statuses:?}"
+    );
+    assert_eq!(ended, "stopped");
+    assert!(
+        statuses.iter().all(|(_, s)| !s.starts_with("live")),
+        "{statuses:?}"
+    );
+    assert!(
+        d12_volts.is_empty(),
+        "a digital net has no volts: {d12_volts:?}"
+    );
+    let first = a0[0].1;
+    assert!(
+        (1.5..=1.8).contains(&first),
+        "half way is about 1.65 V: {a0:?}"
+    );
+    let last = a0.last().unwrap().1;
+    assert!(last > 2.8, "0.9 of 3.3 V is about 2.97 V: {a0:?}");
+    assert!(
+        a0.windows(2).all(|w| w[1].0 - w[0].0 >= 50.0 - 1e-6),
+        "at most one per 50 ms: {a0:?}"
+    );
+}
+
 /// An HC-SR04's distance set while the board runs changes what the program
 /// reads: ter's helper in `live` mode runs the Nucleo four-pin HC-SR04
 /// solution (trigger on D7, echo on D8), the ranger starting with a target
