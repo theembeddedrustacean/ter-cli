@@ -2188,6 +2188,19 @@ fn live_serve_shows_a_run_on_sim86_as_it_happens_and_stops_it() {
     ] {
         std::fs::copy(pilot.join("boards").join(from), dir.join(to)).unwrap();
     }
+    // The heartbeat leaves the button's pin alone: a pull-up gives it a
+    // level to show (left floating, it has none).
+    let board_json = dir.join("sim86/board.json");
+    let mut board: Value =
+        serde_json::from_str(&std::fs::read_to_string(&board_json).unwrap()).unwrap();
+    board["parts"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"id": "pull", "type": "Resistor", "config": {"ohms": 10000}}));
+    let wires = board["wires"].as_array_mut().unwrap();
+    wires.push(serde_json::json!(["pull.1", "mcu.D3"]));
+    wires.push(serde_json::json!(["pull.2", "mcu.3V3"]));
+    std::fs::write(&board_json, board.to_string()).unwrap();
     let tools = tempfile::tempdir().unwrap();
     let o = Command::new(env!("CARGO_BIN_EXE_ter"))
         .args(["install", "sim86", "--json"])
@@ -2372,6 +2385,7 @@ fn live_serve_shows_a_run_on_sim86_as_it_happens_and_stops_it() {
     assert!(!button.is_empty(), "the button's pin is shown");
     assert_eq!(button[0].2["pin"], "GPIO5", "{:?}", button[0]);
     assert_eq!(button[0].2["name"], "D3", "{:?}", button[0]);
+    assert_eq!(button[0].2["level"], 1, "pulled up: {:?}", button[0]);
     assert!(
         named("pin")
             .iter()
