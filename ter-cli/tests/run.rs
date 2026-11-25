@@ -2991,7 +2991,7 @@ async fn serve_shows_a_sim86_run_live_and_stops_it_when_told() {
     // sim86 got no time limit of its own, only the stop of last resort.
     let asked: Value = serde_json::from_str(&m.sim86_saw("got-live-request.json")).unwrap();
     assert!(asked.get("duration_ms").is_none(), "{asked}");
-    assert_eq!(asked["realtime_ms"], 660_000);
+    assert_eq!(asked["realtime_ms"], 1_260_000);
     assert_eq!(asked["watch"], json!(["mcu.D1"]));
     assert_eq!(asked["show"], json!(["mcu.D3"]), "the button's pin");
 
@@ -4412,6 +4412,88 @@ async fn a_long_live_run_is_read_as_it_goes_and_stopped_on_sim86() {
     let (ended, _) = events.until("ended").await;
     assert_eq!(ended, json!({"reason": "user-stop", "detail": ""}));
     assert!(m.sim86_saw("stopped").contains("fake-run-1"));
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// The page pauses the board and resumes it: a paused board holds its
+/// time, the pause does not count against the run's limit, which moves on
+/// by as much, and a run paused for longer than it may be ends at its
+/// limit.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_paused_live_run_holds_its_time_and_its_limit_moves_on_when_it_resumes() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = live_machine(GOOD, "").with_sim86_package();
+    let served = serve_with_env(&m, &server.uri(), &[("TER_LIVE_PAUSE_SECS", "6")]);
+
+    let (status, _, v) = served.run(live_ask(3)).await;
+    assert_eq!(status, 200, "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let ends_at = v["ends_at"].as_u64().unwrap();
+    let mut events = LiveStream::open(&served, &id).await;
+    events.until("pin").await;
+
+    let (status, paused) = served.live_post(&id, "pause", json!({})).await;
+    assert_eq!(status, 200, "{paused}");
+    assert_eq!(paused["ok"], true, "{paused}");
+    let t_ms = paused["t_ms"].as_f64().unwrap();
+    assert!(t_ms > 0.0, "{paused}");
+    let pause_ends_at = paused["pause_ends_at"].as_u64().unwrap();
+    assert!(
+        pause_ends_at.abs_diff(unix_ms_now() + 6_000) < 1_000,
+        "{paused}"
+    );
+    let (event, _) = events.until("paused").await;
+    assert_eq!(event, json!({"t_ms": t_ms, "pause_ends_at": pause_ends_at}));
+
+    // Paused past the run's limit: it goes on, and holds its time.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(unix_ms_now() > ends_at);
+    let (status, again) = served.live_post(&id, "pause", json!({})).await;
+    assert_eq!((status, &again["t_ms"]), (200, &json!(t_ms)), "{again}");
+    // A page that starts to listen meanwhile is told the board is paused.
+    let mut late = LiveStream::open(&served, &id).await;
+    let (event, _) = late.until("paused").await;
+    assert_eq!(event["t_ms"], json!(t_ms));
+    drop(late);
+
+    let (status, resumed) = served.live_post(&id, "resume", json!({})).await;
+    assert_eq!(status, 200, "{resumed}");
+    assert_eq!(resumed["t_ms"], json!(t_ms), "it runs on from where it was");
+    let moved = resumed["ends_at"].as_u64().unwrap();
+    assert!(moved >= ends_at + 4_000, "{resumed} {ends_at}");
+    let (event, before) = events.until("resumed").await;
+    assert_eq!(event, json!({"t_ms": t_ms, "ends_at": moved}));
+    assert!(!before.contains(&"ended".to_string()), "{before:?}");
+    assert_eq!(events.until("limit").await.0, json!({"ends_at": moved}));
+    // Resuming a board that runs changes nothing.
+    let (status, v) = served.live_post(&id, "resume", json!({})).await;
+    assert_eq!((status, &v["ends_at"]), (200, &json!(moved)), "{v}");
+
+    // Paused again, the run has a second or two of its pauses left: then
+    // it ends at its limit, paused.
+    let (status, paused) = served.live_post(&id, "pause", json!({})).await;
+    assert_eq!(status, 200, "{paused}");
+    assert!(
+        paused["pause_ends_at"].as_u64().unwrap() < unix_ms_now() + 2_500,
+        "{paused}"
+    );
+    let (ended, _) = events.until("ended").await;
+    assert_eq!(ended["reason"], "limit", "{ended}");
+    assert!(unix_ms_now() < moved, "the pauses ran out, not the limit");
+    assert!(sim86_says(&m, "stopped", "fake-run-1", 10).await);
+    let (status, v) = served.live_post(&id, "resume", json!({})).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (409, Some("ended")),
+        "{v}"
+    );
 }
 
 /// ter's own helper streams the board's other wired pins by the chip's

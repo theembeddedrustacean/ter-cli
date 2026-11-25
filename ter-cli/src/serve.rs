@@ -43,7 +43,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use ter_check::CheckFile;
 use ter_remote::serve::{
-    LiveEvents, RunFuture, RunRequest, ServeError, Service, editable, no_live, origin_of,
+    LiveControl, LiveEvents, RunFuture, RunRequest, ServeError, Service, editable, no_live,
+    origin_of,
 };
 use ter_sdk::project::TerToml;
 use ter_telemetry::sim86::Sim86;
@@ -172,6 +173,16 @@ impl Service for Serve {
     fn live_view(&self, id: &str) -> Result<String, ServeError> {
         let live = self.0.live(id).ok_or_else(|| no_live(id))?;
         live.view().map_err(|e| ServeError::new(&e.code, e.message))
+    }
+
+    fn live_control(&self, id: &str, control: LiveControl) -> RunFuture {
+        let live = self.0.live(id).ok_or_else(|| no_live(id));
+        Box::pin(async move {
+            live?
+                .control(control)
+                .await
+                .map_err(|e| ServeError::new(&e.code, e.message))
+        })
     }
 
     fn run(&self, request: RunRequest) -> RunFuture {

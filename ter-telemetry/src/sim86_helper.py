@@ -23,6 +23,12 @@ part's chip signal names when sim86's catalog gives them), "pin" and
 reads the line `stop` on standard input, or when standard input closes, so
 a ter that dies never leaves a run going.
 
+While a live run goes on, ter may also write a JSON object a line, each
+with an "id" and what to "do": "pause" or "resume". The helper does it to
+the run and answers with a line holding the same "id": "paused" or
+"resumed" with the board's simulated time ("t_ns"), or "refused" with
+sim86's "message".
+
 Written by `ter install sim86` next to the Python environment that holds
 the sim86 package, and rewritten by ter when it changes. Do not edit it.
 """
@@ -32,7 +38,7 @@ import threading
 import time
 import warnings
 
-HELPER = 6
+HELPER = 7
 
 # A trace comes back exact, every edge with its time, only while it has
 # few enough edges; past that it is a summary. A slice is cut to hold
@@ -353,11 +359,43 @@ class Told(threading.Thread):
     def run(self):
         try:
             for line in sys.stdin:
-                if line.strip() == "stop":
+                text = line.strip()
+                if text == "stop":
                     break
+                if text.startswith("{"):
+                    self.command(text)
         finally:
             self.stop.set()
             self.end()
+
+    def command(self, text):
+        """Do what ter asked to the run, and answer under the same id."""
+        try:
+            asked = json.loads(text)
+        except ValueError:
+            return
+        if not isinstance(asked, dict):
+            return
+        with self.lock:
+            sim_run = self.sim_run
+        try:
+            if sim_run is None:
+                raise Failed("not_started", "the run has not started")
+            answer = do(sim_run, asked)
+        except Exception as e:  # noqa: BLE001 - a refusal is an answer, never the end
+            answer = {"ev": "refused", "message": str(e) or type(e).__name__}
+        answer["id"] = asked.get("id")
+        say(answer)
+
+
+def do(run, asked):
+    """One thing ter asks of a running board, done."""
+    what = asked.get("do")
+    if what == "pause":
+        return {"ev": "paused", "t_ns": run.pause().time_ns}
+    if what == "resume":
+        return {"ev": "resumed", "t_ns": run.resume().time_ns}
+    raise Failed("internal", f"the helper cannot {what!r}")
 
 
 class Tail:

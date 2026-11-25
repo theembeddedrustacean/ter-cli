@@ -7,6 +7,11 @@
 //! it is extended, ten at most), when it is stopped, when a newer run
 //! replaces it, or when nobody has listened to it for a while.
 //!
+//! The page may pause the board and resume it. The time a board is paused
+//! does not count against its limit, which moves on by as much when it
+//! resumes; a run may be paused for ten minutes in all, and ends at its
+//! limit once it has been.
+//!
 //! The checks are not judged from the stream. Once the check's window has
 //! run, its recording is read back in full, written to the run folder,
 //! judged and posted, exactly as `ter run --sim sim86` does; the board
@@ -25,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use ter_remote::serve::{LIVE_CAP_S, LiveEvent, LiveEvents};
+use ter_remote::serve::{LIVE_CAP_S, LiveControl, LiveEvent, LiveEvents};
 use ter_telemetry::Venue;
 use ter_telemetry::event::Stimulus;
 use ter_telemetry::sim86::{
@@ -34,7 +39,7 @@ use ter_telemetry::sim86::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::output::CliError;
 use crate::run::{self, Built, Done, LiveParts, RunArgs};
@@ -48,9 +53,13 @@ const STOP_PATIENCE: Duration = Duration::from_secs(30);
 const UNWATCHED: Duration = Duration::from_secs(15);
 /// How long the site may take to take a run's checks.
 const POST_PATIENCE: Duration = Duration::from_secs(60);
-/// sim86's own wall-clock limit, past ter's cap: what ends a run whose
-/// ter and helper are both gone.
-const LAST_RESORT_MS: u64 = (LIVE_CAP_S + 60) * 1_000;
+/// How long a run may be paused, in all.
+pub const PAUSE_CAP_S: u64 = 600;
+/// How long the helper may take to do what the page asked of the board.
+const CONTROL_PATIENCE: Duration = Duration::from_secs(15);
+/// sim86's own wall-clock limit, past ter's cap and the pauses it allows:
+/// what ends a run whose ter and helper are both gone.
+const LAST_RESORT_MS: u64 = (LIVE_CAP_S + PAUSE_CAP_S + 60) * 1_000;
 
 /// [`UNWATCHED`], or `TER_LIVE_UNWATCHED_SECS` when set (tests set it
 /// short).
@@ -98,7 +107,39 @@ struct State {
     alone_since: Instant,
     /// The run as posted, once it is.
     done: Option<Box<Done>>,
+    /// Since when the board is paused, and its `paused` event, for whoever
+    /// starts to listen meanwhile.
+    paused: Option<(Instant, Value)>,
+    /// How long the board was paused before, in all, in ms.
+    paused_ms: u64,
 }
+
+impl State {
+    fn new(ends_at: u64) -> Self {
+        Self {
+            ends_at,
+            ended: None,
+            listeners: 0,
+            alone_since: Instant::now(),
+            done: None,
+            paused: None,
+            paused_ms: 0,
+        }
+    }
+
+    /// How long the board has been paused, in all, in ms.
+    fn paused_for(&self) -> u64 {
+        let now = self
+            .paused
+            .as_ref()
+            .map_or(0, |(since, _)| since.elapsed().as_millis());
+        self.paused_ms
+            .saturating_add(u64::try_from(now).unwrap_or(u64::MAX))
+    }
+}
+
+/// What the page asked of the board, and where its answer goes.
+type Asked = (LiveControl, oneshot::Sender<Result<Value, CliError>>);
 
 /// A run that is going on, or has been.
 pub struct Live {
@@ -111,6 +152,7 @@ pub struct Live {
     state: Mutex<State>,
     events: broadcast::Sender<LiveEvent>,
     stop: mpsc::UnboundedSender<&'static str>,
+    control: mpsc::UnboundedSender<Asked>,
     over: watch::Receiver<bool>,
 }
 
@@ -169,6 +211,12 @@ impl Live {
         }
         state.listeners += 1;
         let mut from = self.events.subscribe();
+        if let Some((_, paused)) = &state.paused {
+            let _ = tx.try_send(LiveEvent {
+                name: "paused",
+                data: paused.clone(),
+            });
+        }
         drop(state);
         let live = self.clone();
         tokio::spawn(async move {
@@ -203,7 +251,12 @@ impl Live {
             return Err(CliError::new("ended", "This live run is over."));
         }
         let ends_at = state.ends_at.saturating_add(add_s.saturating_mul(1_000));
-        if ends_at.saturating_sub(self.started_at) > LIVE_CAP_S * 1_000 {
+        // The cap is on the time the board runs: the pauses already moved
+        // the end on.
+        let running = ends_at
+            .saturating_sub(self.started_at)
+            .saturating_sub(state.paused_ms);
+        if running > LIVE_CAP_S * 1_000 {
             return Err(CliError::new(
                 "limit_cap",
                 format!(
@@ -220,6 +273,25 @@ impl Live {
     /// Stop the run; `reason` is what its `ended` event says.
     pub fn stop(&self, reason: &'static str) {
         let _ = self.stop.send(reason);
+    }
+
+    /// Do `control` to the board; the answer once sim86 has done it.
+    pub async fn control(&self, control: LiveControl) -> Result<Value, CliError> {
+        let over = || CliError::new("ended", "This live run is over.");
+        if self.ended() {
+            return Err(over());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.control.send((control, tx)).map_err(|_| over())?;
+        let patience = patience("TER_LIVE_CONTROL_SECS", CONTROL_PATIENCE);
+        match tokio::time::timeout(patience, rx).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(over()),
+            Err(_) => Err(CliError::new(
+                "timeout",
+                format!("sim86 did not do it within {} s.", patience.as_secs()),
+            )),
+        }
     }
 
     /// Wait until the run is over and its sim86 run stopped.
@@ -396,21 +468,17 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
     let started_at = unix_ms();
     let (events, _) = broadcast::channel(4096);
     let (stop, stop_rx) = mpsc::unbounded_channel();
+    let (control, control_rx) = mpsc::unbounded_channel();
     let (over_tx, over) = watch::channel(false);
     let live = Arc::new(Live {
         id: new_id(),
         sim86_run,
         started_at,
         helper: venue.helper.clone(),
-        state: Mutex::new(State {
-            ends_at: started_at + limit_s.min(LIVE_CAP_S) * 1_000,
-            ended: None,
-            listeners: 0,
-            alone_since: Instant::now(),
-            done: None,
-        }),
+        state: Mutex::new(State::new(started_at + limit_s.min(LIVE_CAP_S) * 1_000)),
         events,
         stop,
+        control,
         over,
     });
     let first = live.listen().expect("a run that has just started");
@@ -423,6 +491,8 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
             stdin,
             lines,
             stop_rx,
+            control_rx,
+            asked: BTreeMap::new(),
             text,
             stimuli,
             started_text,
@@ -444,6 +514,10 @@ struct Drive {
     stdin: Option<ChildStdin>,
     lines: Lines<BufReader<ChildStdout>>,
     stop_rx: mpsc::UnboundedReceiver<&'static str>,
+    control_rx: mpsc::UnboundedReceiver<Asked>,
+    /// What the helper was asked and has not answered yet, by the id it
+    /// was asked under.
+    asked: BTreeMap<u64, Asked>,
     /// check.yaml.
     text: String,
     stimuli: Vec<Stimulus>,
@@ -490,6 +564,8 @@ impl Drive {
         };
         let stop_patience = patience("TER_LIVE_STOP_PATIENCE_SECS", STOP_PATIENCE);
         let post_patience = patience("TER_LIVE_POST_SECS", POST_PATIENCE);
+        let pause_cap = patience("TER_LIVE_PAUSE_SECS", Duration::from_secs(PAUSE_CAP_S));
+        let mut next_id: u64 = 0;
         // The checks being posted: the site may be slow, and the run is
         // still followed and stopped meanwhile.
         let mut posting: Option<tokio::task::JoinHandle<Value>> = None;
@@ -532,6 +608,7 @@ impl Drive {
                                 }
                                 Some(LiveLine::Ended { reason }) => sim_reason = Some(reason),
                                 Some(LiveLine::Done(done)) => failure = done.err(),
+                                Some(LiveLine::Reply { id, answer }) => self.answered(id, answer, pause_cap),
                                 _ => {}
                             }
                         }
@@ -544,6 +621,29 @@ impl Drive {
                     None
                 }
                 Some(reason) = self.stop_rx.recv() => Some(reason),
+                Some((control, reply)) = self.control_rx.recv() => {
+                    match (&asked, self.stdin.as_mut()) {
+                        (None, Some(stdin)) => {
+                            next_id += 1;
+                            let what = match &control {
+                                LiveControl::Pause => json!({"do": "pause"}),
+                                LiveControl::Resume => json!({"do": "resume"}),
+                            };
+                            let mut line = what;
+                            line["id"] = json!(next_id);
+                            let line = format!("{line}\n");
+                            if stdin.write_all(line.as_bytes()).await.is_ok() && stdin.flush().await.is_ok() {
+                                self.asked.insert(next_id, (control, reply));
+                            } else {
+                                let _ = reply.send(Err(CliError::new("ended", "This live run is over.")));
+                            }
+                        }
+                        _ => {
+                            let _ = reply.send(Err(CliError::new("ended", "This live run is ending.")));
+                        }
+                    }
+                    None
+                }
                 _ = tick.tick() => match asked {
                     Some((_, at)) if at.elapsed() > stop_patience => {
                         let _ = self.child.start_kill();
@@ -552,7 +652,9 @@ impl Drive {
                     Some(_) => None,
                     None => {
                         let state = self.live.state();
-                        if unix_ms() >= state.ends_at {
+                        let paused_out = state.paused.is_some()
+                            && state.paused_for() >= u64::try_from(pause_cap.as_millis()).unwrap_or(u64::MAX);
+                        if paused_out || (state.paused.is_none() && unix_ms() >= state.ends_at) {
                             Some("limit")
                         } else if state.listeners == 0 && state.alone_since.elapsed() >= unwatched() {
                             Some("page-gone")
@@ -590,6 +692,54 @@ impl Drive {
         drop(self.built.take());
         let (reason, detail) = ended_as(asked.map(|(reason, _)| reason), failure, sim_reason);
         ending.end(reason, &detail);
+    }
+
+    /// What the helper answered to what it was asked under `id`: the board
+    /// paused or resumed, said on the stream, and the answer to the page.
+    fn answered(&mut self, id: u64, answer: Result<Value, String>, pause_cap: Duration) {
+        let Some((control, reply)) = self.asked.remove(&id) else {
+            return;
+        };
+        let answer = match answer {
+            Ok(line) => {
+                let t_ms = line["t_ns"].as_u64().unwrap_or(0) as f64 / 1e6;
+                let mut state = self.live.state();
+                match control {
+                    LiveControl::Pause => {
+                        if state.paused.is_none() {
+                            let left = u64::try_from(pause_cap.as_millis())
+                                .unwrap_or(u64::MAX)
+                                .saturating_sub(state.paused_ms);
+                            let data = json!({"t_ms": t_ms, "pause_ends_at": unix_ms().saturating_add(left)});
+                            state.paused = Some((Instant::now(), data.clone()));
+                            self.live.send("paused", data);
+                        }
+                        let (_, data) = state.paused.as_ref().expect("paused");
+                        let mut answer = data.clone();
+                        answer["ok"] = json!(true);
+                        answer["t_ms"] = json!(t_ms);
+                        Ok(answer)
+                    }
+                    LiveControl::Resume => {
+                        if let Some((since, _)) = state.paused.take() {
+                            let paused =
+                                u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            state.paused_ms = state.paused_ms.saturating_add(paused);
+                            state.ends_at = state.ends_at.saturating_add(paused);
+                            self.live
+                                .send("resumed", json!({"t_ms": t_ms, "ends_at": state.ends_at}));
+                            self.live.send("limit", json!({"ends_at": state.ends_at}));
+                        }
+                        Ok(json!({"ok": true, "t_ms": t_ms, "ends_at": state.ends_at}))
+                    }
+                }
+            }
+            Err(message) => Err(CliError::new(
+                "venue_unavailable",
+                format!("sim86 did not do it: {message}."),
+            )),
+        };
+        let _ = reply.send(answer);
     }
 
     /// Judge the run from the recording the helper read back, and post
@@ -985,6 +1135,7 @@ mod tests {
     async fn a_run_whose_task_panics_ends_as_a_sim86_error() {
         let (events, _) = broadcast::channel(16);
         let (stop, _stop_rx) = mpsc::unbounded_channel();
+        let (control, _control_rx) = mpsc::unbounded_channel();
         let (over_tx, over) = watch::channel(false);
         let live = Arc::new(Live {
             id: "l1".into(),
@@ -995,15 +1146,10 @@ mod tests {
                 script: "ter_sim86.py".into(),
                 key: None,
             },
-            state: Mutex::new(State {
-                ends_at: unix_ms() + 60_000,
-                ended: None,
-                listeners: 0,
-                alone_since: Instant::now(),
-                done: None,
-            }),
+            state: Mutex::new(State::new(unix_ms() + 60_000)),
             events,
             stop,
+            control,
             over,
         });
         let mut listening = live.listen().expect("a run that is on");

@@ -45,7 +45,7 @@ pub const PINS_FILE: &str = "sim86/pins.json";
 pub const HELPER: &str = include_str!("sim86_helper.py");
 pub const HELPER_FILE: &str = "ter_sim86.py";
 /// The `helper` number in the script's answers.
-pub const HELPER_VERSION: u64 = 6;
+pub const HELPER_VERSION: u64 = 7;
 /// What `pip install` is asked for: [`OLDEST`] up to before [`BELOW`].
 pub const PACKAGE: &str = "sim86>=0.1.4,<0.3";
 /// The oldest package version the helper works with.
@@ -719,6 +719,12 @@ pub enum LiveLine {
     Recording(Box<Answer>),
     /// The run is over: sim86's reason, or `stopped` when ter asked.
     Ended { reason: String },
+    /// The answer to what ter asked under `id`: the helper's line (its
+    /// `ev` says what was done) or why sim86 refused it.
+    Reply {
+        id: u64,
+        answer: Result<Value, String>,
+    },
     /// The helper's last line.
     Done(Result<(), Failure>),
 }
@@ -757,6 +763,14 @@ pub fn live_line(line: &str) -> Option<LiveLine> {
             .map(|answer| LiveLine::Recording(Box::new(answer))),
         Some("ended") => Some(LiveLine::Ended {
             reason: text("reason").unwrap_or_default(),
+        }),
+        Some("refused") => Some(LiveLine::Reply {
+            id: v.get("id")?.as_u64()?,
+            answer: Err(text("message").unwrap_or_default()),
+        }),
+        Some(_) if v.get("id").is_some() => Some(LiveLine::Reply {
+            id: v.get("id")?.as_u64()?,
+            answer: Ok(v.clone()),
         }),
         Some(_) => None,
         None if v.get("ok").is_some() => Some(LiveLine::Done(parse(line).map(|_| ()))),
@@ -1601,6 +1615,20 @@ mod tests {
         };
         assert_eq!(answer.end_ns, Some(3_000_000_000));
         assert_eq!(answer.pins["mcu.D13"].edges, [(1_513_000, 1)]);
+        assert_eq!(
+            live_line(r#"{"ev": "paused", "id": 3, "t_ns": 1500000}"#),
+            Some(LiveLine::Reply {
+                id: 3,
+                answer: Ok(json!({"ev": "paused", "id": 3, "t_ns": 1_500_000}))
+            })
+        );
+        assert_eq!(
+            live_line(r#"{"ev": "refused", "id": 4, "message": "run ended"}"#),
+            Some(LiveLine::Reply {
+                id: 4,
+                answer: Err("run ended".into())
+            })
+        );
         assert_eq!(
             live_line(r#"{"helper": 3, "ok": true, "run": "r1"}"#),
             Some(LiveLine::Done(Ok(())))

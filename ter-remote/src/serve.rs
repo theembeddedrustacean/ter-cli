@@ -10,7 +10,8 @@
 //! A run on a simulator that can show it as it happens may be asked for
 //! live (`"live": {"limit_s": 60}` in `/run`): the answer then names a live
 //! run, and the page follows it on `/live/<id>/events` (Server-Sent
-//! Events), lengthens it with `/live/<id>/extend` and ends it with
+//! Events), lengthens it with `/live/<id>/extend`, pauses and resumes it
+//! with `/live/<id>/pause` and `/live/<id>/resume`, and ends it with
 //! `/live/<id>/stop`. `/health` says `"live": true` when the service does
 //! this.
 //!
@@ -101,8 +102,8 @@ pub const LIVE_LIMIT_S: u64 = 60;
 pub const LIVE_CAP_S: u64 = 600;
 
 /// One event of a live run, as `/live/<id>/events` sends it: `name` is
-/// the SSE event's name (`pin`, `serial`, `checks`, `limit`, `ended`) and
-/// `data` its one JSON object.
+/// the SSE event's name (`pin`, `serial`, `checks`, `limit`, `paused`,
+/// `resumed`, `ended`) and `data` its one JSON object.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveEvent {
     pub name: &'static str,
@@ -111,6 +112,16 @@ pub struct LiveEvent {
 
 /// A live run's events from now on; it closes after `ended`.
 pub type LiveEvents = tokio::sync::mpsc::Receiver<LiveEvent>;
+
+/// What the lesson page asks of a running board, beside extending and
+/// stopping it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiveControl {
+    /// Hold the board at its simulated time.
+    Pause,
+    /// Let a paused board run on.
+    Resume,
+}
 
 /// A failure `ter serve` answers with, as `{"error": {code, message}}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +197,12 @@ pub trait Service: Send + Sync + 'static {
     /// Stop live run `id`: `{"ok": true}`.
     fn live_stop(&self, id: &str) -> Result<Value, ServeError> {
         Err(no_live(id))
+    }
+    /// Do `control` to live run `id`, once the simulator has done it:
+    /// `{"ok": true, ...}`.
+    fn live_control(&self, id: &str, _control: LiveControl) -> RunFuture {
+        let no = no_live(id);
+        Box::pin(async move { Err(no) })
     }
     /// The address of the simulator's own page for live run `id`, signed
     /// in as the learner, for `/live/<id>/view` to send the browser to.
@@ -398,6 +415,8 @@ pub fn router(service: Arc<dyn Service>, port: u16, site_origin: &str, dev: bool
         .route("/live/{id}/events", get(live_events))
         .route("/live/{id}/extend", post(live_extend))
         .route("/live/{id}/stop", post(live_stop))
+        .route("/live/{id}/pause", post(live_pause))
+        .route("/live/{id}/resume", post(live_resume))
         .route("/live/{id}/view", get(live_view))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(ctx.clone(), guard))
@@ -506,6 +525,21 @@ async fn live_stop(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
     }
 }
 
+async fn live_control(ctx: &Ctx, id: &str, control: LiveControl) -> Response {
+    match ctx.service.live_control(id, control).await {
+        Ok(answer) => axum::Json(answer).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn live_pause(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    live_control(&ctx, &id, LiveControl::Pause).await
+}
+
+async fn live_resume(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    live_control(&ctx, &id, LiveControl::Resume).await
+}
+
 /// The lesson page frames this address; the browser goes on to the
 /// simulator's own page for the run. The frame's request names no origin,
 /// so what guards it is the run's id, which only the page that started
@@ -548,7 +582,7 @@ fn is_view(method: &Method, path: &str) -> bool {
 async fn not_found() -> Response {
     ServeError::new(
         "not_found",
-        "ter serve answers /health, /run and /live/<id>/events, /extend, /stop and /view.",
+        "ter serve answers /health, /run and /live/<id>/events, /extend, /pause, /resume, /stop and /view.",
     )
     .into_response()
 }
@@ -1195,6 +1229,14 @@ mod tests {
                 .then(|| "https://sim.example/live/r1#key=k".to_string())
                 .ok_or_else(|| no_live(id))
         }
+        fn live_control(&self, id: &str, control: LiveControl) -> RunFuture {
+            let answer = match (id, control) {
+                ("l1", LiveControl::Pause) => Ok(json!({"ok": true, "t_ms": 1.5})),
+                ("l1", LiveControl::Resume) => Ok(json!({"ok": true, "t_ms": 1.5, "ends_at": 9})),
+                (id, _) => Err(no_live(id)),
+            };
+            Box::pin(async move { answer })
+        }
     }
 
     #[tokio::test]
@@ -1236,8 +1278,29 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {v}");
         }
 
+        // The board is held and let go once the simulator has done it.
+        let (status, _, v) = send(&app, req("POST", "/live/l1/pause", Some(SITE), "")).await;
+        assert_eq!(
+            (status, v),
+            (StatusCode::OK, json!({"ok": true, "t_ms": 1.5}))
+        );
+        let (status, _, v) = send(&app, req("POST", "/live/l1/resume", Some(SITE), "{}")).await;
+        assert_eq!(
+            (status, v),
+            (
+                StatusCode::OK,
+                json!({"ok": true, "t_ms": 1.5, "ends_at": 9})
+            )
+        );
+
         // No such run, and a service with no live runs at all.
-        for path in ["/live/l2/events", "/live/l2/extend", "/live/l1/stop"] {
+        for path in [
+            "/live/l2/events",
+            "/live/l2/extend",
+            "/live/l1/stop",
+            "/live/l2/pause",
+            "/live/l2/resume",
+        ] {
             let method = if path.ends_with("events") {
                 "GET"
             } else {
@@ -1249,7 +1312,13 @@ mod tests {
         }
 
         // The browser asks first, as for /run: every /live path answers.
-        for path in ["/live/l1/events", "/live/l1/extend", "/live/l1/stop"] {
+        for path in [
+            "/live/l1/events",
+            "/live/l1/extend",
+            "/live/l1/stop",
+            "/live/l1/pause",
+            "/live/l1/resume",
+        ] {
             let mut r = req("OPTIONS", path, Some(SITE), "");
             r.headers_mut().insert(
                 "access-control-request-private-network",
@@ -1291,7 +1360,12 @@ mod tests {
 
         // Another page, or no page at all, gets nothing and stops nothing.
         for origin in [Some(OTHER), None] {
-            for (method, path) in [("GET", "/live/l1/events"), ("POST", "/live/l1/stop")] {
+            for (method, path) in [
+                ("GET", "/live/l1/events"),
+                ("POST", "/live/l1/stop"),
+                ("POST", "/live/l1/pause"),
+                ("POST", "/live/l1/resume"),
+            ] {
                 let (status, _, v) = send(&app, req(method, path, origin, "")).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{origin:?} {path}");
                 assert_eq!(v["error"]["code"], "origin_refused");
