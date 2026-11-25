@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hasher};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,8 +29,8 @@ use ter_remote::serve::{LIVE_CAP_S, LiveEvent, LiveEvents};
 use ter_telemetry::Venue;
 use ter_telemetry::event::Stimulus;
 use ter_telemetry::sim86::{
-    self, Answer, ERROR_LOG, FIRMWARE, Failure, FailureKind, LiveLine, OUTPUT_LOG, ProgramLines,
-    REQUEST_FILE, Sim86,
+    self, Answer, ERROR_LOG, FIRMWARE, Failure, FailureKind, LiveLine, OUTPUT_LOG, PINS_FILE, Plan,
+    ProgramLines, REQUEST_FILE, Sim86,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -272,27 +273,28 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
     };
     let (text, elf, recording) = (text.to_string(), elf.to_path_buf(), recording.to_path_buf());
     let stimuli = file.stimuli();
-    // A net as sim86 names it, to the pin as check.yaml and the board do.
-    let nets: BTreeMap<String, (String, Option<String>)> = venue
-        .plan
-        .watch
-        .iter()
-        .map(|w| {
-            (
-                w.net.clone(),
-                (w.pin.clone(), ter.pins.get(&w.pin).cloned()),
-            )
-        })
-        .collect();
+    let chip = ter.pins.clone();
+    // The board's other wired pins, shown beside the checks' so the page's
+    // logic analyzer has every pin the program drives.
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
+    let shown = sim86::wired(&read(&venue.board), &venue.plan);
+    let pins_json = Path::new(PINS_FILE)
+        .file_name()
+        .map(|name| read(&venue.board.with_file_name(name)))
+        .unwrap_or_default();
 
     if let Err(e) = venue.prepare(&elf) {
         return posted(built, run::infra(&e)).await;
     }
     let program = venue.program.clone().unwrap_or(elf);
     let request = sim86::absolute(&recording.join(REQUEST_FILE));
-    let asked =
-        serde_json::to_string_pretty(&venue.live_request(&stimuli, &program, LAST_RESORT_MS))
-            .expect("the request serialises");
+    let asked = serde_json::to_string_pretty(&venue.live_request(
+        &stimuli,
+        &program,
+        LAST_RESORT_MS,
+        &shown,
+    ))
+    .expect("the request serialises");
     let io = |what: &str, e: std::io::Error| {
         CliError::new(
             "io_error",
@@ -338,7 +340,7 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
                     said.push_str(&line);
                     said.push('\n');
                     match sim86::live_line(&line) {
-                        Some(LiveLine::Started { run }) => break Ok(run),
+                        Some(LiveLine::Started { run, signals }) => break Ok((run, signals)),
                         Some(LiveLine::Done(Err(failure))) => break Err(failure),
                         _ => {}
                     }
@@ -362,8 +364,8 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
             ),
         })
     });
-    let sim86_run = match began {
-        Ok(run) => run,
+    let (sim86_run, signals) = match began {
+        Ok(began) => began,
         Err(failure) => {
             // A closed pipe tells the helper to stop: a run it is still
             // making is stopped as soon as it exists. Only a helper that
@@ -388,6 +390,8 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
             return posted(built, run::infra(&venue.failure(&failure))).await;
         }
     };
+
+    let nets = page_names(&venue.plan, &shown, &chip, &pins_json, &signals);
 
     let started_at = unix_ms();
     let (events, _) = broadcast::channel(4096);
@@ -501,12 +505,14 @@ impl Drive {
                     let Ok(Some(line)) = line else { break };
                     match sim86::live_line(&line) {
                         Some(LiveLine::Pin { t_ns, net, level }) => {
-                            let (name, pin) = self.nets.get(&net).cloned().unwrap_or_default();
-                            self.live.send("pin", json!({
-                                "t_ms": t_ns as f64 / 1e6,
-                                "pin": pin.unwrap_or_else(|| name.clone()),
-                                "name": name, "net": net, "level": level,
-                            }));
+                            // A net left out as a pin already shown is not sent.
+                            if let Some((name, pin)) = self.nets.get(&net).cloned() {
+                                self.live.send("pin", json!({
+                                    "t_ms": t_ns as f64 / 1e6,
+                                    "pin": pin.unwrap_or_else(|| name.clone()),
+                                    "name": name, "net": net, "level": level,
+                                }));
+                            }
                         }
                         Some(LiveLine::Serial { t_ms, source, line }) => {
                             let plain = ter_telemetry::strip_ansi(&line);
@@ -617,6 +623,66 @@ impl Drive {
             }
         })
     }
+}
+
+/// A net as sim86 names it, to `(name, pin)`: the name check.yaml or the
+/// board gives it, and the chip's name for it when ter has one, which is
+/// what the page keys its levels and rows by.
+///
+/// The nets `plan` watches keep their check names and ter.toml's chip
+/// names. Each net in `shown` is a pin of the programmed part, named by
+/// its chip signal: ter.toml's name for a pins.json entry on that net,
+/// else sim86's (`signals`), else the board's own pin name. A net whose
+/// pin is already there under another net or name is left out, so no pin
+/// is sent twice.
+fn page_names(
+    plan: &Plan,
+    shown: &[String],
+    chip: &BTreeMap<String, String>,
+    pins_json: &str,
+    signals: &BTreeMap<String, String>,
+) -> BTreeMap<String, (String, Option<String>)> {
+    // ter.toml's chip names, by the net pins.json puts each name on.
+    let by_net: BTreeMap<String, String> =
+        serde_json::from_str::<BTreeMap<String, Value>>(pins_json)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(name, net)| Some((net.as_str()?.to_string(), chip.get(&name)?.clone())))
+            .collect();
+    let board_pin = |net: &str| -> Option<String> {
+        net.strip_prefix(plan.mcu.as_str())?
+            .strip_prefix('.')
+            .map(str::to_string)
+    };
+    // The chip signal a pin of the programmed part is, when ter knows it.
+    let signal = |net: &str, pin: &str| by_net.get(net).or_else(|| signals.get(pin)).cloned();
+
+    let mut nets: BTreeMap<String, (String, Option<String>)> = plan
+        .watch
+        .iter()
+        .map(|w| (w.net.clone(), (w.pin.clone(), chip.get(&w.pin).cloned())))
+        .collect();
+    // Every name a pin is already sent or known under.
+    let mut taken: Vec<String> = Vec::new();
+    for (net, (name, pin)) in &nets {
+        taken.push(pin.clone().unwrap_or_else(|| name.clone()));
+        if let Some(on) = board_pin(net) {
+            taken.extend(signal(net, &on));
+            taken.push(on);
+        }
+    }
+    for net in shown {
+        let Some(on) = board_pin(net) else { continue };
+        let signal = signal(net, &on);
+        let page = signal.clone().unwrap_or_else(|| on.clone());
+        if nets.contains_key(net) || taken.contains(&page) || taken.contains(&on) {
+            continue;
+        }
+        taken.push(page);
+        taken.push(on.clone());
+        nets.insert(net.clone(), (on, signal));
+    }
+    nets
 }
 
 /// The `checks` event of a post that went wrong inside ter.
@@ -772,6 +838,109 @@ pub async fn run(args: RunArgs, limit_s: u64, json: bool) -> Result<(), CliError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_of(watch: &[(&str, &str)]) -> Plan {
+        Plan {
+            mcu: "mcu".into(),
+            watch: watch
+                .iter()
+                .map(|(pin, net)| sim86::Watch {
+                    pin: pin.to_string(),
+                    net: net.to_string(),
+                })
+                .collect(),
+            buttons: BTreeMap::new(),
+        }
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    fn nets(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// What the page keys each net's events by.
+    fn keyed(names: &BTreeMap<String, (String, Option<String>)>) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|(net, (name, pin))| (net.clone(), pin.clone().unwrap_or_else(|| name.clone())))
+            .collect()
+    }
+
+    #[test]
+    fn a_serial_only_run_shows_the_wired_pins_by_their_chip_names() {
+        // The voltmeter: four LEDs, checks on serial only.
+        let shown = nets(&["mcu.D12", "mcu.D11", "mcu.D7", "mcu.D8"]);
+        let signals = map(&[("D12", "PA6"), ("D11", "PA7"), ("D7", "PA8"), ("D8", "PA9")]);
+        let names = page_names(&plan_of(&[]), &shown, &BTreeMap::new(), "{}", &signals);
+        assert_eq!(
+            names["mcu.D12"],
+            ("D12".to_string(), Some("PA6".to_string()))
+        );
+        assert_eq!(
+            keyed(&names),
+            [
+                ("mcu.D11".into(), "PA7".into()),
+                ("mcu.D12".into(), "PA6".into()),
+                ("mcu.D7".into(), "PA8".into()),
+                ("mcu.D8".into(), "PA9".into()),
+            ]
+        );
+        // Without sim86's catalog: ter.toml's name through pins.json, else
+        // the board's.
+        let names = page_names(
+            &plan_of(&[]),
+            &shown,
+            &map(&[("buzzer", "PA9")]),
+            r#"{"buzzer": "mcu.D8", "adc_a0": "mcu.A0", "user_button": {"part": "mcu", "input": "button"}}"#,
+            &BTreeMap::new(),
+        );
+        assert_eq!(names["mcu.D8"].1.as_deref(), Some("PA9"));
+        assert_eq!(names["mcu.D12"], ("D12".to_string(), None));
+    }
+
+    #[test]
+    fn a_watched_pin_keeps_its_name_and_is_not_sent_twice() {
+        let plan = plan_of(&[("user_led", "mcu.D13")]);
+        let chip = map(&[("user_led", "PA5")]);
+        // PA5 is D13 under its other name on the board; D12 is new.
+        let shown = nets(&["mcu.PA5", "mcu.D12", "mcu.PA6"]);
+        let signals = map(&[
+            ("D13", "PA5"),
+            ("PA5", "PA5"),
+            ("D12", "PA6"),
+            ("PA6", "PA6"),
+        ]);
+        let names = page_names(&plan, &shown, &chip, r#"{"user_led": "mcu.D13"}"#, &signals);
+        assert_eq!(
+            keyed(&names),
+            [
+                ("mcu.D12".into(), "PA6".into()),
+                ("mcu.D13".into(), "PA5".into()),
+            ]
+        );
+        assert_eq!(names["mcu.D13"].0, "user_led");
+        // Without a chip name the watched pin keeps its check name, and
+        // sim86's signal still finds its twin.
+        let names = page_names(&plan, &shown, &BTreeMap::new(), "{}", &signals);
+        assert_eq!(names["mcu.D13"], ("user_led".to_string(), None));
+        assert!(!names.contains_key("mcu.PA5"), "{names:?}");
+        // With nothing to tell them apart, a board name is still sent once.
+        let names = page_names(
+            &plan_of(&[("D12", "led1.+")]),
+            &nets(&["mcu.D12", "mcu.D12"]),
+            &BTreeMap::new(),
+            "{}",
+            &BTreeMap::new(),
+        );
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert_eq!(names["led1.+"].0, "D12");
+    }
 
     #[test]
     fn a_run_ends_for_ters_reason_else_sim86s() {

@@ -85,6 +85,12 @@ class Client:
     def gql(self, query, variables=None):
         return {"getSubscriptionDetails": {"creditBalanceCents": 20184, "plan": "free", "isActive": True}}
 
+    def component(self, type_name):
+        catalog = _setting("catalog")
+        if catalog is None:
+            raise ApiError(f"no part {type_name}", status=404)
+        return {"type": type_name, "pins": json.loads(catalog)}
+
     def stop_run(self, run_id):
         _note("stopped", run_id)
         run = _runs.get(run_id)
@@ -234,6 +240,12 @@ class Run:
 
     def observe(self, *pins):
         self._alive()
+        refused = _setting("refuse-observe")
+        if refused is not None and refused in pins:
+            raise Sim86Error(f"no net {refused}")
+        if len(set(self._observed) | set(pins)) > 64:
+            raise Sim86Error("at most 64 nets can be observed at once")
+        _note("observed", json.dumps(list(pins)))
         if self._since_ns is None:
             self._since_ns = self._now()
         self._observed.extend(p for p in pins if p not in self._observed)

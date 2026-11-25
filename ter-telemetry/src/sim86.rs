@@ -45,7 +45,7 @@ pub const PINS_FILE: &str = "sim86/pins.json";
 pub const HELPER: &str = include_str!("sim86_helper.py");
 pub const HELPER_FILE: &str = "ter_sim86.py";
 /// The `helper` number in the script's answers.
-pub const HELPER_VERSION: u64 = 5;
+pub const HELPER_VERSION: u64 = 6;
 /// What `pip install` is asked for: [`OLDEST`] up to before [`BELOW`].
 pub const PACKAGE: &str = "sim86>=0.1.4,<0.3";
 /// The oldest package version the helper works with.
@@ -301,6 +301,59 @@ pub fn plan(
         watch: watched,
         buttons,
     })
+}
+
+/// The most nets sim86 observes in one run.
+pub const MAX_NETS: usize = 64;
+
+/// Whether a board pin is a supply or a ground, which has no level worth
+/// showing.
+fn is_power(pin: &str) -> bool {
+    let pin = pin.to_ascii_uppercase();
+    pin.starts_with("GND")
+        || pin.ends_with("GND")
+        || [
+            "3V3", "3.3V", "5V", "U5V", "E5V", "VIN", "VCC", "VDD", "VDDA", "VBAT", "VBUS", "AVDD",
+            "IOREF", "AREF", "VREF",
+        ]
+        .contains(&pin.as_str())
+}
+
+/// The programmed part's other wired pins, for a live run to show beside
+/// the nets `plan` watches: each pin of `plan.mcu` with a wire to another
+/// part, less supplies and grounds, in board order, each once, and only as many as sim86 observes beside `plan`'s nets. Never
+/// judged: a run's checks stay on `plan`.
+pub fn wired(board_json: &str, plan: &Plan) -> Vec<String> {
+    let Ok(board) = serde_json::from_str::<Value>(board_json) else {
+        return Vec::new();
+    };
+    let Ok(wires) = wires(&board) else {
+        return Vec::new();
+    };
+    let ids: Vec<&str> = board
+        .get("parts")
+        .or_else(|| board.get("components"))
+        .and_then(Value::as_array)
+        .map(|parts| parts.iter().filter_map(|p| p["id"].as_str()).collect())
+        .unwrap_or_default();
+    let room = MAX_NETS.saturating_sub(plan.watch.len());
+    let mut nets: Vec<String> = Vec::new();
+    for [a, b] in &wires {
+        for (end, other) in [(a, b), (b, a)] {
+            if end.0 != plan.mcu || other.0 == end.0 || !ids.contains(&other.0.as_str()) {
+                continue;
+            }
+            if is_power(&end.1) {
+                continue;
+            }
+            let net = format!("{}.{}", end.0, end.1);
+            if nets.len() < room && !nets.contains(&net) && !plan.watch.iter().any(|w| w.net == net)
+            {
+                nets.push(net);
+            }
+        }
+    }
+    nets
 }
 
 /// The presses and releases of `stimuli` as a sim86 scenario, planned
@@ -646,8 +699,13 @@ pub fn events(
 /// One line the helper's `live` mode prints while a run goes on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveLine {
-    /// The run exists and the board now runs from 0.
-    Started { run: String },
+    /// The run exists and the board now runs from 0. `signals`: the
+    /// programmed part's pins and the chip signal each is (`D12` is
+    /// `PA6`), from sim86's catalog, when it answered.
+    Started {
+        run: String,
+        signals: BTreeMap<String, String>,
+    },
     /// A net's level at `t_ns` of simulated time.
     Pin { t_ns: u64, net: String, level: u8 },
     /// A line a part printed, at `t_ms` of simulated time.
@@ -670,7 +728,20 @@ pub fn live_line(line: &str) -> Option<LiveLine> {
     let v: Value = serde_json::from_str(line.trim()).ok()?;
     let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     match v.get("ev").and_then(Value::as_str) {
-        Some("started") => Some(LiveLine::Started { run: text("run")? }),
+        Some("started") => Some(LiveLine::Started {
+            run: text("run")?,
+            signals: v
+                .get("signals")
+                .and_then(Value::as_object)
+                .map(|pins| {
+                    pins.iter()
+                        .filter_map(|(pin, signal)| {
+                            Some((pin.clone(), signal.as_str()?.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }),
         Some("pin") => Some(LiveLine::Pin {
             t_ns: v.get("t_ns")?.as_u64()?,
             net: text("net")?,
@@ -883,12 +954,20 @@ impl Sim86 {
 
     /// What the helper's `live` mode is asked to run: no simulated-time
     /// limit, and `realtime_ms` on sim86's own clock as the stop of last
-    /// resort, for a run ter is no longer there to stop.
-    pub fn live_request(&self, stimuli: &[Stimulus], program: &Path, realtime_ms: u64) -> Value {
+    /// resort, for a run ter is no longer there to stop. `show`: nets
+    /// streamed beside the watched ones, never read into the recording.
+    pub fn live_request(
+        &self,
+        stimuli: &[Stimulus],
+        program: &Path,
+        realtime_ms: u64,
+        show: &[String],
+    ) -> Value {
         let mut request = self.request(stimuli, program);
         if let Some(fields) = request.as_object_mut() {
             fields.remove("duration_ms");
             fields.insert("realtime_ms".into(), json!(realtime_ms));
+            fields.insert("show".into(), json!(show));
         }
         request
     }
@@ -1370,6 +1449,103 @@ mod tests {
         assert!(venue.provides().contains(&Kind::Stimulus));
     }
 
+    /// The voltmeter's board: four LEDs through resistors, a
+    /// potentiometer on A0, and checks that read serial only.
+    const VOLTMETER: &str = r#"{"parts": [{"id": "mcu", "type": "NucleoF401RE", "firmware": "fw.elf"},
+        {"id": "r1", "type": "Resistor"}, {"id": "d1", "type": "Led"},
+        {"id": "r2", "type": "Resistor"}, {"id": "r3", "type": "Resistor"},
+        {"id": "r4", "type": "Resistor"}, {"id": "rv1", "type": "Potentiometer"}],
+      "wires": [["mcu.D12", "r1.1"], ["r1.2", "d1.+"], ["d1.-", "mcu.GND"],
+                ["mcu.D11", "r2.1"], ["r3.1", "mcu.D7"], ["mcu.D8", "r4.1"],
+                ["mcu.D12", "d1.+"], ["mcu.D2", "mcu.D3"], ["mcu.D4", "nowhere.1"],
+                ["rv1.1", "mcu.GND"], ["rv1.W", "mcu.A0"], ["rv1.3", "mcu.3V3"],
+                ["rv1.3", "mcu.E5V"], ["rv1.3", "mcu.VIN"], ["rv1.3", "mcu.AGND"]]}"#;
+
+    #[test]
+    fn a_live_run_shows_every_wired_pin_of_the_program_part() {
+        let serial_only = plan(VOLTMETER, "{}", &[], &[]).unwrap();
+        assert!(serial_only.watch.is_empty());
+        // Board order, each once; no supply or ground, no wire back to
+        // the part itself, no part that is not on the board. An analog
+        // input is shown too: its pin may as well drive an LED, and a net
+        // with no logic level sends no events.
+        assert_eq!(
+            wired(VOLTMETER, &serial_only),
+            names(&["mcu.D12", "mcu.D11", "mcu.D7", "mcu.D8", "mcu.A0"])
+        );
+        // A watched net is the checks', not shown twice.
+        let watched = plan(
+            VOLTMETER,
+            r#"{"buzzer": "mcu.D8"}"#,
+            &names(&["buzzer"]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            wired(VOLTMETER, &watched),
+            names(&["mcu.D12", "mcu.D11", "mcu.D7", "mcu.A0"])
+        );
+        assert!(wired("not json", &serial_only).is_empty());
+        for pin in [
+            "GND", "GND2", "AGND", "3V3", "5V", "vin", "IOREF", "AVDD", "E5V",
+        ] {
+            assert!(is_power(pin), "{pin}");
+        }
+        for pin in ["D12", "PA6", "GPIO3", "NRST"] {
+            assert!(!is_power(pin), "{pin}");
+        }
+    }
+
+    #[test]
+    fn a_live_run_shows_no_more_nets_than_sim86_observes() {
+        let parts: Vec<String> = (0..80)
+            .map(|i| format!(r#"{{"id": "led{i}", "type": "Led"}}"#))
+            .collect();
+        let wires: Vec<String> = (0..80)
+            .map(|i| format!(r#"["mcu.P{i}", "led{i}.+"]"#))
+            .collect();
+        let board = format!(
+            r#"{{"parts": [{{"id": "mcu", "type": "Big", "firmware": "fw"}}, {}], "wires": [{}]}}"#,
+            parts.join(","),
+            wires.join(",")
+        );
+        let p = plan(&board, r#"{"led": "mcu.P0"}"#, &names(&["led"]), &[]).unwrap();
+        let shown = wired(&board, &p);
+        assert_eq!(shown.len(), MAX_NETS - 1);
+        assert_eq!(shown[0], "mcu.P1");
+    }
+
+    #[test]
+    fn the_live_request_streams_the_shown_nets_beside_the_watched() {
+        let venue = Sim86 {
+            helper: Helper {
+                python: "python".into(),
+                script: "ter_sim86.py".into(),
+                key: None,
+            },
+            board: "ex/sim86/board.json".into(),
+            run_dir: PathBuf::new(),
+            plan: nucleo_plan(),
+            image: Image::Elf,
+            timeout_ms: 3000,
+            capture: Capture::default(),
+            program: None,
+        };
+        let request =
+            venue.live_request(&[], Path::new("t/exercise"), 720_000, &names(&["mcu.D12"]));
+        assert_eq!(request["watch"], json!(["mcu.D13"]));
+        assert_eq!(request["show"], json!(["mcu.D12"]));
+        assert_eq!(request["realtime_ms"], json!(720_000));
+        assert!(request.get("duration_ms").is_none());
+        // The scored run asks for the watched nets only.
+        assert!(
+            venue
+                .request(&[], Path::new("t/exercise"))
+                .get("show")
+                .is_none()
+        );
+    }
+
     #[test]
     fn the_helper_is_the_script_ter_ships() {
         assert!(HELPER.contains(&format!("HELPER = {HELPER_VERSION}")));
@@ -1382,7 +1558,17 @@ mod tests {
     fn the_helpers_live_lines_read() {
         assert_eq!(
             live_line(r#"{"ev": "started", "run": "r1"}"#),
-            Some(LiveLine::Started { run: "r1".into() })
+            Some(LiveLine::Started {
+                run: "r1".into(),
+                signals: BTreeMap::new()
+            })
+        );
+        assert_eq!(
+            live_line(r#"{"ev": "started", "run": "r1", "signals": {"D12": "PA6", "GND": null}}"#),
+            Some(LiveLine::Started {
+                run: "r1".into(),
+                signals: BTreeMap::from([("D12".into(), "PA6".into())])
+            })
         );
         assert_eq!(
             live_line(r#"{"ev": "pin", "t_ns": 1513000, "net": "mcu.D13", "level": 1}"#),

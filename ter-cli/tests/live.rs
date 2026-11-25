@@ -2351,7 +2351,11 @@ fn live_serve_shows_a_run_on_sim86_as_it_happens_and_stops_it() {
     let named = |name: &str| -> Vec<&(u64, String, Value)> {
         seen.iter().filter(|(_, n, _)| n == name).collect()
     };
-    let pins = named("pin");
+    // The LED's net; the board's other wired pins are shown beside it.
+    let pins: Vec<_> = named("pin")
+        .into_iter()
+        .filter(|(_, _, data)| data["net"] == "mcu.D1")
+        .collect();
     assert!(
         pins.len() > 16,
         "a heartbeat, 4 flashes a second: {}",
@@ -2359,6 +2363,21 @@ fn live_serve_shows_a_run_on_sim86_as_it_happens_and_stops_it() {
     );
     assert_eq!(pins[0].2["pin"], "GPIO3", "{:?}", pins[0]);
     assert_eq!(pins[0].2["net"], "mcu.D1");
+    // The button's pin has a wire but no check: shown by the chip's name
+    // for it, never twice and never judged.
+    let button: Vec<_> = named("pin")
+        .into_iter()
+        .filter(|(_, _, data)| data["net"] == "mcu.D3")
+        .collect();
+    assert!(!button.is_empty(), "the button's pin is shown");
+    assert_eq!(button[0].2["pin"], "GPIO5", "{:?}", button[0]);
+    assert_eq!(button[0].2["name"], "D3", "{:?}", button[0]);
+    assert!(
+        named("pin")
+            .iter()
+            .all(|(_, _, data)| data["net"] == "mcu.D1" || data["net"] == "mcu.D3"),
+        "only the wired pins"
+    );
     // Each change arrives after it happened and not long after: the board
     // runs at about real speed and ter passes its changes on as they come.
     let mut worst = 0.0f64;
@@ -2379,6 +2398,10 @@ fn live_serve_shows_a_run_on_sim86_as_it_happens_and_stops_it() {
     assert_eq!(checks["check_status"], "passed", "{checks}");
     assert!(checks["site"]["attempt"].as_u64().is_some(), "{checks}");
     assert!(checks["events"].as_array().is_some_and(|e| e.len() > 16));
+    assert!(
+        !checks.to_string().contains("mcu.D3"),
+        "a shown pin is not judged"
+    );
     assert_eq!(named("checks").len(), 1);
     assert_eq!(extended["ends_at"], ends_at + 60_000, "{extended}");
     assert_eq!(named("limit")[0].2["ends_at"], ends_at + 60_000);

@@ -15,10 +15,11 @@ Prints exactly one JSON object on standard output, {"ok": true, ...} or
 way: ter reads the object, never the exit code or any text.
 
 `live` prints one JSON object a line before that one, each with an "ev":
-"started" (the run exists, paused at 0, and now runs), "pin" and "serial"
-as they happen, "recording" once the check's time is up (its window in
-full, in the shape `run` answers with; a run that ends sooner has none)
-and "ended". It runs with no simulated-time limit and stops the run when it
+"started" (the run exists, paused at 0, and now runs; with the programmed
+part's chip signal names when sim86's catalog gives them), "pin" and
+"serial" as they happen (pins of the request's "watch" and "show" nets),
+"recording" once the check's time is up (its window in full, in the shape
+`run` answers with; a run that ends sooner has none) and "ended". It runs with no simulated-time limit and stops the run when it
 reads the line `stop` on standard input, or when standard input closes, so
 a ter that dies never leaves a run going.
 
@@ -31,7 +32,7 @@ import threading
 import time
 import warnings
 
-HELPER = 5
+HELPER = 6
 
 # A trace comes back exact, every edge with its time, only while it has
 # few enough edges; past that it is a summary. A slice is cut to hold
@@ -416,11 +417,30 @@ def recording(run, watch, end_ns, pins):
     }
 
 
+def signals(request, client):
+    """The programmed part's pins and the chip signal each is, from
+    sim86's catalog: {"D12": "PA6"}. Only names what a live run shows, so
+    a catalog that does not answer leaves it empty."""
+    try:
+        with open(request["board"], encoding="utf-8") as f:
+            board = json.load(f)
+        mcu = next(iter(request.get("firmware") or {}))
+        parts = board.get("parts") or board.get("components") or []
+        kind = next(p["type"] for p in parts if p.get("id") == mcu)
+        pins = client.component(kind).get("pins") or []
+        return {str(p["name"]): str(p["signal"]) for p in pins if p.get("name") and p.get("signal")}
+    except Exception:  # noqa: BLE001 - names are a nicety, never a failure
+        return {}
+
+
 def live(request):
     from sim86 import Run
 
     end_ns = int(request["timeout_ms"]) * 1_000_000
     watch = list(request.get("watch") or [])
+    # Streamed beside the watched nets, never read into the recording: a
+    # net shown only cannot fail or hold back the check's window.
+    shown = [net for net in request.get("show") or [] if net not in watch]
     # ter can say stop while the run is still being made.
     told = Told()
     told.start()
@@ -428,6 +448,7 @@ def live(request):
     # A board file may carry limits of its own, meant for sim86's command.
     # ter holds a live run's limit: no simulated-time limit at all.
     board.limits = {}
+    names = signals(request, client) if shown else {}
     if told.stop.is_set():
         raise Failed("stopped", "ter stopped the run before it started")
     with warnings.catch_warnings():
@@ -446,10 +467,16 @@ def live(request):
             raise Failed("not_paused", f"the recording starts {halt.time_ns / 1e6:.3f} ms in")
         if watch:
             observe(run, watch)
-        say({"ev": "started", "run": run.id})
+        if shown:
+            try:
+                observe(run, shown)
+            except Exception:  # noqa: BLE001 - shown nets are a nicety
+                shown = []
+        observed = watch + shown
+        say({"ev": "started", "run": run.id, "signals": names})
         run.resume()
 
-        tails = {pin: Tail(pin) for pin in watch}
+        tails = {pin: Tail(pin) for pin in observed}
         readers = {pin: Reader(run, pin, end_ns) for pin in watch}
         read_to = 0
         lines_said = 0
@@ -462,7 +489,7 @@ def live(request):
             try:
                 if run.ended is None:
                     wall = time.monotonic()
-                    if watch:
+                    if observed:
                         reach = int((wall - looked) * 1.5e9) + OVERLAP_NS + 500_000_000
                         snapshot = run._observe(min(MAX_WINDOW_NS, reach))
                         for wire in snapshot.get("wires", []):
@@ -470,7 +497,10 @@ def live(request):
                             trace = wire.get("wireTrace")
                             if tail is not None and isinstance(trace, dict) and "mode" in trace:
                                 tail.take(trace)
-                        now_ns = min(tail.to_ns for tail in tails.values())
+                    # How far the board is: the watched nets' looks, so a
+                    # shown net that never comes back holds nothing up.
+                    if watch:
+                        now_ns = min(tails[pin].to_ns for pin in watch)
                     else:
                         now_ns = run.status().time_ns
                     looked = wall

@@ -125,7 +125,8 @@ case "$2" in
     [ -f "$3" ] || { echo "no request at $3" >&2; exit 2; }
     cp "$3" "$here/got-live-request.json"
     if [ -f "$here/live-fails" ]; then cat "$here/live-fails"; exit 0; fi
-    echo '{"ev": "started", "run": "sim86-run-1"}'
+    if [ -f "$here/live-started" ]; then cat "$here/live-started"
+    else echo '{"ev": "started", "run": "sim86-run-1"}'; fi
     sleep 1
     cat "$here/live.jsonl"
     if [ -f "$here/live-ends" ]; then
@@ -2714,6 +2715,67 @@ fn live_ask(limit_s: u64) -> Value {
            "live": {"limit_s": limit_s}})
 }
 
+/// A live run shows the board's other wired pins beside the checks', by
+/// the chip's name for each when sim86 gives it, and judges the checks'
+/// pins only.
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_shows_the_boards_other_wired_pins_live() {
+    let server = site("0.1.0", run_answer()).await;
+    let recorded = sim86_fixture("blinky.json");
+    let live = format!(
+        "{}\n{}\n{}\n{{\"ev\": \"recording\", {}\n",
+        r#"{"ev": "pin", "t_ns": 0, "net": "mcu.D3", "level": 1}"#,
+        r#"{"ev": "pin", "t_ns": 5, "net": "mcu.D9", "level": 1}"#,
+        r#"{"ev": "pin", "t_ns": 10, "net": "mcu.D1", "level": 0}"#,
+        &recorded.trim()[1..]
+    );
+    let m = live_machine(GOOD, &live);
+    std::fs::write(
+        m.sim86_bin().join("live-started"),
+        r#"{"ev": "started", "run": "sim86-run-1", "signals": {"D1": "GPIO3", "D3": "GPIO5"}}
+"#,
+    )
+    .unwrap();
+    let served = m.serve(&server.uri());
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+
+    let mut events = LiveStream::open(&served, &id).await;
+    assert_eq!(
+        events.next().await.unwrap(),
+        (
+            "pin".to_string(),
+            json!({"t_ms": 0.0, "pin": "GPIO5", "name": "D3", "net": "mcu.D3", "level": 1})
+        )
+    );
+    // A net ter did not ask for is not sent; the checks' pin keeps its name.
+    assert_eq!(
+        events.next().await.unwrap(),
+        (
+            "pin".to_string(),
+            json!({"t_ms": 1e-5, "pin": "GPIO3", "name": "user_led", "net": "mcu.D1", "level": 0})
+        )
+    );
+    let (checks, _) = events.until("checks").await;
+    assert_eq!(checks["check_status"], "passed", "{checks}");
+    let runs = posted(&server, "run").await;
+    assert_eq!(runs.len(), 1);
+    assert!(
+        !runs[0].to_string().contains("mcu.D3"),
+        "a shown pin is not in the run record"
+    );
+    let asked: Value = serde_json::from_str(&m.sim86_saw("got-live-request.json")).unwrap();
+    assert_eq!(asked["watch"], json!(["mcu.D1"]));
+    assert_eq!(asked["show"], json!(["mcu.D3"]));
+    assert_eq!(
+        served.live_post(&id, "stop", json!({})).await,
+        (200, json!({"ok": true}))
+    );
+    events.until("ended").await;
+}
+
 /// The page asks for a live run: `/run` answers as soon as the board runs,
 /// the events come as sim86 gives them, the checks are judged from the
 /// recording and posted while the board runs on, and Stop ends the run.
@@ -2788,6 +2850,7 @@ async fn serve_shows_a_sim86_run_live_and_stops_it_when_told() {
     assert!(asked.get("duration_ms").is_none(), "{asked}");
     assert_eq!(asked["realtime_ms"], 660_000);
     assert_eq!(asked["watch"], json!(["mcu.D1"]));
+    assert_eq!(asked["show"], json!(["mcu.D3"]), "the button's pin");
 
     // The run goes on after the checks, until the page stops it.
     assert!(!m.sim86_bin().join("got-stop").exists());
@@ -4206,6 +4269,65 @@ async fn a_long_live_run_is_read_as_it_goes_and_stopped_on_sim86() {
     let (ended, _) = events.until("ended").await;
     assert_eq!(ended, json!({"reason": "user-stop", "detail": ""}));
     assert!(m.sim86_saw("stopped").contains("fake-run-1"));
+}
+
+/// ter's own helper streams the board's other wired pins by the chip's
+/// names from sim86's catalog, and a pin sim86 will not observe holds up
+/// neither the run nor its checks.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_helper_shows_the_wired_pins_and_a_refused_one_changes_nothing() {
+    let server = site("0.1.0", run_answer()).await;
+    for refused in [false, true] {
+        let m = long_sim86_machine();
+        std::fs::write(m.exercise().join("check.yaml"), SIM86_HEARTBEAT_CHECK).unwrap();
+        std::fs::write(
+            m.sim86_bin().join("catalog"),
+            r#"[{"name": "GND"}, {"name": "D1", "signal": "GPIO3"}, {"name": "D3", "signal": "GPIO5"}]"#,
+        )
+        .unwrap();
+        if refused {
+            std::fs::write(m.sim86_bin().join("refuse-observe"), "mcu.D3").unwrap();
+        }
+        let served = m.serve(&server.uri());
+        let (status, _, v) = served.run(live_ask(60)).await;
+        assert_eq!(status, 200, "{v}");
+        let id = v["live"].as_str().unwrap().to_string();
+        let mut events = LiveStream::open(&served, &id).await;
+        let mut pins = Vec::new();
+        let checks = loop {
+            let (name, data) = events.next().await.unwrap();
+            match name.as_str() {
+                "pin" => pins.push(data),
+                "checks" => break data,
+                _ => {}
+            }
+        };
+        assert_eq!(checks["check_status"], "passed", "{checks}");
+        let shown: Vec<&Value> = pins.iter().filter(|p| p["net"] == "mcu.D3").collect();
+        if refused {
+            assert!(shown.is_empty(), "{shown:?}");
+        } else {
+            assert_eq!(
+                shown,
+                [&json!({"t_ms": 0.0, "pin": "GPIO5", "name": "D3", "net": "mcu.D3", "level": 0})]
+            );
+        }
+        assert!(
+            pins.iter()
+                .filter(|p| p["net"] == "mcu.D1")
+                .all(|p| p["name"] == "user_led" && p["pin"] == "GPIO3"),
+            "{pins:?}"
+        );
+        let observed = m.sim86_saw("observed");
+        assert!(observed.starts_with("[\"mcu.D1\"]\n"), "{observed}");
+        assert_eq!(
+            served.live_post(&id, "stop", json!({})).await,
+            (200, json!({"ok": true}))
+        );
+        events.until("ended").await;
+        assert!(m.sim86_saw("stopped").contains("fake-run-1"));
+    }
 }
 
 /// A helper stuck waiting on sim86 still stops the sim86 run the moment
