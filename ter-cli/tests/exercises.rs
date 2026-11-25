@@ -290,7 +290,45 @@ async fn fetch_writes_the_scaffold_and_ter_toml_in_the_course_folder() {
     );
     assert_eq!(ter["fetched_sha256"].as_str().unwrap().len(), 64);
 
+    // Fetched again: the site's files come back, the learner's code stays.
+    std::fs::write(dir.join("check.yaml"), "checks: [old]\n").unwrap();
+    std::fs::write(dir.join("src/bin/main.rs"), "fn main() { loop {} }\n").unwrap();
+    let ter_toml = std::fs::read_to_string(dir.join("ter.toml")).unwrap();
+    std::fs::write(
+        dir.join("ter.toml"),
+        ter_toml.replace("mode = \"hardware\"", "mode = \"simulation\""),
+    )
+    .unwrap();
+    let o = m.ter(&site.uri(), &["ex", "fetch", BLINKY]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("Updated from the site: check.yaml.\n"),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("check.yaml")).unwrap(),
+        "checks: []\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/bin/main.rs")).unwrap(),
+        "fn main() { loop {} }\n"
+    );
     let (ok, v) = m.json(&site.uri(), &["ex", "fetch", BLINKY]);
+    assert!(ok, "{v}");
+    assert_eq!(v["updated"], json!([]), "{v}");
+    assert_eq!(v["mode"], "simulation", "the learner's mode stays: {v}");
+
+    // A folder that holds another exercise is still refused.
+    let (ok, v) = m.json(
+        &site.uri(),
+        &[
+            "ex",
+            "fetch",
+            "sim-only--xiao-esp32c3-nostd",
+            dir.to_str().unwrap(),
+        ],
+    );
     assert!(!ok);
     assert_eq!(v["error"]["code"], "already_fetched", "{v}");
 }

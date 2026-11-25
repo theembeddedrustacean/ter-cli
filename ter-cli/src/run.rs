@@ -22,7 +22,7 @@ use crate::output::{CliError, print_json};
 use crate::record::{Infra, Outcome, RunContext, assemble, file_sha256};
 use crate::session::Session;
 use crate::telemetry::{RUN_CHECK, bad_check, check_recording};
-use crate::{events, hw, remote, sim, sim86};
+use crate::{events, exercises, hw, remote, sim, sim86};
 use ter_flash::Tool;
 
 pub const CHECK_YAML: &str = "check.yaml";
@@ -104,6 +104,20 @@ pub fn venue_for(mode: &str, asked: Option<&str>, dir: &Path) -> Result<&'static
 
 pub async fn run(args: RunArgs, json: bool) -> Result<(), CliError> {
     report(execute(args, json).await?, json)
+}
+
+/// Before a run from the terminal: bring the exercise's site files up to
+/// date ([`exercises::refresh`]), saying so when one changed. With no
+/// exercise folder or no session, the run itself says what is wrong.
+pub async fn refresh(args: &RunArgs, quiet: bool) -> Result<(), CliError> {
+    let (Ok(dir), Ok(session)) = (exercise_dir(args.dir.clone()), Session::open()) else {
+        return Ok(());
+    };
+    let updated = exercises::refresh(&session, &dir).await?;
+    if !quiet && !updated.is_empty() {
+        eprintln!("{}", exercises::updated_line(&updated));
+    }
+    Ok(())
 }
 
 /// A live run is on sim86 for now: refuse any other before the build.

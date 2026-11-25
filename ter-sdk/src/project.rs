@@ -114,6 +114,10 @@ pub struct TerToml {
     /// Checks name pins; a simulator wires GPIOs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pins: BTreeMap<String, String>,
+    /// Fetched from a curriculum checkout (`--dev`): a run leaves its files
+    /// as they are instead of refreshing them from the site.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
 }
 
 const TER_TOML_HEADER: &str = "\
@@ -267,6 +271,8 @@ pub struct Scaffold {
     /// The `runner` its `.cargo/config.toml` sets.
     pub runner: String,
     pub pins: BTreeMap<String, String>,
+    /// From a curriculum checkout rather than the site.
+    pub dev: bool,
 }
 
 impl Scaffold {
@@ -306,6 +312,7 @@ impl Scaffold {
             files,
             runner,
             pins: ex.pins.clone(),
+            dev: false,
         })
     }
 
@@ -380,10 +387,90 @@ impl Scaffold {
             venue: None,
             fetched_sha256: source_sha256(dir)?,
             pins: self.pins.clone(),
+            dev: self.dev,
         };
         ter.save(dir)?;
         Ok(ter)
     }
+
+    /// Bring a folder this exercise was fetched to earlier up to date: the
+    /// site's files, everything outside `src/` and ter.toml's target, modes
+    /// and pins, are rewritten where the scaffold differs. The learner's
+    /// `src/`, `.gitignore` and ter.toml's `mode` (while still allowed) and
+    /// `venue` are kept. Returns the files it changed.
+    pub fn refresh(&self, dir: &Path, modes: Vec<String>) -> Result<Vec<PathBuf>> {
+        if modes.is_empty() {
+            return Err(ProjectError::authoring(
+                &self.exercise_id,
+                "it allows neither hardware nor simulation",
+            ));
+        }
+        let old = TerToml::load(dir)?;
+        if old.exercise != self.exercise_id {
+            return Err(ProjectError::new(
+                "already_fetched",
+                format!(
+                    "{} holds exercise {}, not {}.",
+                    dir.display(),
+                    old.exercise,
+                    self.exercise_id
+                ),
+            ));
+        }
+        // The scaffold as a fresh fetch would leave it, for its hash.
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        let staging = dir
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!(".{name}.refreshing"));
+        let _ = std::fs::remove_dir_all(&staging);
+        let fresh = self.write_into(&staging, &old.course, modes);
+        let _ = std::fs::remove_dir_all(&staging);
+        let fresh = fresh?;
+
+        let mut changed = Vec::new();
+        for (rel, bytes) in &self.files {
+            if learner_owned(rel) || rel == Path::new(GITIGNORE) {
+                continue;
+            }
+            let path = dir.join(rel);
+            if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+                continue;
+            }
+            if let Some(p) = path.parent() {
+                std::fs::create_dir_all(p).map_err(|e| ProjectError::io("create", p, e))?;
+            }
+            std::fs::write(&path, bytes).map_err(|e| ProjectError::io("write", &path, e))?;
+            changed.push(rel.clone());
+        }
+        ensure_gitignore(dir)?;
+
+        let ter = TerToml {
+            mode: if fresh.modes.contains(&old.mode) {
+                old.mode.clone()
+            } else {
+                fresh.mode
+            },
+            course: old.course.clone(),
+            venue: old.venue.clone(),
+            ..fresh
+        };
+        if ter != old {
+            let site_side = |t: &TerToml| (t.target.clone(), t.modes.clone(), t.pins.clone());
+            if site_side(&ter) != site_side(&old) || ter.mode != old.mode {
+                changed.push(PathBuf::from(TER_TOML));
+            }
+            ter.save(dir)?;
+        }
+        Ok(changed)
+    }
+}
+
+/// Whether a file of an exercise is the learner's: anything under `src/`.
+/// The rest (the manifest, cargo config, check.yaml, the circuit, sim86's
+/// board and pins) is the site's.
+pub fn learner_owned(rel: &Path) -> bool {
+    rel.starts_with("src")
 }
 
 /// Make `dir`'s `.gitignore` ignore `.ter/`, `.runs/` and `target/`. A
@@ -776,6 +863,7 @@ mod tests {
                 ("user_button".into(), "GPIO5".into()),
                 ("user_led".into(), "GPIO3".into()),
             ]),
+            dev: false,
         };
         ter.save(dir.path()).unwrap();
         assert_eq!(TerToml::load(dir.path()).unwrap(), ter);
@@ -978,6 +1066,71 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_rewrites_the_sites_files_and_keeps_the_learners() {
+        let root = tempfile::tempdir().unwrap();
+        let mut old = scaffold();
+        old.files
+            .push(file("sim86/pins.json", "{\"user_led\": \"mcu.D1\"}\n"));
+        let f = fetch(&Layout::new(root.path()), &old);
+        let main = f.dir.join("src/bin/main.rs");
+        std::fs::write(&main, "fn main() { loop {} }\n").unwrap();
+        let toml = f.dir.join(TER_TOML);
+        let text = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(&toml, format!("venue = \"sim86\"\n{text}")).unwrap();
+
+        let mut new = scaffold();
+        new.files[3] = file("check.yaml", "checks: [x]\n");
+        new.files
+            .push(file("sim86/pins.json", "{\"user_led\": \"mcu.D10\"}\n"));
+        new.files.push(file("src/bin/main.rs.orig", "starter\n"));
+        new.pins = BTreeMap::from([("user_led".into(), "GPIO10".into())]);
+        let s = Scaffold::check(&new).unwrap();
+        let mut changed = s.refresh(&f.dir, vec!["simulation".into()]).unwrap();
+        changed.sort();
+        assert_eq!(
+            changed,
+            [
+                PathBuf::from("check.yaml"),
+                PathBuf::from("sim86/pins.json"),
+                PathBuf::from(TER_TOML)
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.dir.join("sim86/pins.json")).unwrap(),
+            "{\"user_led\": \"mcu.D10\"}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&main).unwrap(),
+            "fn main() { loop {} }\n"
+        );
+        assert!(!f.dir.join("src/bin/main.rs.orig").exists());
+        let ter = TerToml::load(&f.dir).unwrap();
+        assert_eq!(ter.pins["user_led"], "GPIO10");
+        assert_eq!(ter.modes, ["simulation"]);
+        assert_eq!(ter.mode, "simulation", "hardware is no longer allowed");
+        assert_eq!(ter.venue.as_deref(), Some("sim86"));
+        assert!(
+            !root
+                .path()
+                .join("esp-gpio/.gpio-blinky--xiao-esp32c3-nostd.refreshing")
+                .exists()
+        );
+
+        assert!(
+            s.refresh(&f.dir, vec!["simulation".into()])
+                .unwrap()
+                .is_empty()
+        );
+        let mut other = new.clone();
+        other.exercise_id = "other".into();
+        let err = Scaffold::check(&other)
+            .unwrap()
+            .refresh(&f.dir, default_modes())
+            .unwrap_err();
+        assert_eq!(err.code, "already_fetched");
+    }
+
+    #[test]
     fn clean_keeps_source_and_drops_build_output() {
         let root = tempfile::tempdir().unwrap();
         let layout = Layout::new(root.path());
@@ -1073,6 +1226,7 @@ mod tests {
             venue: None,
             fetched_sha256: String::new(),
             pins: BTreeMap::new(),
+            dev: false,
         };
         let env = layout.cargo_env(&ter, Path::new("/elsewhere/e"));
         assert_eq!(

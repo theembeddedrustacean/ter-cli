@@ -276,6 +276,7 @@ mod tests {
             venue: None,
             fetched_sha256: String::new(),
             pins: Default::default(),
+            dev: false,
         }
     }
 

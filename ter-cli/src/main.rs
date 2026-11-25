@@ -357,6 +357,10 @@ enum ExCommand {
     /// Linux). To put one exercise somewhere else, name the folder:
     /// `ter ex fetch <id> <dir>`.
     ///
+    /// Fetching one that is already there rewrites the files the site owns
+    /// (everything outside src/) and leaves your code alone. Every `ter run`
+    /// does the same.
+    ///
     /// The other commands look for fetched exercises under the same root,
     /// so set it once in the environment or the config rather than passing
     /// --root each time.
@@ -461,6 +465,7 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
                 no_check,
                 abort: None,
             };
+            run::refresh(&args, json).await?;
             if live {
                 let limit = limit.unwrap_or(ter_remote::serve::LIVE_LIMIT_S);
                 live::run(args, limit, json).await

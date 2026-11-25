@@ -92,6 +92,10 @@ time.
   file or the `TER_COURSES_ROOT` environment variable, or pass
   `--root <dir>` to a command. `ter ex fetch <id> <dir>` puts one
   exercise in a folder of your choice.
+- Fetching an exercise again, and every `ter run`, rewrites the files
+  the site owns (everything outside `src/`, and the pins and modes in
+  `ter.toml`) with the site's current ones. Your code in `src/` is never
+  touched.
 - A board run reads serial only, so it can complete an exercise only
   when every check is a serial check with no button presses. Pin checks
   (a blink rate, a pulse width) are graded in simulation: your board

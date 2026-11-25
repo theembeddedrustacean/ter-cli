@@ -262,7 +262,13 @@ async fn handle(
     }
 
     let dir = match exercises::fetched_dir(&request.exercise_id)? {
-        Some(dir) => dir,
+        Some(dir) => {
+            let updated = exercises::refresh(&session, &dir).await?;
+            if !updated.is_empty() {
+                eprintln!("{}", exercises::updated_line(&updated));
+            }
+            dir
+        }
         None => {
             eprintln!("Fetching {}", request.exercise_id);
             exercises::fetch_into_courses(&session, &request.exercise_id)

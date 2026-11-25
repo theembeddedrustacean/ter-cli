@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use ter_sdk::exercise::default_modes;
-use ter_sdk::project::{self, Fetched, Freed, Layout, Scaffold};
+use ter_sdk::project::{self, Fetched, Freed, Layout, Scaffold, TerToml};
 use ter_sdk::{Exercise, dev};
 use ter_telemetry::sim86;
 
@@ -146,6 +146,10 @@ struct FetchedOut<'a> {
     runner: &'a str,
     files: usize,
     dev: bool,
+    /// For a folder fetched before: the site's files it rewrote. The
+    /// learner's `src/` is never among them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated: Option<&'a [PathBuf]>,
 }
 
 /// From the site, or with `dev` from a curriculum checkout.
@@ -167,12 +171,22 @@ pub async fn fetch(
                 .map_err(|e| session.forget_dead_token(e))?
         }
     };
-    let scaffold = Scaffold::check(&exercise)?;
+    let mut scaffold = Scaffold::check(&exercise)?;
+    scaffold.dev = dev.is_some();
     let dest = match dir {
         Some(d) => d,
         None => layout()?.exercise_dir(&course, &exercise.exercise_id),
     };
-    let Fetched { dir, ter } = scaffold.write(&dest, &course, modes)?;
+    // Fetched here before: bring the site's files up to date instead.
+    let (Fetched { dir, ter }, updated) = match TerToml::load(&dest) {
+        Ok(ter) if ter.exercise == exercise.exercise_id => {
+            let mut updated = scaffold.refresh(&dest, modes)?;
+            updated.sort();
+            let ter = TerToml::load(&dest)?;
+            (Fetched { dir: dest, ter }, Some(updated))
+        }
+        _ => (scaffold.write(&dest, &course, modes)?, None),
+    };
 
     if json {
         print_json(&FetchedOut {
@@ -186,11 +200,21 @@ pub async fn fetch(
             runner: &scaffold.runner,
             files: scaffold.files.len(),
             dev: dev.is_some(),
+            updated: updated.as_deref(),
         });
         return Ok(());
     }
-    println!("Fetched {} ({})", exercise.title, ter.exercise);
-    println!("  into    {}", dir.display());
+    match &updated {
+        None => {
+            println!("Fetched {} ({})", exercise.title, ter.exercise);
+            println!("  into    {}", dir.display());
+        }
+        Some(updated) => {
+            println!("{} ({}) was fetched before.", exercise.title, ter.exercise);
+            println!("  in      {}", dir.display());
+            println!("  {}", updated_line(updated));
+        }
+    }
     println!("  course  {}", ter.course);
     println!("  target  {}", ter.target);
     println!("  mode    {} (allowed: {})", ter.mode, ter.modes.join(", "));
@@ -208,6 +232,45 @@ pub async fn fetch_into_courses(session: &Session, id: &str) -> Result<PathBuf, 
     let scaffold = Scaffold::check(&exercise)?;
     let dest = layout()?.exercise_dir(&course, &exercise.exercise_id);
     Ok(scaffold.write(&dest, &course, modes)?.dir)
+}
+
+/// Rewrite the site's files in the exercise folder `dir` from what the
+/// site serves now, before a run: everything but the learner's `src/`
+/// (see [`Scaffold::refresh`]). Returns the files it changed. A folder
+/// fetched with `--dev`, a site that does not hand the exercise over and a
+/// scaffold ter cannot write leave the folder as it is; the run goes on with
+/// it, and its own calls to the site say what is wrong.
+pub async fn refresh(session: &Session, dir: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let Ok(ter) = TerToml::load(dir) else {
+        return Ok(Vec::new());
+    };
+    if ter.dev {
+        return Ok(Vec::new());
+    }
+    let Ok(exercise) = session.client.exercise(&ter.exercise).await else {
+        return Ok(Vec::new());
+    };
+    let Ok(scaffold) = Scaffold::check(&exercise) else {
+        return Ok(Vec::new());
+    };
+    let modes = exercise.modes.clone().unwrap_or_else(default_modes);
+    match scaffold.refresh(dir, modes) {
+        Err(e) if e.code == "bad_scaffold" => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+        Ok(mut updated) => {
+            updated.sort();
+            Ok(updated)
+        }
+    }
+}
+
+/// The one line that says which of the site's files changed.
+pub fn updated_line(updated: &[PathBuf]) -> String {
+    if updated.is_empty() {
+        return "Its files from the site are up to date.".into();
+    }
+    let names: Vec<String> = updated.iter().map(|p| p.display().to_string()).collect();
+    format!("Updated from the site: {}.", names.join(", "))
 }
 
 /// The folder `id` was fetched to, if it was.

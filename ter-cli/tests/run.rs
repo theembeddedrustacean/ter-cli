@@ -803,6 +803,60 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
+async fn a_run_rewrites_the_sites_files_that_changed_and_keeps_the_learners_code() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]);
+    let dir = m.exercise();
+    std::fs::create_dir_all(dir.join("sim86")).unwrap();
+    std::fs::write(dir.join("sim86/pins.json"), "{\"user_led\": \"mcu.D1\"}\n").unwrap();
+    let cargo_toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+    let file =
+        |path: &str, content: &str| json!({"path": path, "content": content, "encoding": "utf8"});
+    Mock::given(method("GET"))
+        .and(path(format!("{API}.exercise")))
+        .respond_with(ok(json!({
+            "exercise_id": EXERCISE, "title": "Heartbeat", "target": "xiao-esp32c3-nostd",
+            "modes": ["hardware", "simulation"], "pins": {"user_led": "GPIO10"},
+            "files": [
+                file("Cargo.toml", &cargo_toml),
+                file(".cargo/config.toml", "[target.riscv32imc-unknown-none-elf]\nrunner = \"espflash flash --monitor\"\n"),
+                file("src/main.rs", "fn main() {}\n"),
+                file("diagram.json", UFERRIS),
+                file("sim86/pins.json", "{\"user_led\": \"mcu.D10\"}\n"),
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let o = m.ter_in(&server.uri(), &["run", "--no-check", "--sim"], &dir);
+
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(
+        err.contains("Updated from the site: .cargo/config.toml, sim86/pins.json, ter.toml.\n"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("sim86/pins.json")).unwrap(),
+        "{\"user_led\": \"mcu.D10\"}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/main.rs")).unwrap(),
+        GOOD
+    );
+    let ter = std::fs::read_to_string(dir.join("ter.toml")).unwrap();
+    assert!(ter.contains("user_led = \"GPIO10\""), "{ter}");
+    assert!(ter.contains("mode = \"hardware\""), "{ter}");
+    assert_eq!(posted(&server, "run").await.len(), 1);
+
+    // Nothing changed since: nothing to say.
+    let o = m.ter_in(&server.uri(), &["run", "--no-check", "--sim"], &dir);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(!err.contains("Updated from the site"), "{err}");
+}
+
+#[tokio::test]
 async fn a_mode_the_exercise_does_not_allow_is_refused_before_building() {
     let server = site("0.1.0", run_answer()).await;
     let m = Machine::with_exercise(GOOD, &["hardware"]);
