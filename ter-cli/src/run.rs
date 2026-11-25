@@ -16,7 +16,7 @@ use ter_telemetry::sim86::Sim86;
 use ter_telemetry::wokwi::Wokwi;
 use ter_telemetry::{Capture, Recording, Venue, rfc3339_utc};
 
-use crate::build::cargo_build;
+use crate::build::{Abort, cargo_build};
 use crate::config::Config;
 use crate::output::{CliError, print_json};
 use crate::record::{Infra, Outcome, RunContext, assemble, file_sha256};
@@ -38,6 +38,10 @@ pub struct RunArgs {
     /// wait for it.
     pub bench: remote::Want,
     pub no_check: bool,
+    /// Stops the build from elsewhere (`ter serve`, for a run the page
+    /// dropped or replaced): the run then ends as `replaced`, before
+    /// anything ran.
+    pub abort: Option<Abort>,
 }
 
 /// A run that was posted, for printing or for `ter serve` to return.
@@ -282,9 +286,17 @@ pub async fn build(args: RunArgs, quiet: bool) -> Result<Built, CliError> {
     }
     let started = Instant::now();
     let layout = Layout::new(Config::load()?.courses_root);
-    let build = cargo_build(&dir, layout.cargo_env(&ter, &dir), !json)?;
+    let abort = args.abort;
+    let stopped = |abort: &Option<Abort>| abort.as_ref().is_some_and(Abort::aborted);
+    if stopped(&abort) {
+        return Err(replaced());
+    }
+    let build = cargo_build(&dir, layout.cargo_env(&ter, &dir), !json, abort.as_ref())?;
     let log_path = recording.join("build.log");
     write(&log_path, build.log.as_bytes())?;
+    if stopped(&abort) {
+        return Err(replaced());
+    }
 
     let previous =
         LastRun::load(&dir)?.filter(|last| last.user == user && last.site == client.site_url());
@@ -309,6 +321,14 @@ pub async fn build(args: RunArgs, quiet: bool) -> Result<Built, CliError> {
         quiet,
         ran_in: None,
     })
+}
+
+/// A run whose build was stopped: nothing ran, nothing is posted.
+pub fn replaced() -> CliError {
+    CliError::new(
+        "replaced",
+        "The run was stopped before it ran: the page dropped it or asked for a newer run.",
+    )
 }
 
 /// A sim86 run that can be watched as it happens: the check, its text,

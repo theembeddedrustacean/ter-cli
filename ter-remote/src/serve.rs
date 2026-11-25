@@ -145,7 +145,7 @@ impl ServeError {
             "not_found" | "unknown_bench" => StatusCode::NOT_FOUND,
             "unsupported_media_type" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "timeout" => StatusCode::GATEWAY_TIMEOUT,
-            "busy" | "bench_busy" | "limit_cap" | "ended" => StatusCode::CONFLICT,
+            "busy" | "bench_busy" | "limit_cap" | "ended" | "replaced" => StatusCode::CONFLICT,
             "outdated" => StatusCode::UPGRADE_REQUIRED,
             "venue_unavailable" | "bench_offline" | "no_capacity" => {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -1105,6 +1105,7 @@ mod tests {
         assert_eq!(status("unknown_bench"), StatusCode::NOT_FOUND);
         assert_eq!(status("not_observable"), StatusCode::BAD_REQUEST);
         assert_eq!(status("timeout"), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(status("replaced"), StatusCode::CONFLICT);
     }
 
     #[test]

@@ -28,6 +28,13 @@
 //! One run at a time: a second request waits for the first, since both
 //! would build in the same course cache. A live run holds that turn only
 //! until its board runs.
+//!
+//! A run the page no longer wants is not built: when its `/run` is
+//! dropped (the page's Stop aborts the request; the server drops a
+//! request whose connection closes) or a newer `/run` comes in, cargo and
+//! everything it started are stopped, no sim86 run is started for it, and
+//! the turn goes to the next run at once. A run past its build goes on as
+//! before, except that a live run is stopped as soon as it starts.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -41,6 +48,7 @@ use ter_remote::serve::{
 use ter_sdk::project::TerToml;
 use ter_telemetry::sim86::Sim86;
 
+use crate::build::Abort;
 use crate::config::Config;
 use crate::exercises;
 use crate::live::{self, Live, Started};
@@ -74,6 +82,8 @@ struct Inner {
     simulators: std::sync::Mutex<Option<(std::time::Instant, Value)>>,
     /// The live run, going or over, until the next one.
     live: std::sync::Mutex<Option<Arc<Live>>>,
+    /// Stops the newest run's build, should another come in.
+    newest: std::sync::Mutex<Option<Abort>>,
 }
 
 impl Inner {
@@ -166,7 +176,34 @@ impl Service for Serve {
 
     fn run(&self, request: RunRequest) -> RunFuture {
         let inner = self.0.clone();
-        Box::pin(async move { handle(inner, request).await.map_err(|f| f.0) })
+        let abort = Abort::default();
+        // A newer run replaces one still waiting or building.
+        if let Some(before) = inner
+            .newest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(abort.clone())
+        {
+            before.abort();
+        }
+        Box::pin(async move {
+            // The server drops this future when the page drops the request.
+            let mut dropped = AbortOnDrop(Some(abort.clone()));
+            let answer = handle(inner, request, abort).await.map_err(|f| f.0);
+            dropped.0 = None;
+            answer
+        })
+    }
+}
+
+/// Stops a run's build if its request goes before the run is over.
+struct AbortOnDrop(Option<Abort>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(abort) = &self.0 {
+            abort.abort();
+        }
     }
 }
 
@@ -176,8 +213,15 @@ const REPLACE_PATIENCE: Duration = Duration::from_secs(20);
 /// wait for a free simulator.
 const LIVE_START_ALLOWANCE: Duration = Duration::from_secs(480);
 
-async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFailure> {
+async fn handle(
+    inner: Arc<Inner>,
+    request: RunRequest,
+    abort: Abort,
+) -> Result<Value, ServeFailure> {
     let turn = inner.turn.clone().lock_owned().await;
+    if abort.aborted() {
+        return Err(run::replaced().into());
+    }
     // One live run at a time, and none left running under another run.
     // Taken with the turn, so two runs asked for at once cannot both find
     // none to stop.
@@ -239,6 +283,7 @@ async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFa
         venue,
         bench,
         no_check: false,
+        abort: Some(abort.clone()),
     };
     let live_limit = request.live;
     if live_limit.is_some() {
@@ -257,9 +302,15 @@ async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFa
                 .await
                 .map(|done| Ok(Box::new(done))),
             Some(limit_s) => match run::build(args, true).await {
-                Ok(built) => live::start(built, limit_s)
-                    .await
-                    .map(|started| match started {
+                Ok(_) if abort.aborted() => Err(run::replaced()),
+                Ok(built) => match live::start(built, limit_s).await {
+                    // Dropped or replaced while sim86 started it.
+                    Ok(Started::Live(live, _events)) if abort.aborted() => {
+                        live.stop("replaced");
+                        let _ = tokio::time::timeout(REPLACE_PATIENCE, live.over()).await;
+                        Err(run::replaced())
+                    }
+                    started => started.map(|started| match started {
                         Started::Posted(done) => Ok(done),
                         // The page listens from here on; with no listener the
                         // run stops by itself.
@@ -276,6 +327,7 @@ async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFa
                             Err(answer)
                         }
                     }),
+                },
                 Err(e) => Err(e),
             },
         };
@@ -540,14 +592,49 @@ pub async fn serve(
         let _ = out.write_all(banner.as_bytes()).and_then(|()| out.flush());
     }
 
-    let service = Arc::new(Serve(Arc::new(Inner {
+    let inner = Arc::new(Inner {
         turn,
         simulators: std::sync::Mutex::new(None),
         live: std::sync::Mutex::new(None),
-    })));
-    ter_remote::serve::serve(listener, service, &page, dev)
-        .await
-        .map_err(|e| CliError::new("io_error", format!("ter serve stopped: {e}")))
+        newest: std::sync::Mutex::new(None),
+    });
+    let service = Arc::new(Serve(inner.clone()));
+    tokio::select! {
+        served = ter_remote::serve::serve(listener, service, &page, dev) => {
+            served.map_err(|e| CliError::new("io_error", format!("ter serve stopped: {e}")))
+        }
+        () = interrupted() => {
+            // cargo runs in a process group of its own, which Ctrl-C does
+            // not reach: a build going on is stopped here.
+            let newest = inner.newest.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(abort) = newest {
+                abort.abort();
+            }
+            std::process::exit(130)
+        }
+    }
+}
+
+/// Ctrl-C, or the terminal or the system ending ter.
+async fn interrupted() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut hangup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+            _ = hangup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

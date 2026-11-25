@@ -124,6 +124,7 @@ case "$2" in
     # end by itself.
     [ -f "$3" ] || { echo "no request at $3" >&2; exit 2; }
     cp "$3" "$here/got-live-request.json"
+    echo started >> "$here/live-starts"
     if [ -f "$here/live-fails" ]; then cat "$here/live-fails"; exit 0; fi
     if [ -f "$here/live-started" ]; then cat "$here/live-started"
     else echo '{"ev": "started", "run": "sim86-run-1"}'; fi
@@ -1870,6 +1871,148 @@ async fn serve_runs_the_pages_files_and_answers_with_the_posted_run() {
     let p = &posted(&server, "run").await[0]["payload"];
     assert_eq!(p["venue"], "wokwi");
     assert_eq!(p["check_status"], "passed");
+}
+
+/// A build script that, while `$SLOW_BUILD_DIR/slow` exists, starts a
+/// long `sleep`, notes its own, its parent's (cargo's) and the sleep's
+/// process ids in `$SLOW_BUILD_DIR/building`, and waits for the sleep.
+const SLOW_BUILD_RS: &str = r#"
+fn main() {
+    let Ok(dir) = std::env::var("SLOW_BUILD_DIR") else { return };
+    let dir = std::path::Path::new(&dir);
+    // Not there after a fast build: cargo then runs this every build.
+    println!("cargo:rerun-if-changed={}", dir.join("slow").display());
+    if !dir.join("slow").exists() {
+        return;
+    }
+    let mut sleep = std::process::Command::new("sleep").arg("120").spawn().unwrap();
+    let ids = format!("{} {} {}", std::os::unix::process::parent_id(), std::process::id(), sleep.id());
+    std::fs::write(dir.join("building.tmp"), ids).unwrap();
+    std::fs::rename(dir.join("building.tmp"), dir.join("building")).unwrap();
+    sleep.wait().unwrap();
+}
+"#;
+
+/// Whether process `pid` still runs (a zombie nobody reaped does not).
+#[cfg(target_os = "linux")]
+fn running(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+    })
+}
+
+/// The process ids a slow build noted, once it is building.
+#[cfg(target_os = "linux")]
+async fn slow_build_started(marks: &Path) -> Vec<String> {
+    for _ in 0..1800 {
+        if let Ok(ids) = std::fs::read_to_string(marks.join("building")) {
+            std::fs::remove_file(marks.join("building")).unwrap();
+            return ids.split_whitespace().map(str::to_string).collect();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the slow build never started");
+}
+
+/// Wait up to 10 s for every one of `ids` to be gone.
+#[cfg(target_os = "linux")]
+async fn all_gone(ids: &[String]) -> bool {
+    for _ in 0..100 {
+        if !ids.iter().any(|id| running(id)) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// The page's Stop drops its `/run` while ter builds, and a double click
+/// asks for a second run while the first builds: either way cargo and
+/// everything it started are stopped at once, nothing is posted for that
+/// run, and the next run builds and runs straight away.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn serve_stops_the_build_of_a_run_the_page_dropped_or_replaced() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["simulation"]).simulated(
+        HEARTBEAT_CHECK,
+        "heartbeat.vcd",
+        42,
+    );
+    std::fs::write(m.exercise().join("build.rs"), SLOW_BUILD_RS).unwrap();
+    let marks = tempfile::tempdir().unwrap();
+    let served = serve_with_env(
+        &m,
+        &server.uri(),
+        &[("SLOW_BUILD_DIR", marks.path().to_str().unwrap())],
+    );
+    let ask = || {
+        let request = reqwest::Client::new()
+            .post(format!("{}/run", served.url))
+            .header("origin", &served.page)
+            .json(&json!({"exercise_id": EXERCISE}));
+        tokio::spawn(async move {
+            let r = request.send().await.unwrap();
+            (r.status().as_u16(), r.json::<Value>().await.unwrap())
+        })
+    };
+
+    // Dropped: the page's Stop aborts the request, which closes it.
+    std::fs::write(marks.path().join("slow"), "").unwrap();
+    let dropped = ask();
+    let ids = slow_build_started(marks.path()).await;
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    dropped.abort();
+    assert!(
+        all_gone(&ids).await,
+        "cargo, its build script and the sleep it started are stopped: {ids:?}"
+    );
+
+    // Replaced: a newer run while the first builds. It builds at once,
+    // not after the dropped run's sleep.
+    let dropped_at = std::time::Instant::now();
+    let first = ask();
+    let ids = slow_build_started(marks.path()).await;
+    assert!(
+        dropped_at.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        dropped_at.elapsed()
+    );
+    std::fs::remove_file(marks.path().join("slow")).unwrap();
+    let asked = std::time::Instant::now();
+    let (status, _, v) = served.run(json!({"exercise_id": EXERCISE})).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["check_status"], "passed", "{v}");
+    assert!(
+        asked.elapsed() < Duration::from_secs(90),
+        "the newer run did not wait for the first's build: {:?}",
+        asked.elapsed()
+    );
+    assert!(all_gone(&ids).await, "{ids:?}");
+    let (status, v) = first.await.unwrap();
+    assert_eq!(status, 409, "{v}");
+    assert_eq!(v["error"]["code"], "replaced", "{v}");
+    assert_eq!(
+        posted(&server, "run").await.len(),
+        1,
+        "only the run that ran is posted"
+    );
+
+    // Ctrl-C on ter serve while it builds stops the build too, though
+    // cargo is in a process group of its own.
+    std::fs::write(marks.path().join("slow"), "").unwrap();
+    let _building = ask();
+    let ids = slow_build_started(marks.path()).await;
+    let ter = served.child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &ter])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(all_gone(&ids).await, "{ids:?}");
 }
 
 #[cfg(unix)]
@@ -4404,7 +4547,7 @@ async fn a_site_that_does_not_answer_holds_up_no_live_run() {
     assert_eq!(ended["reason"], "user-stop");
 }
 
-/// Two runs asked for at once: the second stops the first, and no run is
+/// Two runs asked for at once: the newer replaces the other, and no run is
 /// left going that nobody can stop.
 #[cfg(unix)]
 #[tokio::test]
@@ -4413,19 +4556,23 @@ async fn two_live_runs_asked_for_at_once_leave_one_going() {
     let m = live_machine(GOOD, &live_blinky());
     let served = m.serve(&server.uri());
 
+    // The newer replaces the other: before it is built, or as soon as
+    // sim86 has started it.
     let ((s1, _, a), (s2, _, b)) = tokio::join!(served.run(live_ask(60)), served.run(live_ask(60)));
-    assert_eq!((s1, s2), (200, 200), "{a} {b}");
-    let (a, b) = (a["live"].as_str().unwrap(), b["live"].as_str().unwrap());
-    assert_ne!(a, b);
+    let mut answers = [(s1, a), (s2, b)];
+    answers.sort_by_key(|(status, _)| *status);
+    let [(going, live), (replaced, error)] = answers;
+    assert_eq!((going, replaced), (200, 409), "{live} {error}");
+    assert_eq!(error["error"]["code"], "replaced", "{error}");
+    let id = live["live"].as_str().unwrap();
+    assert_eq!(served.live_status(id).await, 200);
+    served.live_post(id, "stop", json!({})).await;
+    // Every run sim86 started is stopped.
+    let starts = m.sim86_saw("live-starts").lines().count();
+    assert!((1..=2).contains(&starts), "{starts}");
     assert!(
-        sim86_says(&m, "got-stop", "stop", 10).await,
-        "the first run is stopped"
+        sim86_says(&m, "got-stop", &vec!["stop"; starts].join("\n"), 10).await,
+        "{starts} started: {:?}",
+        std::fs::read_to_string(m.sim86_bin().join("got-stop"))
     );
-    let mut statuses = [served.live_status(a).await, served.live_status(b).await];
-    statuses.sort_unstable();
-    assert_eq!(statuses, [200, 404]);
-    for id in [a, b] {
-        served.live_post(id, "stop", json!({})).await;
-    }
-    assert!(sim86_says(&m, "got-stop", "stop\nstop", 10).await);
 }

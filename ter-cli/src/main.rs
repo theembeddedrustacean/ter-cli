@@ -459,6 +459,7 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
                 venue,
                 bench: Default::default(),
                 no_check,
+                abort: None,
             };
             if live {
                 let limit = limit.unwrap_or(ter_remote::serve::LIVE_LIMIT_S);
