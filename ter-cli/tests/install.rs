@@ -109,7 +109,7 @@ case "$1" in
   -m)
     case "$2" in
       venv) mkdir -p "$3/bin" && cp "$0" "$3/bin/python" ;;
-      pip) touch "$FAKE/sim86-package" ;;
+      pip) echo 0.2.0 > "$FAKE/sim86-package" ;;
     esac
     exit 0 ;;
 esac
@@ -118,13 +118,14 @@ if [ ! -f "$FAKE/sim86-package" ]; then
   echo '{"helper": 1, "ok": false, "python": "3.12.3", "error": {"kind": "missing", "message": "the sim86 package is not in this Python"}}'
   exit 0
 fi
+v="$(cat "$FAKE/sim86-package")"
 case "$2" in
-  version) echo '{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.1.4"}' ;;
+  version) echo "{\"helper\": 1, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"$v\"}" ;;
   balance)
     if [ -n "$SIM86_API_KEY" ]; then
-      echo '{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.1.4", "balance": {"credits": 87, "plan": "free"}}'
+      echo "{\"helper\": 1, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"$v\", \"balance\": {\"credits\": 87, \"plan\": \"free\"}}"
     else
-      echo '{"helper": 1, "ok": false, "sim86": "0.1.4", "error": {"kind": "no_key", "message": "no API key: set SIM86_API_KEY, or run `sim86 login`"}}'
+      echo "{\"helper\": 1, \"ok\": false, \"sim86\": \"$v\", \"error\": {\"kind\": \"no_key\", \"message\": \"no API key: set SIM86_API_KEY, or run sim86 login\"}}"
     fi ;;
 esac
 "#;
@@ -298,7 +299,7 @@ fn sim86_goes_into_ters_own_python_environment_with_the_helper_beside_it() {
             .collect::<Vec<_>>(),
         [
             format!("python -m venv {}", venv.display()),
-            "python -m pip install --upgrade --quiet sim86>=0.1.4,<0.3".to_string(),
+            "python -m pip install --upgrade --quiet sim86>=0.2.0,<0.3".to_string(),
         ]
     );
     assert_eq!(
@@ -307,7 +308,7 @@ fn sim86_goes_into_ters_own_python_environment_with_the_helper_beside_it() {
     );
     let out = text(&first.stdout);
     assert!(
-        out.contains(&format!("Installed sim86 0.1.4 in {}.", home.display())),
+        out.contains(&format!("Installed sim86 0.2.0 in {}.", home.display())),
         "{out}"
     );
     // No key yet: the install is done, and the next step is named.
@@ -332,7 +333,7 @@ fn sim86_goes_into_ters_own_python_environment_with_the_helper_beside_it() {
             "tool": "sim86",
             "path": home,
             "installed": false,
-            "version": "0.1.4",
+            "version": "0.2.0",
             "python": "3.12.3",
             "key": "accepted",
             "plan": "free",
@@ -355,6 +356,30 @@ fn sim86_goes_into_ters_own_python_environment_with_the_helper_beside_it() {
     assert_eq!(
         std::fs::read_to_string(home.join("ter_sim86.py")).unwrap(),
         ter_telemetry::sim86::HELPER
+    );
+    // A package older than ter takes is upgraded, and the learner is told.
+    std::fs::write(m.root.path().join("sim86-package"), "0.1.4\n").unwrap();
+    let before = m.log();
+    let upgraded = m.ter(dir.path(), &["sim86"]);
+    assert!(upgraded.status.success(), "{}", text(&upgraded.stderr));
+    assert_eq!(
+        m.log()[before.len()..]
+            .lines()
+            .filter(|l| l.contains(" -m "))
+            .collect::<Vec<_>>(),
+        ["python -m pip install --upgrade --quiet sim86>=0.2.0,<0.3"]
+    );
+    let out = text(&upgraded.stdout);
+    assert!(
+        out.contains(&format!(
+            "Upgrading sim86 0.1.4 in {}: ter needs 0.2.0 or newer.",
+            home.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("Installed sim86 0.2.0 in {}.", home.display())),
+        "{out}"
     );
 }
 

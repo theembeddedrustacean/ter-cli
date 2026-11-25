@@ -47,13 +47,35 @@ pub const HELPER_FILE: &str = "ter_sim86.py";
 /// The `helper` number in the script's answers.
 pub const HELPER_VERSION: u64 = 8;
 /// What `pip install` is asked for: [`OLDEST`] up to before [`BELOW`].
-pub const PACKAGE: &str = "sim86>=0.1.4,<0.3";
-/// The oldest package version the helper works with.
-pub const OLDEST: &str = "0.1.4";
+pub const PACKAGE: &str = "sim86>=0.2.0,<0.3";
+/// The oldest package version the helper works with. An older install is
+/// upgraded by `ter install sim86`, and a run on it stops first.
+pub const OLDEST: &str = "0.2.0";
 /// The first package version ter does not take.
 pub const BELOW: &str = "0.3.0";
 /// The package version this ter was tested with.
 pub const TESTED: &str = "0.2.0";
+/// Whether the installed package `version` is older than [`OLDEST`]. A
+/// version that does not read as one is not called old.
+pub fn too_old(version: &str) -> bool {
+    fn numbers(version: &str) -> Option<[u64; 3]> {
+        let mut parts = version.trim().trim_start_matches('v').splitn(3, '.');
+        let mut out = [0; 3];
+        for (i, slot) in out.iter_mut().enumerate() {
+            match parts.next() {
+                Some(part) => {
+                    let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+                    *slot = digits.parse().ok()?;
+                }
+                None if i == 0 => return None,
+                None => {}
+            }
+        }
+        Some(out)
+    }
+    matches!((numbers(version), numbers(OLDEST)), (Some(found), Some(oldest)) if found < oldest)
+}
+
 /// The learner's sim86 key, when it is in the environment.
 pub const KEY_ENV: &str = "SIM86_API_KEY";
 
@@ -409,6 +431,9 @@ pub enum FailureKind {
     Busy,
     /// sim86 wants a newer package.
     Version,
+    /// The installed package is older than [`OLDEST`]; the message is its
+    /// version.
+    Old,
     /// sim86 refused to start the run.
     Refused,
     /// The run ended before the check's time was up.
@@ -479,6 +504,9 @@ impl Failure {
             }
             FailureKind::Version => format!(
                 "sim86 no longer takes the sim86 package installed here ({said}). Update it with `ter install sim86`; if that does not help, update ter"
+            ),
+            FailureKind::Old => format!(
+                "sim86 {said} is installed here, and ter needs {OLDEST} or newer. Upgrade it with `ter install sim86`"
             ),
             FailureKind::Refused => format!("sim86 refused to start the run ({said})"),
             FailureKind::Ended => {
@@ -903,9 +931,14 @@ impl Helper {
         self.call(&["version".into()], Duration::from_secs(30), None)
     }
 
-    /// The account's plan and credits: one call to sim86.
+    /// The account's plan and credits: one call to sim86. A package older
+    /// than [`OLDEST`] is [`FailureKind::Old`], whatever sim86 said.
     pub fn balance(&self) -> Result<Balance, Failure> {
-        self.call(&["balance".into()], Duration::from_secs(60), None)?
+        let answer = self.call(&["balance".into()], Duration::from_secs(60), None)?;
+        if let Some(version) = answer.sim86.as_deref().filter(|v| too_old(v)) {
+            return Err(Failure::new(FailureKind::Old, version));
+        }
+        answer
             .balance
             .ok_or_else(|| Failure::new(FailureKind::Api, "sim86 gave no balance"))
     }
@@ -1426,6 +1459,19 @@ mod tests {
             FailureKind::Helper
         );
         assert_eq!(parse("").unwrap_err().kind, FailureKind::Helper);
+    }
+
+    #[test]
+    fn a_package_older_than_the_oldest_is_old_and_says_how_to_upgrade() {
+        assert!(too_old("0.1.4") && too_old("0.1.9") && too_old("v0.1.4"));
+        assert!(!too_old(OLDEST) && !too_old(TESTED) && !too_old("0.2.7"));
+        assert!(!too_old("0.3.0") && !too_old("") && !too_old("dev"));
+        assert_eq!(PACKAGE, format!("sim86>={OLDEST},<0.3"));
+        let line = Failure::new(FailureKind::Old, "0.1.4").explain();
+        assert_eq!(
+            line,
+            "sim86 0.1.4 is installed here, and ter needs 0.2.0 or newer. Upgrade it with `ter install sim86`"
+        );
     }
 
     #[test]

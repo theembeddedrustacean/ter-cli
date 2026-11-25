@@ -102,7 +102,8 @@ exit 42
 /// `python <helper> version|balance|view <run>|run <request>|live <request>`. It answers with the
 /// JSON beside it (`balance.json`, `run.json`: what the real helper
 /// printed, recorded) and keeps what it was given for the test to look at.
-/// Its package has a key of its own once `has-key` is beside it.
+/// Its package has a key of its own once `has-key` is beside it, and is
+/// the version in `version` when that is there.
 const FAKE_SIM86_PYTHON: &str = r#"#!/bin/sh
 here="$(dirname "$0")"
 [ -f "$1" ] || { echo "no helper at $1" >&2; exit 2; }
@@ -110,7 +111,8 @@ cp "$1" "$here/got-helper.py"
 case "$2" in
   version)
     key=false; [ -f "$here/has-key" ] && key=true
-    echo "{\"helper\": 4, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"0.1.4\", \"key\": $key}" ;;
+    v=0.2.0; [ -f "$here/version" ] && v="$(cat "$here/version")"
+    echo "{\"helper\": 4, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"$v\", \"key\": $key}" ;;
   balance) cat "$here/balance.json" ;;
   run)
     [ -f "$3" ] || { echo "no request at $3" >&2; exit 2; }
@@ -161,7 +163,7 @@ const SIM86_NUCLEO: &str = r#"{"name": "ter-nucleo-f401re",
 "#;
 const SIM86_NUCLEO_PINS: &str =
     r#"{"user_led": "mcu.D13", "user_button": {"part": "mcu", "input": "button"}}"#;
-const SIM86_BALANCE: &str = r#"{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.1.4", "balance": {"credits": 20184, "plan": "free"}}"#;
+const SIM86_BALANCE: &str = r#"{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.2.0", "balance": {"credits": 20184, "plan": "free"}}"#;
 const SIM86_KEY: &str = "sk-sim86-never-shown";
 
 /// gpio-blinky's check, and a line the chip's ROM prints at reset.
@@ -3552,6 +3554,17 @@ async fn health_lists_the_simulators_and_whether_each_is_ready() {
         "{health}"
     );
     assert!(!health.to_string().contains(SIM86_KEY));
+    drop(served);
+
+    // A package older than ter takes is not ready, with the upgrade named.
+    std::fs::write(m.sim86_bin().join("version"), "0.1.4").unwrap();
+    let served = m.serve(&server.uri());
+    let health = health_of(&served).await;
+    assert_eq!(
+        health["simulators"][1],
+        json!({"name": "sim86", "ready": false, "reason": "sim86 0.1.4 is installed here, and ter needs 0.2.0 or newer. Upgrade it with `ter install sim86`."}),
+        "{health}"
+    );
 }
 
 #[tokio::test]
@@ -4186,7 +4199,7 @@ async fn sim86_not_run(answer: &str) -> (Value, Value) {
 
 #[cfg(unix)]
 fn sim86_error(kind: &str, message: &str) -> String {
-    json!({"helper": 1, "ok": false, "sim86": "0.1.4",
+    json!({"helper": 1, "ok": false, "sim86": "0.2.0",
            "error": {"kind": kind, "message": message}})
     .to_string()
 }
@@ -4316,6 +4329,15 @@ async fn sim86_not_installed_no_key_or_no_credits_stops_before_the_build() {
     );
     let msg = sim86_refused(&m, "venue_unavailable").await;
     assert!(msg.contains("no credits left"), "{msg}");
+    // A package older than ter takes: one line saying how to upgrade it.
+    balance(&m, &SIM86_BALANCE.replace("0.2.0", "0.1.4"));
+    let msg = sim86_refused(&m, "venue_unavailable").await;
+    assert!(
+        msg.starts_with(
+            "sim86 0.1.4 is installed here, and ter needs 0.2.0 or newer. Upgrade it with `ter install sim86`."
+        ),
+        "{msg}"
+    );
 }
 
 #[cfg(unix)]

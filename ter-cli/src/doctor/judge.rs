@@ -7,7 +7,7 @@ use serde::Serialize;
 use ter_flash::{PortKind, Tool};
 use ter_gen::install::{Item, NOT_INSTALLED, State, at_least, same_version};
 use ter_sdk::version::{check_supported, newer_available};
-use ter_telemetry::sim86::{KEY_ENV, TESTED};
+use ter_telemetry::sim86::{KEY_ENV, OLDEST, TESTED, too_old};
 
 use crate::hw::{PORT_ENV, graded_only};
 use crate::sim::TOKEN_PAGE;
@@ -641,6 +641,19 @@ fn wokwi(survey: &Survey, needed: bool) -> [Check; 2] {
 fn sim86(facts: &Sim86, needed: bool) -> [Check; 2] {
     let not_needed = "not needed here; `ter install sim86` sets it up";
     let tool = match (&facts.install, needed) {
+        (Sim86Install::Found { version, python }, _) if too_old(version) => {
+            let found = format!("{version}, Python {python}");
+            let check = if needed {
+                Check::fail("tool.sim86", found)
+            } else {
+                Check::warn("tool.sim86", found)
+            };
+            check
+                .why(format!(
+                    "sim86 {version} is too old: ter needs {OLDEST} or newer"
+                ))
+                .fix("ter install sim86")
+        }
         (Sim86Install::Found { version, python }, _) => {
             let check = Check::ok("tool.sim86", format!("{version}, Python {python}"));
             if version == TESTED {
@@ -672,6 +685,9 @@ fn sim86(facts: &Sim86, needed: bool) -> [Check; 2] {
         }
     };
     let account = match (&facts.install, &facts.account) {
+        (Sim86Install::Found { version, .. }, _) if too_old(version) => {
+            Check::skip(ID, "not looked at").why("upgrade sim86 first: ter install sim86")
+        }
         (Sim86Install::Found { .. }, Sim86Account::Balance { plan, credits }) if *credits > 0 => {
             Check::ok(ID, format!("key accepted: plan {plan}, {credits} credits"))
         }
@@ -1240,12 +1256,50 @@ mod tests {
         // A package newer than the tested one says so and is fine.
         facts.sim86 = sim86_found(Sim86Account::NotAsked);
         facts.sim86.install = Sim86Install::Found {
-            version: "0.1.7".into(),
+            version: "0.2.7".into(),
             python: "3.12.3".into(),
         };
         let tool = get(&judge(&facts), "tool.sim86").clone();
         assert_eq!(tool.status, Status::Ok);
         assert!(tool.why.unwrap().contains(TESTED));
+        // One older than ter takes is a warning here, with the upgrade.
+        facts.sim86.install = Sim86Install::Found {
+            version: "0.1.4".into(),
+            python: "3.12.3".into(),
+        };
+        let report = judge(&facts);
+        assert!(report.ok);
+        assert!(report.install.is_empty());
+        let tool = get(&report, "tool.sim86").clone();
+        assert_eq!(tool.status, Status::Warn);
+        assert_eq!(tool.fix.as_deref(), Some("ter install sim86"));
+    }
+
+    #[test]
+    fn a_sim86_older_than_ter_takes_stops_a_sim86_exercise_until_it_is_upgraded() {
+        let mut facts = bare();
+        facts.folder = exercise("simulation", "sim86", c3());
+        facts.tools[0] = present("espflash", "4.6.0");
+        facts.sim86 = sim86_found(Sim86Account::NotAsked);
+        facts.sim86.install = Sim86Install::Found {
+            version: "0.1.4".into(),
+            python: "3.12.3".into(),
+        };
+        let report = judge(&facts);
+        assert_eq!(failed(&report), ["tool.sim86", "exercise.venue"]);
+        assert_eq!(report.install, ["sim86"]);
+        let tool = get(&report, "tool.sim86");
+        assert_eq!(tool.found, "0.1.4, Python 3.12.3");
+        assert_eq!(
+            tool.why.as_deref(),
+            Some("sim86 0.1.4 is too old: ter needs 0.2.0 or newer")
+        );
+        assert_eq!(tool.fix.as_deref(), Some("ter install sim86"));
+        let account = get(&report, "sim86.account");
+        assert_eq!(
+            (account.status, account.found.as_str()),
+            (Status::Skip, "not looked at")
+        );
     }
 
     #[test]

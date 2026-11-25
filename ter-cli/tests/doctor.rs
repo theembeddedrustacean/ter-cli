@@ -538,10 +538,13 @@ fn venues_still_answers_in_the_same_shape() {
 }
 
 /// Plays the Python that holds sim86, running ter's helper: the package
-/// is 0.1.4, and the account is what `$FAKE/sim86-balance` says.
+/// is 0.2.0 unless `$FAKE/sim86-version` names another, and the account
+/// is what `$FAKE/sim86-balance` says.
 const SIM86_PYTHON: &str = r#"#!/bin/sh
 case "$2" in
-  version) echo '{"helper": 1, "ok": true, "python": "3.12.3", "sim86": "0.1.4"}' ;;
+  version)
+    v=0.2.0; [ -f "$FAKE/sim86-version" ] && v="$(cat "$FAKE/sim86-version")"
+    echo "{\"helper\": 1, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"$v\"}" ;;
   balance) echo asked >> "$FAKE/sim86-asked"; cat "$FAKE/sim86-balance" ;;
 esac
 "#;
@@ -587,7 +590,7 @@ fn a_sim86_exercise_is_judged_for_the_package_the_key_and_the_credits() {
     std::fs::set_permissions(bin.join("python"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let balance = |text: &str| std::fs::write(m.root.path().join("sim86-balance"), text).unwrap();
     balance(
-        r#"{"helper": 1, "ok": true, "sim86": "0.1.4", "balance": {"credits": 87, "plan": "free"}}"#,
+        r#"{"helper": 1, "ok": true, "sim86": "0.2.0", "balance": {"credits": 87, "plan": "free"}}"#,
     );
     let key = "sk-sim86-never-shown";
     let doctor = |args: &[&str]| {
@@ -601,7 +604,7 @@ fn a_sim86_exercise_is_judged_for_the_package_the_key_and_the_credits() {
     let out = doctor(&["--offline", "--json"]);
     let r = report(&out);
     assert_eq!(out.status.code(), Some(0), "{r:#}");
-    assert_eq!(check(&r, "tool.sim86")["found"], "0.1.4, Python 3.12.3");
+    assert_eq!(check(&r, "tool.sim86")["found"], "0.2.0, Python 3.12.3");
     assert_eq!(check(&r, "sim86.account")["found"], "not asked");
     assert!(!m.root.path().join("sim86-asked").exists());
     assert_eq!(check(&r, "exercise.venue")["found"], "simulation on sim86");
@@ -622,7 +625,7 @@ fn a_sim86_exercise_is_judged_for_the_package_the_key_and_the_credits() {
     }
     let shown = text(&doctor(&[]).stdout);
     for line in [
-        "  ok    tool.sim86          0.1.4, Python 3.12.3\n",
+        "  ok    tool.sim86          0.2.0, Python 3.12.3\n",
         "\nsim86\n  ok    sim86.account       key accepted: plan free, 87 credits\n",
         "simulation on sim86\n",
     ] {
@@ -647,7 +650,7 @@ fn a_sim86_exercise_is_judged_for_the_package_the_key_and_the_credits() {
         )
     );
     balance(
-        r#"{"helper": 1, "ok": true, "sim86": "0.1.4", "balance": {"credits": 0, "plan": "free"}}"#,
+        r#"{"helper": 1, "ok": true, "sim86": "0.2.0", "balance": {"credits": 0, "plan": "free"}}"#,
     );
     let r = report(&doctor(&["--json"]));
     assert_eq!(check(&r, "sim86.account")["status"], "fail");
@@ -657,4 +660,29 @@ fn a_sim86_exercise_is_judged_for_the_package_the_key_and_the_credits() {
     let r = report(&doctor(&["--json"]));
     assert_eq!(check(&r, "sim86.account")["status"], "warn");
     assert_eq!(check(&r, "sim86.account")["found"], "balance unknown");
+
+    // A package older than ter takes stops the run, sim86 is not asked,
+    // and `ter install sim86` upgrades it.
+    std::fs::write(m.root.path().join("sim86-version"), "0.1.4").unwrap();
+    std::fs::remove_file(m.root.path().join("sim86-asked")).unwrap();
+    let out = doctor(&["--json"]);
+    let r = report(&out);
+    assert_eq!(out.status.code(), Some(1), "{r:#}");
+    assert_eq!(r["install"], json!(["sim86"]));
+    let tool = check(&r, "tool.sim86");
+    assert_eq!(
+        (&tool["status"], &tool["found"], &tool["fix"]),
+        (
+            &json!("fail"),
+            &json!("0.1.4, Python 3.12.3"),
+            &json!("ter install sim86")
+        )
+    );
+    assert_eq!(
+        tool["why"],
+        "sim86 0.1.4 is too old: ter needs 0.2.0 or newer"
+    );
+    assert_eq!(check(&r, "sim86.account")["status"], "skip");
+    assert_eq!(check(&r, "exercise.venue")["status"], "fail");
+    assert!(!m.root.path().join("sim86-asked").exists());
 }

@@ -146,7 +146,9 @@ fn sim86(offline: bool) -> Sim86 {
         },
         Err(e) => Sim86Install::Broken(e.explain()),
     };
-    let account = if offline || !matches!(install, Sim86Install::Found { .. }) {
+    // A package too old for ter is upgraded before its account matters.
+    let usable = matches!(&install, Sim86Install::Found { version, .. } if !ter_telemetry::sim86::too_old(version));
+    let account = if offline || !usable {
         Sim86Account::NotAsked
     } else {
         match helper.balance() {

@@ -189,7 +189,7 @@ pub fn account(answer: Result<Balance, Failure>) -> Result<Option<Balance>, CliE
         Err(failure)
             if matches!(
                 failure.kind,
-                FailureKind::NoKey | FailureKind::Auth | FailureKind::Missing
+                FailureKind::NoKey | FailureKind::Auth | FailureKind::Missing | FailureKind::Old
             ) =>
         {
             Err(unavailable(format!("{}.", failure.explain())))
@@ -218,15 +218,24 @@ fn helper() -> Result<Helper, CliError> {
     Ok(helper)
 }
 
-/// What this machine needs before any sim86 run: the package and a key.
-/// Asks sim86 nothing, so a key that is there may still be refused, and
-/// the account may have no credits; a run finds that out.
+/// What this machine needs before any sim86 run: a package that is not
+/// too old, and a key. Asks sim86 nothing, so a key that is there may
+/// still be refused, and the account may have no credits; a run finds that
+/// out.
 pub fn setup() -> Result<(), CliError> {
     let helper = helper()?;
-    if helper.key.is_some() {
-        return Ok(());
-    }
     match helper.version() {
+        Ok(found) if found.sim86.as_deref().is_some_and(sim86::too_old) => {
+            Err(unavailable(format!(
+                "{}.",
+                Failure {
+                    kind: FailureKind::Old,
+                    message: found.sim86.unwrap_or_default(),
+                }
+                .explain()
+            )))
+        }
+        Ok(_) if helper.key.is_some() => Ok(()),
         Ok(found) if found.key == Some(true) => Ok(()),
         Ok(_) => Err(unavailable(format!(
             "{}.",
@@ -363,7 +372,12 @@ mod tests {
                 message: "said".into(),
             }))
         };
-        for kind in [FailureKind::NoKey, FailureKind::Auth, FailureKind::Missing] {
+        for kind in [
+            FailureKind::NoKey,
+            FailureKind::Auth,
+            FailureKind::Missing,
+            FailureKind::Old,
+        ] {
             assert_eq!(failed(kind).unwrap_err().code, "venue_unavailable");
         }
         assert!(

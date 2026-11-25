@@ -323,15 +323,21 @@ fn sim86(json: bool) -> Result<Sim86Installed, CliError> {
             .and_then(|()| crate::sim86::write_helper(&helper))
             .map_err(|e| fail(format!("Could not write {}: {e}", helper.script.display())))
     };
-    let present = python.is_file()
-        && write_helper().is_ok()
-        && helper
-            .version()
-            .is_ok_and(|v| v.sim86.as_deref().is_some_and(package_fits));
+    let had = (python.is_file() && write_helper().is_ok())
+        .then(|| helper.version().ok().and_then(|v| v.sim86))
+        .flatten();
+    let present = had.as_deref().is_some_and(package_fits);
     if !present {
         let system = find_python()?;
         if !json {
-            println!("Installing sim86 in {}.", home.display());
+            match had.as_deref().filter(|v| sim86lib::too_old(v)) {
+                Some(old) => println!(
+                    "Upgrading sim86 {old} in {}: ter needs {} or newer.",
+                    home.display(),
+                    sim86lib::OLDEST
+                ),
+                None => println!("Installing sim86 in {}.", home.display()),
+            }
         }
         std::fs::create_dir_all(&home)
             .map_err(|e| fail(format!("Could not create {}: {e}", home.display())))?;
@@ -598,10 +604,10 @@ mod tests {
     #[test]
     fn the_package_must_be_in_the_range_pip_is_asked_for() {
         assert!(package_fits(sim86lib::TESTED));
-        assert!(package_fits("0.1.4"));
-        assert!(package_fits("0.1.9"));
+        assert!(package_fits("0.2.0"));
         assert!(package_fits("0.2.7"));
-        assert!(!package_fits("0.1.3"));
+        assert!(!package_fits("0.1.4"));
+        assert!(!package_fits("0.1.9"));
         assert!(!package_fits("0.3.0"));
         assert!(!package_fits(""));
         assert_eq!(
