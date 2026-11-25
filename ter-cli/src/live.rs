@@ -22,7 +22,10 @@
 //! Each part of the board with inputs (what a sensor senses) or events
 //! (a button's press) is sent to the page as `controls`, from sim86's
 //! catalog, with the value each input starts at: the board file's
-//! `config.inputs`, else the catalog's default. The page sets an input or
+//! `config.inputs`, else the catalog's default. A part whose event carries
+//! one number in a range (an HC-SR04's `{"distance_cm": 50}`) has it as an
+//! input too, `nullable` when the part can be sent null (no target). The
+//! page sets an input or
 //! sends an event while the board runs or is paused; ter checks it against
 //! the controls first, and says on the stream what was done, with the
 //! board's time just before it was sent: what it brings about comes at or
@@ -1036,6 +1039,7 @@ fn refused(parts: &[Value], control: &LiveControl) -> Option<String> {
                 .map(Vec::len)
                 .or_else(|| spec["axes"].as_u64().and_then(|n| usize::try_from(n).ok()));
             let values: Vec<f64> = match (value, axes) {
+                (Value::Null, _) if spec["nullable"] == true => return None,
                 (Value::Array(list), Some(n)) if list.len() == n => {
                     list.iter().filter_map(Value::as_f64).collect()
                 }
@@ -1384,6 +1388,9 @@ mod tests {
                 {"kind": "input", "name": "acceleration", "axes": ["x", "y", "z"], "value": [0, 0, 9.8]}]}),
             json!({"id": "btn1", "label": "Button", "type": "Btn", "controls": [
                 {"kind": "action", "name": "events", "actions": ["pressed", "released"]}]}),
+            json!({"id": "us1", "label": "Ultrasonic ranger HC-SR04", "type": "HCSR04", "controls": [
+                {"kind": "input", "name": "distance_cm", "label": "Distance", "unit": "cm",
+                 "min": 2, "max": 400, "step": 1, "nullable": true, "value": 100}]}),
         ];
         let input = |part: &str, name: &str, value: Value| LiveControl::Input {
             part: part.into(),
@@ -1398,6 +1405,9 @@ mod tests {
             input("ldr1", "lux", json!(500)),
             input("ldr1", "lux", json!(0.1)),
             input("imu", "acceleration", json!([0, 9.8, 0])),
+            input("us1", "distance_cm", json!(2)),
+            input("us1", "distance_cm", json!(400)),
+            input("us1", "distance_cm", Value::Null),
             action("btn1", "released"),
             LiveControl::Pause,
         ] {
@@ -1406,11 +1416,11 @@ mod tests {
         for (bad, said) in [
             (
                 input("pot1", "position", json!(1)),
-                "No part \"pot1\" of this board takes an input; these do: ldr1, imu.",
+                "No part \"pot1\" of this board takes an input; these do: ldr1, imu, us1.",
             ),
             (
                 input("btn1", "lux", json!(1)),
-                "No part \"btn1\" of this board takes an input; these do: ldr1, imu.",
+                "No part \"btn1\" of this board takes an input; these do: ldr1, imu, us1.",
             ),
             (
                 input("ldr1", "light", json!(1)),
@@ -1421,6 +1431,19 @@ mod tests {
                 "lux is from 0.1 to 10000 lux.",
             ),
             (input("ldr1", "lux", json!([1])), "lux is one number."),
+            (input("ldr1", "lux", Value::Null), "lux is one number."),
+            (
+                input("us1", "distance_cm", json!(1)),
+                "distance_cm is from 2 to 400 cm.",
+            ),
+            (
+                input("us1", "distance_cm", json!([50])),
+                "distance_cm is one number.",
+            ),
+            (
+                input("imu", "acceleration", Value::Null),
+                "acceleration is a list of 3 numbers.",
+            ),
             (
                 input("imu", "acceleration", json!(1)),
                 "acceleration is a list of 3 numbers.",

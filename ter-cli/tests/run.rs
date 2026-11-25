@@ -4641,8 +4641,23 @@ const SIM86_CONTROLS_CATALOG: &str = r#"{
  "XiaoESP32C3": {"name": "Seeed XIAO ESP32-C3", "inputs": [{"default": 0.0, "label": "BOOT button (GPIO9)", "max": 1.0, "min": 0.0, "name": "boot", "step": 1.0, "unit": "", "widget": "button"}]},
  "Btn": {"name": "Button", "description": "4-leg push button. Events: 'pressed', 'released'."},
  "Ldr": {"name": "Photoresistor (LDR)", "description": "R = 15 k (lux/10)^-0.7.", "inputs": [{"default": 100.0, "label": "Light", "max": 10000.0, "min": 0.1, "name": "lux", "step": 0.1, "unit": "lux"}]},
- "Potentiometer": {"name": "Potentiometer", "inputs": [{"default": 0.5, "label": "Position", "max": 1.0, "min": 0.0, "name": "position", "step": 0.01, "unit": ""}]}
+ "Potentiometer": {"name": "Potentiometer", "inputs": [{"default": 0.5, "label": "Position", "max": 1.0, "min": 0.0, "name": "position", "step": 0.01, "unit": ""}]},
+ "HCSR04": {"name": "Ultrasonic ranger HC-SR04", "description": "Power VCC from 5 V, ground GND, drive TRIG from an MCU output and bring ECHO to an MCU input through a divider (ECHO is 5 V). Event: {\"distance_cm\": 2..400} sets the target, {\"distance_cm\": null} removes it (no echo)."},
+ "Fan": {"name": "Fan", "description": "Event: {\"speed_rpm\": 0..5000} sets its speed."},
+ "Keypad4x4": {"name": "Keypad 4x4", "description": "Event: {\"pressed\":\"<keys>\"} gives the complete set of held keys, e.g. \"1A\" or \"\" to release all."}
 }"#;
+
+/// A board with an HC-SR04 that starts with a target at 50 cm, two parts
+/// whose event takes one number (one with a start, one without) and a
+/// keypad, whose event is not a number.
+const SIM86_RANGER_BOARD: &str = r#"{"name": "ter-ranger",
+ "parts": [{"id": "mcu", "type": "XiaoESP32C3", "firmware": "fw.bin"},
+           {"id": "us1", "type": "HCSR04", "config": {"inputs": {"distance_cm": 50}}},
+           {"id": "fan1", "type": "Fan"},
+           {"id": "fan2", "type": "Fan", "label": "Cooler", "config": {"inputs": {"speed_rpm": 1200}}},
+           {"id": "kp1", "type": "Keypad4x4"}],
+ "wires": [["mcu.D1", "us1.TRIG"], ["us1.ECHO", "mcu.D2"]]}
+"#;
 
 fn controls_machine(board: &str) -> Machine {
     let m = live_machine(GOOD, "").with_sim86_package();
@@ -4835,6 +4850,194 @@ async fn a_recorded_sim86_run_starts_its_parts_inputs_and_refuses_a_wrong_one() 
         "{v}"
     );
     assert!(!m.sim86_bin().join("runs").exists());
+}
+
+/// An HC-SR04's distance, which sim86 takes as an event of JSON, is an
+/// input the page can set, to a number of centimeters or to null (no
+/// target): its start is sent at 0 as that event, each change too, and the
+/// stream says what was set. Any part whose event is one number in a range
+/// is offered the same way, once what it senses at the start is known.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_page_sets_an_hcsr04s_distance_through_its_event() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = controls_machine(SIM86_RANGER_BOARD);
+    let served = m.serve(&server.uri());
+
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let mut events = LiveStream::open(&served, &id).await;
+    let (name, controls) = events.next().await.unwrap();
+    assert_eq!(name, "controls");
+    let ranger = |cm: Value| {
+        json!({"id": "us1", "label": "Ultrasonic ranger HC-SR04", "type": "HCSR04", "controls": [
+            {"kind": "input", "name": "distance_cm", "label": "Distance", "unit": "cm",
+             "min": 2, "max": 400, "step": 1, "nullable": true, "value": cm}]})
+    };
+    assert_eq!(
+        controls,
+        json!({"parts": [
+            {"id": "mcu", "label": "Seeed XIAO ESP32-C3", "type": "XiaoESP32C3", "controls": [
+                {"kind": "input", "name": "boot", "label": "BOOT button (GPIO9)", "unit": "",
+                 "min": 0.0, "max": 1.0, "step": 1.0, "widget": "button", "value": 0.0}]},
+            ranger(json!(50)),
+            {"id": "fan2", "label": "Cooler", "type": "Fan", "controls": [
+                {"kind": "input", "name": "speed_rpm", "label": "Speed", "unit": "rpm",
+                 "min": 0, "max": 5000, "step": 1, "value": 1200}]},
+        ]})
+    );
+    // The starts go as the parts' events at 0, and not in their config.
+    assert_eq!(
+        sim86_events(&m),
+        [
+            json!({"run": "fake-run-1", "part": "us1", "action": r#"{"distance_cm": 50}"#, "t_ns": 0}),
+            json!({"run": "fake-run-1", "part": "fan2", "action": r#"{"speed_rpm": 1200}"#, "t_ns": 0}),
+        ]
+    );
+    let configs: Value =
+        serde_json::from_str(m.sim86_saw("configs").lines().next().unwrap()).unwrap();
+    assert_eq!(configs["us1"], json!({}));
+    events.until("pin").await;
+
+    for (value, sent) in [
+        (json!(120), r#"{"distance_cm": 120}"#),
+        (Value::Null, r#"{"distance_cm": null}"#),
+    ] {
+        let (status, set) = served
+            .live_post(
+                &id,
+                "input",
+                json!({"part": "us1", "name": "distance_cm", "value": value}),
+            )
+            .await;
+        assert_eq!(status, 200, "{set}");
+        let t_ms = set["t_ms"].as_f64().unwrap();
+        assert_eq!(
+            set,
+            json!({"ok": true, "part": "us1", "name": "distance_cm", "value": value, "t_ms": t_ms})
+        );
+        let (event, _) = events.until("input").await;
+        assert_eq!(
+            event,
+            json!({"part": "us1", "name": "distance_cm", "value": value, "t_ms": t_ms})
+        );
+        let last = sim86_events(&m).pop().unwrap();
+        assert_eq!(
+            (&last["part"], &last["action"]),
+            (&json!("us1"), &json!(sent))
+        );
+    }
+
+    for (body, said) in [
+        (
+            json!({"part": "us1", "name": "distance_cm", "value": 1}),
+            "distance_cm is from 2 to 400 cm.",
+        ),
+        (
+            json!({"part": "us1", "name": "distance_cm", "value": [50]}),
+            "distance_cm is one number.",
+        ),
+        (
+            json!({"part": "fan2", "name": "speed_rpm", "value": null}),
+            "speed_rpm is one number.",
+        ),
+        (
+            json!({"part": "fan1", "name": "speed_rpm", "value": 100}),
+            "No part \"fan1\" of this board takes an input; these do: mcu, us1, fan2.",
+        ),
+    ] {
+        let (status, v) = served.live_post(&id, "input", body).await;
+        assert_eq!(
+            (
+                status,
+                v["error"]["code"].as_str(),
+                v["error"]["message"].as_str()
+            ),
+            (400, Some("bad_request"), Some(said)),
+            "{v}"
+        );
+    }
+    assert_eq!(sim86_events(&m).len(), 4);
+
+    // A page that starts to listen now sees no target.
+    let mut late = LiveStream::open(&served, &id).await;
+    let (name, now) = late.next().await.unwrap();
+    assert_eq!(
+        (name.as_str(), &now["parts"][1]),
+        ("controls", &ranger(Value::Null))
+    );
+    drop(late);
+
+    served.live_post(&id, "stop", json!({})).await;
+    events.until("ended").await;
+    assert!(sim86_says(&m, "stopped", "fake-run-1", 10).await);
+}
+
+/// Without a start in the board file an HC-SR04 is sent nothing, and its
+/// control says what sim86 has it sense then; a start may be null, and
+/// one out of range does not run.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_recorded_sim86_run_starts_an_hcsr04_from_the_board_file() {
+    let server = site("0.1.0", run_answer()).await;
+    let board = |inputs: &str| {
+        SIM86_RANGER_BOARD.replace(
+            r#""config": {"inputs": {"distance_cm": 50}}"#,
+            &format!(r#""config": {{"inputs": {inputs}}}"#),
+        )
+    };
+    for (inputs, sent) in [
+        ("{}", None),
+        (r#"{"distance_cm": null}"#, Some(r#"{"distance_cm": null}"#)),
+        (r#"{"distance_cm": 400}"#, Some(r#"{"distance_cm": 400}"#)),
+    ] {
+        let m = controls_machine(&board(inputs));
+        let (ok, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+        assert!(ok, "{inputs}: {v}");
+        let sent_to_us1: Vec<Value> = sim86_events(&m)
+            .into_iter()
+            .filter(|e| e["part"] == "us1")
+            .map(|e| e["action"].clone())
+            .collect();
+        assert_eq!(
+            sent_to_us1,
+            sent.map(|s| vec![json!(s)]).unwrap_or_default(),
+            "{inputs}"
+        );
+    }
+
+    for (inputs, said) in [
+        (
+            r#"{"distance_cm": 1}"#,
+            "us1 config.inputs: distance_cm is from 2 to 400",
+        ),
+        (
+            r#"{"distance_cm": "far"}"#,
+            "us1 config.inputs: distance_cm is a number",
+        ),
+        (
+            r#"{"distance_cm": [50]}"#,
+            "us1 config.inputs: distance_cm is one number",
+        ),
+    ] {
+        let m = controls_machine(&board(inputs));
+        let (_, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+        assert!(v.to_string().contains(said), "{inputs}: {v}");
+        assert!(!m.sim86_bin().join("runs").exists());
+    }
+
+    // Live, the control starts at sim86's own 100 cm.
+    let m = controls_machine(&board("{}"));
+    let served = m.serve(&server.uri());
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let mut events = LiveStream::open(&served, &id).await;
+    let (_, controls) = events.next().await.unwrap();
+    assert_eq!(controls["parts"][1]["controls"][0]["value"], json!(100));
+    served.live_post(&id, "stop", json!({})).await;
+    events.until("ended").await;
 }
 
 /// ter's own helper streams the board's other wired pins by the chip's

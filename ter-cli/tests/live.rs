@@ -2916,6 +2916,228 @@ fn live_sim86_input_changes_what_the_light_sensor_reads() {
     );
 }
 
+/// An HC-SR04's distance set while the board runs changes what the program
+/// reads: ter's helper in `live` mode runs the Nucleo four-pin HC-SR04
+/// solution (trigger on D7, echo on D8), the ranger starting with a target
+/// at 50 cm by the board file's `config.inputs`, moves the target to
+/// 150 cm, then takes it away (null), which sim86 accepts. Needs the
+/// solution built into the pilot's `elf/`; a few seconds of sim86 time.
+#[test]
+#[ignore = "live sim86"]
+fn live_sim86_distance_changes_what_the_ranger_reads() {
+    use std::io::{BufRead, Write};
+    use ter_telemetry::Venue;
+    use ter_telemetry::sim86::{self, Helper, Image, LiveLine, Sim86};
+
+    let Some(pilot) = sim86_ready() else {
+        return;
+    };
+    let elf =
+        pilot.join("elf/solution--stm32-timer-asg-hcsr04-two-pin--nucleo-f401re-nostd--debug.elf");
+    if !elf.exists() {
+        eprintln!("skipped: build {} first", elf.display());
+        return;
+    }
+    let tools = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["install", "sim86", "--json"])
+        .env("TER_TOOLS_DIR", tools.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let home = tools.path().join("sim86");
+    let helper = Helper {
+        python: home.join("venv/bin/python"),
+        script: home.join(sim86::HELPER_FILE),
+        key: None,
+    };
+
+    let board = serde_json::json!({
+        "name": "ter-nucleo-f401re-ranger",
+        "parts": [
+            {"id": "mcu", "type": "NucleoF401RE", "firmware": "firmware.elf"},
+            {"id": "us1", "type": "HCSR04", "config": {"inputs": {"distance_cm": 50}}}
+        ],
+        "wires": [
+            ["mcu.5V", "us1.VCC"], ["us1.GND", "mcu.GND"],
+            ["mcu.D7", "us1.TRIG"], ["us1.ECHO", "mcu.D8"]
+        ]
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let board_file = dir.path().join("board.json");
+    std::fs::write(&board_file, board.to_string()).unwrap();
+    let plan = sim86::plan(
+        &board.to_string(),
+        r#"{"trigger": "mcu.D7"}"#,
+        &["trigger".to_string()],
+        &[],
+    )
+    .unwrap();
+    let mut venue = Sim86 {
+        helper: helper.clone(),
+        board: board_file,
+        run_dir: dir.path().join("run"),
+        plan,
+        image: Image::Elf,
+        timeout_ms: 60_000,
+        capture: ter_telemetry::Capture::default(),
+        program: None,
+    };
+    std::fs::create_dir_all(&venue.run_dir).unwrap();
+    venue.prepare(&elf).unwrap();
+    let program = venue.program.clone().unwrap_or(elf);
+    // sim86 stops it after 90 s of its own clock whatever happens here.
+    let request = venue.run_dir.join("request.json");
+    std::fs::write(
+        &request,
+        venue.live_request(&[], &program, 90_000, &[]).to_string(),
+    )
+    .unwrap();
+    let mut child = helper
+        .command(&["live".into(), request.into()], Some(&venue.run_dir))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut runs = OwnRuns {
+        python: helper.python.clone(),
+        ids: Vec::new(),
+    };
+    let mut ask = child.stdin.take().unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut next = || -> LiveLine {
+        loop {
+            let line = lines.next().expect("the helper goes on").unwrap();
+            if let Some(line) = sim86::live_line(&line) {
+                return line;
+            }
+        }
+    };
+    // `Distance 50 cm`: the centimeters.
+    let reading = |line: &str| -> Option<u32> {
+        line.strip_prefix("Distance ")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    };
+
+    let LiveLine::Started { run, controls, .. } = next() else {
+        panic!("the run starts first")
+    };
+    runs.ids.push(run.clone());
+    let ranger = controls
+        .iter()
+        .find(|p| p["id"] == "us1")
+        .expect("the HC-SR04 is a part the page can change");
+    assert_eq!(
+        ranger["controls"],
+        serde_json::json!([{"kind": "input", "name": "distance_cm", "label": "Distance",
+            "unit": "cm", "min": 2, "max": 400, "step": 1, "nullable": true, "value": 50}]),
+        "{ranger}"
+    );
+
+    let mut readings = |count: usize| -> Vec<(f64, u32)> {
+        let mut seen = Vec::new();
+        while seen.len() < count {
+            match next() {
+                LiveLine::Serial { t_ms, line, .. } => {
+                    if let Some(r) = reading(&line) {
+                        seen.push((t_ms, r));
+                    }
+                }
+                LiveLine::Ended { reason } => panic!("ended: {reason}"),
+                LiveLine::Done(done) => panic!("done: {done:?}"),
+                _ => {}
+            }
+        }
+        seen
+    };
+    let near = readings(2);
+    assert!(
+        near.iter().all(|&(_, cm)| (48..=53).contains(&cm)),
+        "a target at 50 cm from the start: {near:?}"
+    );
+
+    let set = |id: u64, value: Value, ask: &mut std::process::ChildStdin| {
+        writeln!(
+            ask,
+            "{}",
+            serde_json::json!({"id": id, "do": "input", "part": "us1", "name": "distance_cm", "value": value})
+        )
+        .unwrap();
+        ask.flush().unwrap();
+    };
+    set(1, serde_json::json!(150), &mut ask);
+    let mut set_at = None;
+    let mut after: Vec<(f64, u32)> = Vec::new();
+    // Until the reading moves, or for 3 s of the board's time.
+    while !after
+        .last()
+        .is_some_and(|&(t, cm)| cm >= 140 || t > set_at.unwrap_or(0.0) + 3000.0)
+    {
+        match next() {
+            LiveLine::Reply { id: 1, answer } => {
+                let answer = answer.unwrap_or_else(|e| panic!("refused: {e}"));
+                assert_eq!(answer["ev"], "input", "{answer}");
+                set_at = Some(answer["t_ns"].as_u64().unwrap() as f64 / 1e6);
+            }
+            LiveLine::Serial { t_ms, line, .. } => {
+                if let (Some(at), Some(cm)) = (set_at, reading(&line))
+                    && t_ms > at
+                {
+                    after.push((t_ms, cm));
+                }
+            }
+            LiveLine::Ended { reason } => panic!("ended: {reason}"),
+            _ => {}
+        }
+    }
+
+    // No target: sim86 takes it (the program then waits for an echo).
+    set(2, Value::Null, &mut ask);
+    let gone = loop {
+        match next() {
+            LiveLine::Reply { id: 2, answer } => break answer,
+            LiveLine::Ended { reason } => panic!("ended: {reason}"),
+            _ => {}
+        }
+    };
+    writeln!(ask, "stop").unwrap();
+    ask.flush().unwrap();
+    let mut ended = String::new();
+    loop {
+        match next() {
+            LiveLine::Ended { reason } => ended = reason,
+            LiveLine::Done(_) => break,
+            _ => {}
+        }
+    }
+    drop(ask);
+    let _ = child.wait();
+
+    let statuses = runs.none_left();
+    eprintln!(
+        "ranger: near {near:?}, set at {set_at:?}, then {:?} after {} lines; null {gone:?}; ended {ended}; {statuses:?}",
+        after.last(),
+        after.len()
+    );
+    assert_eq!(ended, "stopped");
+    assert!(
+        statuses.iter().all(|(_, s)| !s.starts_with("live")),
+        "{statuses:?}"
+    );
+    let far = after.last().unwrap().1;
+    assert!(
+        (148..=156).contains(&far),
+        "the target moved to 150 cm: {near:?} then {after:?}"
+    );
+    assert_eq!(
+        gone.map(|a| a["ev"].clone()),
+        Ok(serde_json::json!("input"))
+    );
+}
+
 /// Toggle on Press, which the test account can fetch once Heartbeat passed.
 const LIVE_BUTTON: &str = "gpio-button-blink--xiao-esp32c3-nostd";
 

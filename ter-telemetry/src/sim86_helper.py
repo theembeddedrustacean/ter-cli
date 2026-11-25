@@ -40,6 +40,11 @@ A part's "config" in the board file may carry "inputs", {name: value}:
 what the part senses from time 0, set while the board is paused there.
 It is ter's, checked against sim86's catalog and not sent to sim86.
 
+A part whose catalog says its event is a JSON object of one number in a
+range ('Event: {"distance_cm": 2..400} ...') takes that number as an
+input of the same name, set by sending the part that object; null is
+allowed when the catalog says {"distance_cm": null} does something.
+
 Written by `ter install sim86` next to the Python environment that holds
 the sim86 package, and rewritten by ter when it changes. Do not edit it.
 """
@@ -51,7 +56,7 @@ import threading
 import time
 import warnings
 
-HELPER = 7
+HELPER = 8
 
 # A trace comes back exact, every edge with its time, only while it has
 # few enough edges; past that it is a summary. A slice is cut to hold
@@ -79,6 +84,15 @@ TAIL_NS = 300_000_000
 
 # How long what sim86's catalog says of a part is kept beside the helper.
 CATALOG_S = 24 * 3600
+
+# What a part senses before it is sent the event that sets an input, where
+# the catalog does not say: measured on sim86 0.2 (an HC-SR04 with no
+# event sees a target at 100 cm). An input set by an event whose start is
+# known neither here nor from the board file is not offered to the page.
+EVENT_DEFAULTS = {"HCSR04": {"distance_cm": 100}}
+
+# The ends of an event input's name that are its unit ("distance_cm").
+UNITS = {"cm", "mm", "m", "in", "us", "ms", "s", "hz", "khz", "mv", "v", "ma", "lux", "deg", "pct", "rpm"}
 
 LOW, HIGH = 1, 2
 
@@ -261,8 +275,9 @@ class Reader:
 
 
 def opened(request):
-    """The request's board with the program in it, the client, and the
-    inputs the board's parts start with."""
+    """The request's board with the program in it, the client, the
+    inputs the board's parts start with, and which of those inputs are
+    set by an event."""
     from sim86 import Client, check_board, load_board
 
     try:
@@ -275,7 +290,7 @@ def opened(request):
     if problems:
         text = "; ".join(str(p) for p in problems)
         raise Failed("image" if "not a format" in text or "firmware" in text.lower() else "board", text)
-    return board, client, starts
+    return board, client, starts, by_event(board, client)
 
 
 def catalog(client, kind):
@@ -320,12 +335,75 @@ def actions_of(text):
     return list(dict.fromkeys(re.findall(r"'([A-Za-z_][A-Za-z0-9_]*)'", found.group(1))))
 
 
+def event_inputs(kind, text):
+    """The input a part takes as an event of one number, from its catalog
+    description ('Event: {"distance_cm": 2..400} sets the target,
+    {"distance_cm": null} removes it'): the catalog says it nowhere else.
+    Shaped as the catalog's inputs are, with "event": True."""
+    number = r"(-?\d+(?:\.\d+)?)"
+    found = re.search(
+        r'\bEvents?:\s*\{\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*' + number + r"\s*\.\.\s*" + number + r"\s*\}",
+        text or "",
+    )
+    if not found:
+        return []
+    name, lo, hi = found.groups()
+    whole = "." not in lo and "." not in hi
+    lo, hi = (int(lo), int(hi)) if whole else (float(lo), float(hi))
+    head, _, end = name.rpartition("_")
+    unit = end if head and end.lower() in UNITS else ""
+    words = (head if unit else name).replace("_", " ").strip()
+    spec = {"name": name, "label": words[:1].upper() + words[1:], "unit": unit, "min": lo, "max": hi, "event": True}
+    if whole:
+        spec["step"] = 1
+    if re.search(r'\{\s*"' + re.escape(name) + r'"\s*:\s*null\s*\}', text):
+        spec["nullable"] = True
+    default = EVENT_DEFAULTS.get(kind, {}).get(name)
+    if default is not None:
+        spec["default"] = default
+    return [spec]
+
+
+def inputs_of(kind, entry):
+    """A part's inputs, by name: the catalog's, and the one its event sets."""
+    specs = {str(s["name"]): s for s in entry.get("inputs") or [] if isinstance(s, dict) and s.get("name")}
+    for spec in event_inputs(kind, entry.get("description")):
+        specs.setdefault(spec["name"], spec)
+    return specs
+
+
+def by_event(board, client):
+    """The inputs of the board's parts that are set by an event, {(part, name)}."""
+    found = set()
+    for part in board.parts:
+        try:
+            entry = catalog(client, part.type)
+        except Exception:  # noqa: BLE001 - set as sim86 takes inputs then
+            continue
+        for name, spec in inputs_of(part.type, entry).items():
+            if spec.get("event"):
+                found.add((part.id, name))
+    return found
+
+
+def set_input(run, events, part, name, value):
+    """Set a part's input: by its event when the part takes it so."""
+    if (part, name) in events:
+        run.event(part, json.dumps({name: value}))
+    else:
+        run[part].set_input(name, value)
+
+
 def wrong_input(specs, name, value):
     """What is wrong with setting input `name` to `value`, by the catalog's
     inputs of the part (`specs`, by name); None when nothing is."""
     spec = specs.get(name)
     if spec is None:
         return f"there is no input {name!r}; it has {', '.join(sorted(specs)) or 'none'}"
+    if value is None and spec.get("nullable"):
+        return None
+    if spec.get("event") and isinstance(value, list):
+        return f"{name} is one number"
     values = value if isinstance(value, list) else [value]
     if not values or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
         return f"{name} is a number"
@@ -351,7 +429,7 @@ def starting(board, client):
             entry = catalog(client, part.type)
         except Exception:  # noqa: BLE001 - unchecked then, as sim86 takes it
             entry = None
-        specs = {str(s.get("name")): s for s in (entry or {}).get("inputs") or [] if isinstance(s, dict)}
+        specs = inputs_of(part.type, entry or {})
         for name, value in inputs.items():
             problem = wrong_input(specs, str(name), value) if entry is not None else None
             if problem:
@@ -360,11 +438,11 @@ def starting(board, client):
     return starts
 
 
-def start_inputs(run, starts):
+def start_inputs(run, starts, events):
     """Set the inputs the parts start with, on a board paused at 0."""
     for part, inputs in starts.items():
         for name, value in inputs.items():
-            run[part].set_input(name, value)
+            set_input(run, events, part, name, value)
 
 
 def part_controls(board, client, starts):
@@ -378,15 +456,16 @@ def part_controls(board, client, starts):
         except Exception:  # noqa: BLE001 - controls are a nicety
             continue
         controls = []
-        for spec in entry.get("inputs") or []:
-            if not isinstance(spec, dict) or not spec.get("name"):
+        for name, spec in inputs_of(part.type, entry).items():
+            start = starts.get(part.id) or {}
+            if spec.get("event") and name not in start and "default" not in spec:
+                # What it senses until set is not known: never shown wrong.
                 continue
-            name = str(spec["name"])
             control = {"kind": "input", "name": name}
-            for key in ("label", "unit", "min", "max", "step", "widget", "axes", "advanced"):
+            for key in ("label", "unit", "min", "max", "step", "widget", "axes", "advanced", "nullable"):
                 if spec.get(key) is not None:
                     control[key] = spec[key]
-            control["value"] = (starts.get(part.id) or {}).get(name, spec.get("default"))
+            control["value"] = start.get(name, spec.get("default"))
             controls.append(control)
         actions = actions_of(entry.get("description"))
         if actions:
@@ -411,7 +490,7 @@ def record(request):
     timeout_ms = int(request["timeout_ms"])
     end_ns = timeout_ms * 1_000_000
     watch = list(request.get("watch") or [])
-    board, client, starts = opened(request)
+    board, client, starts, events = opened(request)
 
     started = time.monotonic()
     with warnings.catch_warnings():
@@ -429,7 +508,7 @@ def record(request):
         if not halt.paused or halt.time_ns != 0:
             # Nothing before this moment was recorded: not a run to judge.
             return answer
-        start_inputs(run, starts)
+        start_inputs(run, starts, events)
         if watch:
             observe(run, watch)
         readers = {pin: Reader(run, pin, end_ns) for pin in watch}
@@ -479,6 +558,8 @@ class Told(threading.Thread):
         self.sim_run = None
         # The id of a reset ter asked for, until the main loop does it.
         self.reset = None
+        # The parts' inputs set by an event, {(part, name)}.
+        self.events = set()
 
     def attach(self, sim_run):
         """The run to stop, once it exists: at once if ter said so already."""
@@ -535,14 +616,14 @@ class Told(threading.Thread):
         try:
             if sim_run is None:
                 raise Failed("not_started", "the run has not started")
-            answer = do(sim_run, asked)
+            answer = do(sim_run, asked, self.events)
         except Exception as e:  # noqa: BLE001 - a refusal is an answer, never the end
             answer = {"ev": "refused", "message": str(e) or type(e).__name__}
         answer["id"] = asked.get("id")
         say(answer)
 
 
-def do(run, asked):
+def do(run, asked, events):
     """One thing ter asks of a running board, done."""
     what = asked.get("do")
     if what == "pause":
@@ -554,7 +635,7 @@ def do(run, asked):
     # never before that time.
     if what == "input":
         t_ns = run.status().time_ns
-        run[str(asked["part"])].set_input(str(asked["name"]), asked["value"])
+        set_input(run, events, str(asked["part"]), str(asked["name"]), asked["value"])
         return {"ev": "input", "t_ns": t_ns}
     if what == "action":
         t_ns = run.status().time_ns
@@ -647,7 +728,8 @@ def live(request):
     # ter can say stop while the run is still being made.
     told = Told()
     told.start()
-    board, client, starts = opened(request)
+    board, client, starts, events = opened(request)
+    told.events = events
     # A board file may carry limits of its own, meant for sim86's command.
     # ter holds a live run's limit: no simulated-time limit at all.
     board.limits = {}
@@ -673,7 +755,7 @@ def live(request):
             halt = new.status()
             if not halt.paused or halt.time_ns != 0:
                 raise Failed("not_paused", f"the recording starts {halt.time_ns / 1e6:.3f} ms in")
-            start_inputs(new, starts)
+            start_inputs(new, starts, events)
             if watch:
                 observe(new, watch)
             if shown:

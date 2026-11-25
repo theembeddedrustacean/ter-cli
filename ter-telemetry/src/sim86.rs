@@ -45,7 +45,7 @@ pub const PINS_FILE: &str = "sim86/pins.json";
 pub const HELPER: &str = include_str!("sim86_helper.py");
 pub const HELPER_FILE: &str = "ter_sim86.py";
 /// The `helper` number in the script's answers.
-pub const HELPER_VERSION: u64 = 7;
+pub const HELPER_VERSION: u64 = 8;
 /// What `pip install` is asked for: [`OLDEST`] up to before [`BELOW`].
 pub const PACKAGE: &str = "sim86>=0.1.4,<0.3";
 /// The oldest package version the helper works with.

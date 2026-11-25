@@ -126,8 +126,9 @@ pub enum LiveControl {
     Resume,
     /// Start the board again from its time 0, with the same program.
     Reset,
-    /// Set what a part senses: its input `name` to `value`, a number or a
-    /// list of them (one per axis).
+    /// Set what a part senses: its input `name` to `value`, a number, a
+    /// list of them (one per axis), or null (nothing to sense, for an
+    /// input that is nullable).
     Input {
         part: String,
         name: String,
@@ -572,8 +573,10 @@ fn body_text(body: &Value, key: &str) -> Option<String> {
 async fn live_input(State(ctx): State<Ctx>, Path(id): Path<String>, body: Bytes) -> Response {
     let body = serde_json::from_slice::<Value>(&body).unwrap_or_default();
     let number = |v: &Value| v.is_number();
+    // null: an input the part can be without (an HC-SR04 with no target).
     let value = body.get("value").filter(|v| {
         number(v)
+            || v.is_null()
             || v.as_array()
                 .is_some_and(|a| !a.is_empty() && a.iter().all(number))
     });
@@ -581,7 +584,7 @@ async fn live_input(State(ctx): State<Ctx>, Path(id): Path<String>, body: Bytes)
         (body_text(&body, "part"), body_text(&body, "name"), value)
     else {
         return ServeError::bad_request(
-            "Send {\"part\": \"ldr1\", \"name\": \"lux\", \"value\": 500}: the part's id, its input's name, and a number (or a list of numbers, one per axis).",
+            "Send {\"part\": \"ldr1\", \"name\": \"lux\", \"value\": 500}: the part's id, its input's name, and a number (or a list of numbers, one per axis, or null for an input that is nullable).",
         )
         .into_response();
     };
@@ -1376,6 +1379,11 @@ mod tests {
             (
                 r#"{"part": "ldr1", "name": "xyz", "value": [0, 0.5, 9.8]}"#,
                 json!([0, 0.5, 9.8]),
+            ),
+            // Whether the input may be null is the service's to say.
+            (
+                r#"{"part": "ldr1", "name": "lux", "value": null}"#,
+                Value::Null,
             ),
         ] {
             let (status, _, v) = send(&app, req("POST", "/live/l1/input", Some(SITE), body)).await;
