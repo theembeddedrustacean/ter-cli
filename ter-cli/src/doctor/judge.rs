@@ -1159,7 +1159,10 @@ mod tests {
         facts.sim86 = sim86_found(balance(20184));
         let report = judge(&facts);
         assert!(report.ok, "{:?}", failed(&report));
-        assert_eq!(get(&report, "tool.sim86").found, "0.1.4, Python 3.12.3");
+        assert_eq!(
+            get(&report, "tool.sim86").found,
+            format!("{TESTED}, Python 3.12.3")
+        );
         assert_eq!(
             get(&report, "sim86.account").found,
             "key accepted: plan free, 20184 credits"

@@ -45,11 +45,15 @@ pub const PINS_FILE: &str = "sim86/pins.json";
 pub const HELPER: &str = include_str!("sim86_helper.py");
 pub const HELPER_FILE: &str = "ter_sim86.py";
 /// The `helper` number in the script's answers.
-pub const HELPER_VERSION: u64 = 4;
-/// What `pip install` is asked for.
-pub const PACKAGE: &str = "sim86>=0.1.4,<0.2";
+pub const HELPER_VERSION: u64 = 5;
+/// What `pip install` is asked for: [`OLDEST`] up to before [`BELOW`].
+pub const PACKAGE: &str = "sim86>=0.1.4,<0.3";
+/// The oldest package version the helper works with.
+pub const OLDEST: &str = "0.1.4";
+/// The first package version ter does not take.
+pub const BELOW: &str = "0.3.0";
 /// The package version this ter was tested with.
-pub const TESTED: &str = "0.1.4";
+pub const TESTED: &str = "0.2.0";
 /// The learner's sim86 key, when it is in the environment.
 pub const KEY_ENV: &str = "SIM86_API_KEY";
 
@@ -817,6 +821,12 @@ impl Helper {
     }
 }
 
+/// `path` from the root: the helper runs in the run folder, so a path
+/// relative to where ter runs would name the wrong file there.
+pub fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// The form sim86 takes a program in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Image {
@@ -861,8 +871,8 @@ impl Sim86 {
     pub fn request(&self, stimuli: &[Stimulus], program: &Path) -> Value {
         let nets: Vec<&str> = self.plan.watch.iter().map(|w| w.net.as_str()).collect();
         json!({
-            "board": self.board,
-            "firmware": {self.plan.mcu.as_str(): program},
+            "board": absolute(&self.board),
+            "firmware": {self.plan.mcu.as_str(): absolute(program)},
             "watch": nets,
             "scenario": scenario(stimuli, &self.plan.buttons),
             "timeout_ms": self.timeout_ms,
@@ -969,7 +979,7 @@ impl Venue for Sim86 {
         let program = self.program.clone().ok_or_else(|| {
             VenueError::unavailable("The program was not prepared for sim86", String::new())
         })?;
-        let request = self.run_dir.join(REQUEST_FILE);
+        let request = absolute(&self.run_dir.join(REQUEST_FILE));
         let text = serde_json::to_string_pretty(&self.request(stimuli, &program))
             .expect("the request serialises");
         std::fs::write(&request, text).map_err(|e| {
@@ -1346,8 +1356,8 @@ mod tests {
         assert_eq!(
             request,
             json!({
-                "board": "ex/sim86/board.json",
-                "firmware": {"mcu": "t/exercise"},
+                "board": absolute(Path::new("ex/sim86/board.json")),
+                "firmware": {"mcu": absolute(Path::new("t/exercise"))},
                 "watch": ["mcu.D13"],
                 "scenario": {"name": "ter-setup", "events": [
                     {"at": "1000ms", "env": {"part": "mcu", "input": "button", "value": 1.0}}]},

@@ -31,7 +31,7 @@ import threading
 import time
 import warnings
 
-HELPER = 4
+HELPER = 5
 
 # A trace comes back exact, every edge with its time, only while it has
 # few enough edges; past that it is a summary. A slice is cut to hold
@@ -42,8 +42,14 @@ MIN_SLICE_NS = 1_000
 # How many reads one net may take before ter gives up on it.
 MAX_READS = 4_000
 
-# sim86 answers for at most this long a window at once.
+# sim86 answers for at most this long a window at once, and holds a net's
+# recording for the last this long only.
 MAX_WINDOW_NS = 10_000_000_000
+# So a recording is read a piece of this long at a time, each piece while
+# sim86 still holds all of it.
+CHUNK_NS = 5_000_000_000
+# A live run reads its recording as it goes, once this much more is there.
+READ_AHEAD_NS = 2_000_000_000
 # A live run: how long to wait between two looks at the nets, how far each
 # look reaches back over the one before, and how long past the check's end
 # the board runs before its window is read (as `run` does).
@@ -62,12 +68,20 @@ class Failed(Exception):
 
 def classify(error):
     """The kind of a sim86 error, from its class and status, then its words."""
+    import sim86
     from sim86 import ApiError, AuthError, RunEnded
 
     text = str(error)
     low = text.lower()
     if isinstance(error, AuthError):
         return "no_key" if low.startswith("no api key") else "auth"
+    # Newer packages name these; older ones say it in words.
+    refused = getattr(sim86, "CircuitRefused", None)
+    if refused is not None and isinstance(error, refused):
+        return "board"
+    out_of_credits = getattr(sim86, "OutOfCredits", None)
+    if out_of_credits is not None and isinstance(error, out_of_credits):
+        return "credits"
     if any(word in low for word in ("credit", "balance", "quota", "payment")):
         return "credits"
     if isinstance(error, ApiError):
@@ -94,12 +108,15 @@ def level_of(state):
 
 
 class Reader:
-    """Every edge on one net from 0 to end_ns, or Failed("incomplete")."""
+    """Every edge on one net from 0 to end_ns, or Failed("incomplete"),
+    read a piece at a time while sim86 still holds it."""
 
     def __init__(self, run, pin, end_ns):
         self.run, self.pin, self.end_ns = run, pin, end_ns
         self.reads = 0
         self.leaves = []
+        # Read in full up to here.
+        self.read_to = 0
 
     def incomplete(self, why):
         return Failed("incomplete", f"{self.pin}: {why}")
@@ -165,9 +182,10 @@ class Reader:
         points = sorted({p for p in points if a < p < b})
         return [a] + points + [b]
 
-    def read(self, a, b, trace=None):
-        if trace is None:
-            trace = self.window(a, b)
+    def read(self, a, b):
+        trace = self.window(a, b)
+        if int(trace.get("availableFromNs") or 0) > a:
+            raise self.incomplete(f"sim86 no longer holds the recording from {a} ns (it keeps the last 10 s)")
         if self.exact(trace, a, b):
             self.leaves.append((a, b, trace))
             return
@@ -180,19 +198,13 @@ class Reader:
         for start, stop in zip(bounds, bounds[1:]):
             self.read(start, stop)
 
-    def edges(self, whole):
-        """`whole` is the trace of 0..end_ns from the one public read."""
-        self.read(0, self.end_ns, self.trace(whole))
-        return self.joined()
-
-    def all(self):
-        """Every edge of 0..end_ns, read in windows sim86 answers for."""
-        a = 0
-        while a < self.end_ns:
-            b = min(self.end_ns, a + MAX_WINDOW_NS)
-            self.read(a, b)
-            a = b
-        return self.joined()
+    def upto(self, b):
+        """Read on from where the last read stopped, to b."""
+        b = min(b, self.end_ns)
+        while self.read_to < b:
+            stop = min(b, self.read_to + CHUNK_NS)
+            self.read(self.read_to, stop)
+            self.read_to = stop
 
     def joined(self):
         if not self.leaves:
@@ -241,6 +253,14 @@ def opened(request):
     return board, client
 
 
+def observe(run, pins):
+    """Have sim86 record these nets from now: `observe` in newer packages,
+    `watch` in older ones."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        (getattr(run, "observe", None) or run.watch)(*pins)
+
+
 def record(request):
     from sim86 import Run
 
@@ -266,18 +286,20 @@ def record(request):
             # Nothing before this moment was recorded: not a run to judge.
             return answer
         if watch:
-            run.watch(*watch)
-        halt = run.until(at=timeout_ms)
-        if halt.time_ns < end_ns:
-            raise Failed("ended", f"the run stopped at {halt.time_ns / 1e6:.3f} ms, before {timeout_ms} ms")
+            observe(run, watch)
+        readers = {pin: Reader(run, pin, end_ns) for pin in watch}
+        # The board runs a piece at a time and waits while that piece is
+        # read: sim86 holds only the last 10 s of a net.
+        at_ns = 0
+        while at_ns < end_ns:
+            at_ns = min(end_ns, at_ns + CHUNK_NS)
+            halt = run.until(at=at_ns / 1e6)
+            if halt.time_ns < at_ns:
+                raise Failed("ended", f"the run stopped at {halt.time_ns / 1e6:.3f} ms, before {timeout_ms} ms")
+            for reader in readers.values():
+                reader.upto(at_ns)
         answer["end_ns"] = end_ns
-        pins = {}
-        for pin in watch:
-            # One public read of 0..now; a net too busy for it is then read
-            # in slices.
-            whole = run.measure(pin, over=halt.time_ns / 1e6).raw
-            pins[pin] = Reader(run, pin, end_ns).edges(whole)
-        answer["pins"] = pins
+        answer["pins"] = {pin: reader.joined() for pin, reader in readers.items()}
         answer["serial"] = [
             [float(line.t), str(line.source), str(line.line)] for line in run.serial.lines
         ]
@@ -301,11 +323,31 @@ def say(event):
 
 
 class Told(threading.Thread):
-    """Sets `stop` when ter says so, or is no longer there to say it."""
+    """Sets `stop` and stops the run when ter says so, or is no longer
+    there to say it. It stops the run itself, from this thread, so a main
+    loop that is waiting on sim86 does not keep the run going."""
 
     def __init__(self):
         super().__init__(daemon=True)
         self.stop = threading.Event()
+        self.lock = threading.Lock()
+        self.sim_run = None
+
+    def attach(self, sim_run):
+        """The run to stop, once it exists: at once if ter said so already."""
+        with self.lock:
+            self.sim_run = sim_run
+        if self.stop.is_set():
+            self.end()
+
+    def end(self):
+        with self.lock:
+            sim_run, self.sim_run = self.sim_run, None
+        if sim_run is not None:
+            try:
+                sim_run.client.stop_run(sim_run.id)
+            except Exception:
+                pass
 
     def run(self):
         try:
@@ -314,6 +356,7 @@ class Told(threading.Thread):
                     break
         finally:
             self.stop.set()
+            self.end()
 
 
 class Tail:
@@ -374,14 +417,19 @@ def recording(run, watch, end_ns, pins):
 
 
 def live(request):
-    from sim86 import Run, Sim86Error
+    from sim86 import Run
 
     end_ns = int(request["timeout_ms"]) * 1_000_000
     watch = list(request.get("watch") or [])
+    # ter can say stop while the run is still being made.
+    told = Told()
+    told.start()
     board, client = opened(request)
     # A board file may carry limits of its own, meant for sim86's command.
     # ter holds a live run's limit: no simulated-time limit at all.
     board.limits = {}
+    if told.stop.is_set():
+        raise Failed("stopped", "ter stopped the run before it started")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         run = Run.start(
@@ -391,18 +439,19 @@ def live(request):
             scenario=request.get("scenario") or None,
             paused=True,
         )
-    told = Told()
+    told.attach(run)
     try:
         halt = run.status()
         if not halt.paused or halt.time_ns != 0:
             raise Failed("not_paused", f"the recording starts {halt.time_ns / 1e6:.3f} ms in")
         if watch:
-            run.watch(*watch)
+            observe(run, watch)
         say({"ev": "started", "run": run.id})
-        told.start()
         run.resume()
 
         tails = {pin: Tail(pin) for pin in watch}
+        readers = {pin: Reader(run, pin, end_ns) for pin in watch}
+        read_to = 0
         lines_said = 0
         recorded = False
         now_ns = 0
@@ -429,17 +478,31 @@ def live(request):
                 for line in lines[lines_said:]:
                     say({"ev": "serial", "t_ms": float(line.t), "source": str(line.source), "line": str(line.line)})
                 lines_said = len(lines)
-                if not recorded and run.ended is None and now_ns >= end_ns + TAIL_NS:
-                    say(recording(run, watch, end_ns, {pin: Reader(run, pin, end_ns).all() for pin in watch}))
+                # The recording is read as the board makes it, while sim86
+                # still holds every piece, and a little behind the board.
+                ready = min(end_ns, now_ns - TAIL_NS)
+                if not recorded and run.ended is None and (ready >= end_ns or ready - read_to >= READ_AHEAD_NS):
+                    for reader in readers.values():
+                        reader.upto(ready)
+                    read_to = ready
+                if not recorded and run.ended is None and read_to >= end_ns:
+                    say(recording(run, watch, end_ns, {pin: reader.joined() for pin, reader in readers.items()}))
                     recorded = True
-            except Sim86Error:
-                # A run that ended under a request is an ended run.
-                if run.ended is None:
+            except Exception:
+                # A run that ended, or was stopped, under a request is an
+                # ended run.
+                if run.ended is None and not told.stop.is_set():
                     raise
             if run.ended is not None:
                 break
         ended = run.ended
-        say({"ev": "ended", "reason": "stopped" if ended in (None, "disconnected") else str(ended)})
+        if told.stop.is_set():
+            reason = "stopped"
+        elif ended in (None, "disconnected"):
+            reason = "disconnected"
+        else:
+            reason = str(ended)
+        say({"ev": "ended", "reason": reason})
         return {"run": run.id}
     finally:
         try:

@@ -298,7 +298,7 @@ fn sim86_goes_into_ters_own_python_environment_with_the_helper_beside_it() {
             .collect::<Vec<_>>(),
         [
             format!("python -m venv {}", venv.display()),
-            "python -m pip install --upgrade --quiet sim86>=0.1.4,<0.2".to_string(),
+            "python -m pip install --upgrade --quiet sim86>=0.1.4,<0.3".to_string(),
         ]
     );
     assert_eq!(

@@ -282,11 +282,12 @@ fn find_python() -> Result<PathBuf, CliError> {
 }
 
 /// Whether an installed package version is one [`sim86lib::PACKAGE`] asks
-/// for: at least the tested one, and before the next minor.
+/// for: at least the oldest the helper works with, and before the first
+/// one ter does not take.
 fn package_fits(version: &str) -> bool {
-    plan::at_least(version, sim86lib::TESTED)
-        && version.split('.').take(2).collect::<Vec<_>>()
-            == sim86lib::TESTED.split('.').take(2).collect::<Vec<_>>()
+    !version.trim().is_empty()
+        && plan::at_least(version, sim86lib::OLDEST)
+        && !plan::at_least(version, sim86lib::BELOW)
 }
 
 /// Run one step of the install; with `--json` its output goes to stderr.
@@ -597,11 +598,20 @@ mod tests {
     #[test]
     fn the_package_must_be_in_the_range_pip_is_asked_for() {
         assert!(package_fits(sim86lib::TESTED));
+        assert!(package_fits("0.1.4"));
         assert!(package_fits("0.1.9"));
+        assert!(package_fits("0.2.7"));
         assert!(!package_fits("0.1.3"));
-        assert!(!package_fits("0.2.0"));
+        assert!(!package_fits("0.3.0"));
         assert!(!package_fits(""));
-        assert!(sim86lib::PACKAGE.contains(sim86lib::TESTED));
+        assert_eq!(
+            sim86lib::PACKAGE,
+            format!(
+                "sim86>={},<{}",
+                sim86lib::OLDEST,
+                sim86lib::BELOW.trim_end_matches(".0")
+            )
+        );
     }
 
     #[test]

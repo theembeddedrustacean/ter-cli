@@ -5,6 +5,21 @@ use std::process::Command;
 
 use serde_json::Value;
 
+/// The site the live tests talk to: the real one, or the one in
+/// `TER_LIVE_SITE_URL` (a staging site, with a token of its own).
+trait LiveSite {
+    fn live_site(&mut self) -> &mut Self;
+}
+
+impl LiveSite for Command {
+    fn live_site(&mut self) -> &mut Self {
+        match std::env::var("TER_LIVE_SITE_URL") {
+            Ok(url) => self.env("TER_SITE_URL", url),
+            Err(_) => self.env_remove("TER_SITE_URL"),
+        }
+    }
+}
+
 fn ter_json(token: &str, args: &[&str]) -> (bool, Value) {
     let config = tempfile::tempdir().unwrap();
     let o = Command::new(env!("CARGO_BIN_EXE_ter"))
@@ -12,7 +27,7 @@ fn ter_json(token: &str, args: &[&str]) -> (bool, Value) {
         .arg("--json")
         .env("TER_CONFIG_DIR", config.path())
         .env("TER_TOKEN", token)
-        .env_remove("TER_SITE_URL")
+        .live_site()
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&o.stdout);
@@ -112,7 +127,7 @@ fn live_code_left_ten_minutes_expires() {
         .env("TER_CONFIG_DIR", config.path())
         .env("TER_KEYCHAIN", "off")
         .env_remove("TER_TOKEN")
-        .env_remove("TER_SITE_URL")
+        .live_site()
         .output()
         .unwrap();
     assert!(!o.status.success());
@@ -136,7 +151,7 @@ fn ter_ex(token: &str, args: &[&str]) -> (bool, Value, tempfile::TempDir) {
         .env("TER_CONFIG_DIR", config.path())
         .env("TER_TOKEN", token)
         .env("TER_KEYCHAIN", "off")
-        .env_remove("TER_SITE_URL")
+        .live_site()
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&o.stdout);
@@ -471,7 +486,7 @@ impl LiveMachine {
             .env("TER_CONFIG_DIR", self.config.path())
             .env("TER_TOKEN", &self.token)
             .env("TER_KEYCHAIN", "off")
-            .env_remove("TER_SITE_URL")
+            .live_site()
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&o.stdout);
@@ -1151,7 +1166,7 @@ fn live_serve_fetches_runs_and_posts_for_the_page() {
         .env("TER_CONFIG_DIR", m.config.path())
         .env("TER_TOKEN", &m.token)
         .env("TER_KEYCHAIN", "off")
-        .env_remove("TER_SITE_URL")
+        .live_site()
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -1245,7 +1260,7 @@ impl SharedBench {
             .env("TER_CONFIG_DIR", m.config.path())
             .env("TER_TOKEN", &m.token)
             .env("TER_KEYCHAIN", "off")
-            .env_remove("TER_SITE_URL")
+            .live_site()
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1686,7 +1701,7 @@ fn page_bench_run(on_devices_page: bool) {
         .env("TER_CONFIG_DIR", driver.config.path())
         .env("TER_TOKEN", &driver.token)
         .env("TER_KEYCHAIN", "off")
-        .env_remove("TER_SITE_URL")
+        .live_site()
         .env_remove("TER_PORT")
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -1787,7 +1802,7 @@ fn live_llm_hint_from_the_learners_own_provider() {
                 .env("TER_CONFIG_DIR", m.config.path())
                 .env("TER_TOKEN", &m.token)
                 .env("TER_KEYCHAIN", "off")
-                .env_remove("TER_SITE_URL")
+                .live_site()
                 .env_remove("TER_LLM_KEY")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -2055,7 +2070,7 @@ fn live_serve_runs_the_pages_run_on_sim86_and_answers_with_its_events() {
         .env("TER_TOKEN", &m.token)
         .env("TER_KEYCHAIN", "off")
         .env("TER_TOOLS_DIR", tools.path())
-        .env_remove("TER_SITE_URL")
+        .live_site()
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -2186,7 +2201,7 @@ fn live_serve_shows_a_run_on_sim86_as_it_happens_and_stops_it() {
         .env("TER_TOKEN", &m.token)
         .env("TER_KEYCHAIN", "off")
         .env("TER_TOOLS_DIR", tools.path())
-        .env_remove("TER_SITE_URL")
+        .live_site()
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -2387,7 +2402,9 @@ fn live_serve_shows_a_run_on_sim86_as_it_happens_and_stops_it() {
 /// press planned at 1000 ms turns the Nucleo's LED on at 1000 ms. With
 /// `TER_SIM86_PWM_ELF` (an ESP32-C3 program that toggles the LED 4000
 /// times 500 us apart, then 20000 times 50 us apart), every one of those
-/// 24000 edges is in the recording. Every run is stopped by the helper.
+/// 24000 edges is in the recording. A 12.5 s run, longer than sim86 holds
+/// of a net, is read whole. `TER_SIM86_VERSION` runs it all on another
+/// sim86 the pin allows. Every run is stopped by the helper.
 #[test]
 #[ignore = "live sim86"]
 fn live_sim86_records_from_the_first_edge_and_judges_the_pilot_boards() {
@@ -2408,6 +2425,15 @@ fn live_sim86_records_from_the_first_edge_and_judges_the_pilot_boards() {
     assert_eq!(v["tools"][0]["key"], "accepted", "{v}");
     assert!(v["tools"][0]["credits"].as_i64().unwrap() > 0, "{v}");
     let home = tools.path().join("sim86");
+    // Another sim86 the pin allows, such as its oldest.
+    if let Ok(version) = std::env::var("TER_SIM86_VERSION") {
+        let o = Command::new(home.join("venv/bin/python"))
+            .args(["-m", "pip", "install", "--quiet"])
+            .arg(format!("sim86=={version}"))
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
     let helper = Helper {
         python: home.join("venv/bin/python"),
         script: home.join(sim86::HELPER_FILE),
@@ -2515,6 +2541,30 @@ fn live_sim86_records_from_the_first_edge_and_judges_the_pilot_boards() {
         "the LED answers the press at 1000 ms: {seen:?}"
     );
     eprintln!("nucleo button toggle: {verdicts:?}");
+
+    // Longer than the 10 s sim86 holds of a net: read in pieces as the
+    // run goes, with no gap where two pieces meet.
+    let long = "timeout_ms: 12500\nassert:\n  - id: early\n    pin: user_led\n    toggles_per_s: { min: 3.6, max: 4.4 }\n    window_ms: [900, 2900]\n  - id: late\n    pin: user_led\n    toggles_per_s: { min: 3.6, max: 4.4 }\n    window_ms: [10000, 12000]\n";
+    let mut xiao = venue("uferris-c3", &["user_led"], &[], esp(), 12500);
+    let (rec, verdicts) = record(
+        &mut xiao,
+        &pilot.join("elf/solution--gpio-blinky--xiao-esp32c3-nostd--debug.elf"),
+        long,
+    );
+    assert!(
+        verdicts
+            .iter()
+            .all(|v| v.status == ter_check::CheckStatus::Pass),
+        "{verdicts:?}"
+    );
+    let seen = edges(&rec);
+    assert!(
+        seen.windows(2)
+            .all(|w| w[0].0 < w[1].0 && w[1].0 - w[0].0 < 1_000_000 && w[0].1 != w[1].1),
+        "every flash, in order: {seen:?}"
+    );
+    assert!(seen.last().unwrap().0 > 12_000_000, "{seen:?}");
+    eprintln!("long heartbeat: {} edges, {verdicts:?}", seen.len());
 
     // A PWM-rate signal: every edge, though one read of the net gives a
     // summary past about a thousand.
