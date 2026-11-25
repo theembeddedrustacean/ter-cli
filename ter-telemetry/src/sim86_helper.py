@@ -27,7 +27,11 @@ While a live run goes on, ter may also write a JSON object a line, each
 with an "id" and what to "do": "pause" or "resume". The helper does it to
 the run and answers with a line holding the same "id": "paused" or
 "resumed" with the board's simulated time ("t_ns"), or "refused" with
-sim86's "message".
+sim86's "message". "reset" stops the run and starts a new one from the
+same request, paused at 0 and then running, as at the start: the answer
+is "reset" with the new run's id ("run"), and every line after it is the
+new run's. A reset that cannot start the new run answers "refused" and
+ends as any failed start does.
 
 Written by `ter install sim86` next to the Python environment that holds
 the sim86 package, and rewritten by ter when it changes. Do not edit it.
@@ -339,6 +343,8 @@ class Told(threading.Thread):
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.sim_run = None
+        # The id of a reset ter asked for, until the main loop does it.
+        self.reset = None
 
     def attach(self, sim_run):
         """The run to stop, once it exists: at once if ter said so already."""
@@ -355,6 +361,16 @@ class Told(threading.Thread):
                 sim_run.client.stop_run(sim_run.id)
             except Exception:
                 pass
+
+    def detach(self):
+        """The run is being replaced: nothing to stop from here meanwhile."""
+        with self.lock:
+            self.sim_run = None
+
+    def take_reset(self):
+        with self.lock:
+            asked, self.reset = self.reset, None
+        return asked
 
     def run(self):
         try:
@@ -378,6 +394,10 @@ class Told(threading.Thread):
             return
         with self.lock:
             sim_run = self.sim_run
+            # The main loop owns the run, so it makes the new one.
+            if asked.get("do") == "reset" and sim_run is not None and self.reset is None:
+                self.reset = asked.get("id")
+                return
         try:
             if sim_run is None:
                 raise Failed("not_started", "the run has not started")
@@ -489,33 +509,49 @@ def live(request):
     names = signals(request, client) if shown else {}
     if told.stop.is_set():
         raise Failed("stopped", "ter stopped the run before it started")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        run = Run.start(
-            board, client,
-            duration=None,
-            realtime=float(request["realtime_ms"]),
-            scenario=request.get("scenario") or None,
-            paused=True,
-        )
-    told.attach(run)
-    try:
-        halt = run.status()
-        if not halt.paused or halt.time_ns != 0:
-            raise Failed("not_paused", f"the recording starts {halt.time_ns / 1e6:.3f} ms in")
-        if watch:
-            observe(run, watch)
-        if shown:
+
+    def begin(shown):
+        """A new run of the board, paused at 0 with its nets observed, and
+        the shown nets sim86 took."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            new = Run.start(
+                board, client,
+                duration=None,
+                realtime=float(request["realtime_ms"]),
+                scenario=request.get("scenario") or None,
+                paused=True,
+            )
+        told.attach(new)
+        try:
+            halt = new.status()
+            if not halt.paused or halt.time_ns != 0:
+                raise Failed("not_paused", f"the recording starts {halt.time_ns / 1e6:.3f} ms in")
+            if watch:
+                observe(new, watch)
+            if shown:
+                try:
+                    observe(new, shown)
+                except Exception:  # noqa: BLE001 - shown nets are a nicety
+                    shown = []
+        except BaseException:
             try:
-                observe(run, shown)
-            except Exception:  # noqa: BLE001 - shown nets are a nicety
-                shown = []
+                new.stop()
+            except Exception:
+                pass
+            raise
+        return new, shown
+
+    run, shown = begin(shown)
+    try:
         observed = watch + shown
         say({"ev": "started", "run": run.id, "signals": names})
         run.resume()
 
-        tails = {pin: Tail(pin) for pin in observed}
-        readers = {pin: Reader(run, pin, end_ns) for pin in watch}
+        def fresh():
+            return {pin: Tail(pin) for pin in observed}, {pin: Reader(run, pin, end_ns) for pin in watch}
+
+        tails, readers = fresh()
         read_to = 0
         lines_said = 0
         recorded = False
@@ -524,6 +560,32 @@ def live(request):
         while True:
             if told.stop.wait(POLL_S):
                 break
+            reset = told.take_reset()
+            if reset is not None:
+                told.detach()
+                try:
+                    run.stop()
+                except Exception:
+                    pass
+                try:
+                    run, shown = begin(shown)
+                except Exception as e:  # noqa: BLE001 - said, then the end of the run
+                    say({"ev": "refused", "id": reset, "message": str(e) or type(e).__name__})
+                    if told.stop.is_set():
+                        break
+                    raise
+                if told.stop.is_set():
+                    break
+                observed = watch + shown
+                say({"ev": "reset", "id": reset, "run": run.id})
+                run.resume()
+                tails, readers = fresh()
+                read_to = 0
+                lines_said = 0
+                recorded = False
+                now_ns = 0
+                looked = time.monotonic()
+                continue
             try:
                 if run.ended is None:
                     wall = time.monotonic()

@@ -374,6 +374,64 @@ impl Built {
         })
     }
 
+    /// The same sim86 run once more, for a live run started again: the
+    /// same build and checks, and this run's folder until [`Self::afresh`]
+    /// gives it its own.
+    pub fn again(&self) -> Result<Built, CliError> {
+        let Plan::Sim86(sim) = &self.plan else {
+            return Err(CliError::new(
+                "internal",
+                "Only a run on sim86 is started again.",
+            ));
+        };
+        Ok(Built {
+            dir: self.dir.clone(),
+            ter: self.ter.clone(),
+            mode: self.mode.clone(),
+            venue: self.venue,
+            sim_allowed: self.sim_allowed,
+            plan: Plan::Sim86(Box::new(Checked {
+                file: sim.file.clone(),
+                text: sim.text.clone(),
+                ready: sim.ready.clone(),
+            })),
+            session: Session::open()?,
+            user: self.user.clone(),
+            bench: None,
+            number: self.number,
+            recording: self.recording.clone(),
+            started: Instant::now(),
+            build: crate::build::Build {
+                ok: self.build.ok,
+                log: self.build.log.clone(),
+                elf: self.build.elf.clone(),
+                duration: self.build.duration,
+            },
+            log_path: self.log_path.clone(),
+            previous: self.previous.clone(),
+            elf_sha256: self.elf_sha256.clone(),
+            quiet: self.quiet,
+            ran_in: None,
+        })
+    }
+
+    /// A run folder of its own, with the build's log in it, and the
+    /// exercise's last run as it is now.
+    pub fn afresh(&mut self) -> Result<&Path, CliError> {
+        let (number, recording) = new_recording(&self.dir)?;
+        let log_path = recording.join("build.log");
+        write(&log_path, self.build.log.as_bytes())?;
+        let site = self.session.client.site_url().to_string();
+        self.previous =
+            LastRun::load(&self.dir)?.filter(|last| last.user == self.user && last.site == site);
+        self.number = number;
+        self.recording = recording;
+        self.log_path = log_path;
+        self.started = Instant::now();
+        self.ran_in = None;
+        Ok(&self.recording)
+    }
+
     /// Say where the run ran and for how long, for the text `ter run`
     /// prints.
     pub fn ran(&mut self, took: Duration, on: &'static str) {

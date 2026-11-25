@@ -4496,6 +4496,75 @@ async fn a_paused_live_run_holds_its_time_and_its_limit_moves_on_when_it_resumes
     );
 }
 
+/// The page starts the board again from its time 0: a new sim86 run with
+/// the program already built, under the same live run. A reset before the
+/// check's window has run leaves one attempt to post, from the first run
+/// folder; a reset after it is a second attempt, in a folder of its own.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_reset_live_run_starts_a_new_sim86_run_from_zero_and_is_judged_again() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = live_machine(GOOD, "").with_sim86_package();
+    std::fs::write(m.sim86_bin().join("speed"), "2").unwrap();
+    let served = m.serve(&server.uri());
+
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["sim86_run"], "fake-run-1", "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let ends_at = v["ends_at"].as_u64().unwrap();
+    let mut events = LiveStream::open(&served, &id).await;
+    events.until("pin").await;
+
+    // Before the window has run: nothing is posted for the first board.
+    let (status, reset) = served.live_post(&id, "reset", json!({})).await;
+    assert_eq!(status, 200, "{reset}");
+    assert_eq!(
+        reset,
+        json!({"ok": true, "run": "fake-run-2", "ends_at": ends_at})
+    );
+    let (event, before) = events.until("reset").await;
+    assert_eq!(event, json!({"run": "fake-run-2", "ends_at": ends_at}));
+    assert!(!before.contains(&"checks".to_string()), "{before:?}");
+    assert!(sim86_says(&m, "stopped", "fake-run-1", 10).await);
+    let (pin, _) = events.until("pin").await;
+    assert_eq!(pin["t_ms"], json!(0.0), "the new board starts at 0: {pin}");
+    let (checks, _) = events.until("checks").await;
+    assert_eq!(checks["check_status"], "passed", "{checks}");
+    assert_eq!(posted(&server, "run").await.len(), 1);
+    assert!(!m.exercise().join(".runs/2").exists());
+
+    // After it, paused: the new board runs, and the pause moved the end on.
+    let (status, _) = served.live_post(&id, "pause", json!({})).await;
+    assert_eq!(status, 200);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (status, reset) = served.live_post(&id, "reset", json!({})).await;
+    assert_eq!(status, 200, "{reset}");
+    assert_eq!(reset["run"], "fake-run-3", "{reset}");
+    assert!(
+        reset["ends_at"].as_u64().unwrap() >= ends_at + 1_000,
+        "{reset}"
+    );
+    events.until("reset").await;
+    let (checks, before) = events.until("checks").await;
+    assert_eq!(checks["check_status"], "passed", "{checks}");
+    assert!(!before.contains(&"paused".to_string()), "{before:?}");
+    assert_eq!(posted(&server, "run").await.len(), 2);
+    assert!(m.exercise().join(".runs/2/build.log").is_file());
+    assert!(m.exercise().join(".runs/2/events.jsonl").is_file());
+
+    assert_eq!(
+        served.live_post(&id, "stop", json!({})).await,
+        (200, json!({"ok": true}))
+    );
+    let (ended, _) = events.until("ended").await;
+    assert_eq!(ended["reason"], "user-stop", "{ended}");
+    assert!(sim86_says(&m, "stopped", "fake-run-3", 10).await);
+    let runs = m.sim86_saw("runs");
+    assert_eq!(runs.lines().count(), 3, "{runs}");
+    assert!(!m.exercise().join(".runs/1/firmware.bin").exists());
+}
+
 /// ter's own helper streams the board's other wired pins by the chip's
 /// names from sim86's catalog, and a pin sim86 will not observe holds up
 /// neither the run nor its checks.

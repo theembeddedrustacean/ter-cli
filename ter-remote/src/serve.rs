@@ -11,8 +11,8 @@
 //! live (`"live": {"limit_s": 60}` in `/run`): the answer then names a live
 //! run, and the page follows it on `/live/<id>/events` (Server-Sent
 //! Events), lengthens it with `/live/<id>/extend`, pauses and resumes it
-//! with `/live/<id>/pause` and `/live/<id>/resume`, and ends it with
-//! `/live/<id>/stop`. `/health` says `"live": true` when the service does
+//! with `/live/<id>/pause` and `/live/<id>/resume`, starts it again from
+//! its time 0 with `/live/<id>/reset`, and ends it with `/live/<id>/stop`. `/health` says `"live": true` when the service does
 //! this.
 //!
 //! Only the lesson page's origin gets an answer a browser will read (and
@@ -103,7 +103,7 @@ pub const LIVE_CAP_S: u64 = 600;
 
 /// One event of a live run, as `/live/<id>/events` sends it: `name` is
 /// the SSE event's name (`pin`, `serial`, `checks`, `limit`, `paused`,
-/// `resumed`, `ended`) and `data` its one JSON object.
+/// `resumed`, `reset`, `ended`) and `data` its one JSON object.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveEvent {
     pub name: &'static str,
@@ -121,6 +121,8 @@ pub enum LiveControl {
     Pause,
     /// Let a paused board run on.
     Resume,
+    /// Start the board again from its time 0, with the same program.
+    Reset,
 }
 
 /// A failure `ter serve` answers with, as `{"error": {code, message}}`.
@@ -417,6 +419,7 @@ pub fn router(service: Arc<dyn Service>, port: u16, site_origin: &str, dev: bool
         .route("/live/{id}/stop", post(live_stop))
         .route("/live/{id}/pause", post(live_pause))
         .route("/live/{id}/resume", post(live_resume))
+        .route("/live/{id}/reset", post(live_reset))
         .route("/live/{id}/view", get(live_view))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(ctx.clone(), guard))
@@ -540,6 +543,10 @@ async fn live_resume(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response
     live_control(&ctx, &id, LiveControl::Resume).await
 }
 
+async fn live_reset(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    live_control(&ctx, &id, LiveControl::Reset).await
+}
+
 /// The lesson page frames this address; the browser goes on to the
 /// simulator's own page for the run. The frame's request names no origin,
 /// so what guards it is the run's id, which only the page that started
@@ -582,7 +589,7 @@ fn is_view(method: &Method, path: &str) -> bool {
 async fn not_found() -> Response {
     ServeError::new(
         "not_found",
-        "ter serve answers /health, /run and /live/<id>/events, /extend, /pause, /resume, /stop and /view.",
+        "ter serve answers /health, /run and /live/<id>/events, /extend, /pause, /resume, /reset, /stop and /view.",
     )
     .into_response()
 }
@@ -1233,6 +1240,7 @@ mod tests {
             let answer = match (id, control) {
                 ("l1", LiveControl::Pause) => Ok(json!({"ok": true, "t_ms": 1.5})),
                 ("l1", LiveControl::Resume) => Ok(json!({"ok": true, "t_ms": 1.5, "ends_at": 9})),
+                ("l1", LiveControl::Reset) => Ok(json!({"ok": true, "run": "r2"})),
                 (id, _) => Err(no_live(id)),
             };
             Box::pin(async move { answer })
@@ -1292,6 +1300,11 @@ mod tests {
                 json!({"ok": true, "t_ms": 1.5, "ends_at": 9})
             )
         );
+        let (status, _, v) = send(&app, req("POST", "/live/l1/reset", Some(SITE), "")).await;
+        assert_eq!(
+            (status, v),
+            (StatusCode::OK, json!({"ok": true, "run": "r2"}))
+        );
 
         // No such run, and a service with no live runs at all.
         for path in [
@@ -1300,6 +1313,7 @@ mod tests {
             "/live/l1/stop",
             "/live/l2/pause",
             "/live/l2/resume",
+            "/live/l2/reset",
         ] {
             let method = if path.ends_with("events") {
                 "GET"
@@ -1318,6 +1332,7 @@ mod tests {
             "/live/l1/stop",
             "/live/l1/pause",
             "/live/l1/resume",
+            "/live/l1/reset",
         ] {
             let mut r = req("OPTIONS", path, Some(SITE), "");
             r.headers_mut().insert(
@@ -1365,6 +1380,7 @@ mod tests {
                 ("POST", "/live/l1/stop"),
                 ("POST", "/live/l1/pause"),
                 ("POST", "/live/l1/resume"),
+                ("POST", "/live/l1/reset"),
             ] {
                 let (status, _, v) = send(&app, req(method, path, origin, "")).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{origin:?} {path}");

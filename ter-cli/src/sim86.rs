@@ -23,6 +23,7 @@ use crate::output::CliError;
 pub const TOOLS_ENV: &str = "TER_TOOLS_DIR";
 
 /// A simulated run on sim86, ready to go once the program is built.
+#[derive(Clone)]
 pub struct Ready {
     pub helper: Helper,
     pub board: PathBuf,

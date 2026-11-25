@@ -12,6 +12,13 @@
 //! resumes; a run may be paused for ten minutes in all, and ends at its
 //! limit once it has been.
 //!
+//! The page may also start the board again from its time 0: the helper
+//! stops the sim86 run and starts a new one with the program it already
+//! has, so nothing is built again. The live run keeps its id, limit and
+//! pause allowance; the new sim86 run is a new attempt, judged and posted
+//! from a run folder of its own once its window has run, while the old
+//! one's checks, if they were still being posted, are no longer sent.
+//!
 //! The checks are not judged from the stream. Once the check's window has
 //! run, its recording is read back in full, written to the run folder,
 //! judged and posted, exactly as `ter run --sim sim86` does; the board
@@ -98,6 +105,8 @@ fn new_id() -> String {
 }
 
 struct State {
+    /// sim86's own id for the board's run: a new one when it is reset.
+    run: String,
     /// When ter stops the run, in Unix ms.
     ends_at: u64,
     /// The `ended` event, once the run is over.
@@ -115,8 +124,9 @@ struct State {
 }
 
 impl State {
-    fn new(ends_at: u64) -> Self {
+    fn new(run: String, ends_at: u64) -> Self {
         Self {
+            run,
             ends_at,
             ended: None,
             listeners: 0,
@@ -136,6 +146,18 @@ impl State {
         self.paused_ms
             .saturating_add(u64::try_from(now).unwrap_or(u64::MAX))
     }
+
+    /// The board runs again: the pause, if any, is over and the end moves
+    /// on by as much.
+    fn unpause(&mut self) -> bool {
+        let Some((since, _)) = self.paused.take() else {
+            return false;
+        };
+        let paused = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.paused_ms = self.paused_ms.saturating_add(paused);
+        self.ends_at = self.ends_at.saturating_add(paused);
+        true
+    }
 }
 
 /// What the page asked of the board, and where its answer goes.
@@ -144,8 +166,6 @@ type Asked = (LiveControl, oneshot::Sender<Result<Value, CliError>>);
 /// A run that is going on, or has been.
 pub struct Live {
     pub id: String,
-    /// sim86's own id for the run.
-    pub sim86_run: String,
     /// When the board started, in Unix ms.
     pub started_at: u64,
     helper: sim86::Helper,
@@ -169,6 +189,11 @@ impl Live {
         self.state().ended.is_some()
     }
 
+    /// sim86's own id for the board's run now.
+    pub fn sim86_run(&self) -> String {
+        self.state().run.clone()
+    }
+
     /// The address of sim86's own page for the run, signed in as the
     /// learner, while the run is on. The key is in it: it is handed to
     /// the learner's browser and never printed or kept.
@@ -179,7 +204,7 @@ impl Live {
                 format!("Live run {:?} is over.", self.id),
             ));
         }
-        self.helper.view(&self.sim86_run).map_err(|failure| {
+        self.helper.view(&self.sim86_run()).map_err(|failure| {
             CliError::new(
                 "venue_unavailable",
                 format!(
@@ -192,7 +217,7 @@ impl Live {
 
     /// What `/run` answers with.
     pub fn answer(&self) -> Value {
-        json!({"live": self.id, "sim86_run": self.sim86_run,
+        json!({"live": self.id, "sim86_run": self.sim86_run(),
                "started_at": self.started_at, "ends_at": self.ends_at()})
     }
 
@@ -281,9 +306,13 @@ impl Live {
         if self.ended() {
             return Err(over());
         }
+        // A reset makes a new sim86 run, which may wait for a simulator.
+        let patience = match control {
+            LiveControl::Reset => patience("TER_LIVE_START_SECS", START_BUDGET),
+            _ => patience("TER_LIVE_CONTROL_SECS", CONTROL_PATIENCE),
+        };
         let (tx, rx) = oneshot::channel();
         self.control.send((control, tx)).map_err(|_| over())?;
-        let patience = patience("TER_LIVE_CONTROL_SECS", CONTROL_PATIENCE);
         match tokio::time::timeout(patience, rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => Err(over()),
@@ -472,10 +501,12 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
     let (over_tx, over) = watch::channel(false);
     let live = Arc::new(Live {
         id: new_id(),
-        sim86_run,
         started_at,
         helper: venue.helper.clone(),
-        state: Mutex::new(State::new(started_at + limit_s.min(LIVE_CAP_S) * 1_000)),
+        state: Mutex::new(State::new(
+            sim86_run,
+            started_at + limit_s.min(LIVE_CAP_S) * 1_000,
+        )),
         events,
         stop,
         control,
@@ -486,6 +517,8 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
         Drive {
             live: live.clone(),
             built: Some(built),
+            spare: None,
+            firmware: recording.join(FIRMWARE),
             venue,
             child,
             stdin,
@@ -509,6 +542,11 @@ struct Drive {
     live: Arc<Live>,
     /// The run to post, until it is.
     built: Option<Built>,
+    /// The same run again, kept when the first is posted, for a reset.
+    spare: Option<Built>,
+    /// The program sim86 was given, in the first run folder: the helper
+    /// uploads it again on a reset.
+    firmware: std::path::PathBuf,
     venue: Sim86,
     child: Child,
     stdin: Option<ChildStdin>,
@@ -569,7 +607,7 @@ impl Drive {
         // The checks being posted: the site may be slow, and the run is
         // still followed and stopped meanwhile.
         let mut posting: Option<tokio::task::JoinHandle<Value>> = None;
-        let began = Instant::now();
+        let mut began = Instant::now();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut program = ProgramLines::new(&self.venue.plan);
         let mut asked: Option<(&'static str, Instant)> = None;
@@ -602,13 +640,27 @@ impl Drive {
                             match other {
                                 Some(LiveLine::Recording(answer)) => {
                                     if let Some(mut built) = self.built.take() {
+                                        self.spare = built
+                                            .again()
+                                            .inspect_err(|e| eprintln!("A reset of live run {} will not be posted: {}", self.live.id, e.message))
+                                            .ok();
                                         built.ran(began.elapsed(), "on sim86");
                                         posting = Some(self.checks(built, &answer, post_patience));
                                     }
                                 }
                                 Some(LiveLine::Ended { reason }) => sim_reason = Some(reason),
                                 Some(LiveLine::Done(done)) => failure = done.err(),
-                                Some(LiveLine::Reply { id, answer }) => self.answered(id, answer, pause_cap),
+                                Some(LiveLine::Reply { id, answer }) => {
+                                    if self.answered(id, answer, pause_cap) {
+                                        // A new board from its time 0: what
+                                        // the old one did is not its own.
+                                        program = ProgramLines::new(&self.venue.plan);
+                                        began = Instant::now();
+                                        sim_reason = None;
+                                        // The old run's post goes on, unsent.
+                                        drop(posting.take());
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -628,6 +680,7 @@ impl Drive {
                             let what = match &control {
                                 LiveControl::Pause => json!({"do": "pause"}),
                                 LiveControl::Resume => json!({"do": "resume"}),
+                                LiveControl::Reset => json!({"do": "reset"}),
                             };
                             let mut line = what;
                             line["id"] = json!(next_id);
@@ -676,7 +729,7 @@ impl Drive {
         }
         let _ = tokio::time::timeout(Duration::from_secs(10), self.child.wait()).await;
         let _ = std::fs::write(self.venue.run_dir.join(OUTPUT_LOG), &self.said);
-        let _ = std::fs::remove_file(self.venue.run_dir.join(FIRMWARE));
+        let _ = std::fs::remove_file(&self.firmware);
 
         // Checks still being posted come before the end; the post has a
         // limit of its own.
@@ -695,11 +748,13 @@ impl Drive {
     }
 
     /// What the helper answered to what it was asked under `id`: the board
-    /// paused or resumed, said on the stream, and the answer to the page.
-    fn answered(&mut self, id: u64, answer: Result<Value, String>, pause_cap: Duration) {
+    /// paused, resumed or reset, said on the stream, and the answer to the
+    /// page. True when the board is a new one from its time 0.
+    fn answered(&mut self, id: u64, answer: Result<Value, String>, pause_cap: Duration) -> bool {
         let Some((control, reply)) = self.asked.remove(&id) else {
-            return;
+            return false;
         };
+        let mut reset = false;
         let answer = match answer {
             Ok(line) => {
                 let t_ms = line["t_ns"].as_u64().unwrap_or(0) as f64 / 1e6;
@@ -721,16 +776,26 @@ impl Drive {
                         Ok(answer)
                     }
                     LiveControl::Resume => {
-                        if let Some((since, _)) = state.paused.take() {
-                            let paused =
-                                u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
-                            state.paused_ms = state.paused_ms.saturating_add(paused);
-                            state.ends_at = state.ends_at.saturating_add(paused);
+                        if state.unpause() {
                             self.live
                                 .send("resumed", json!({"t_ms": t_ms, "ends_at": state.ends_at}));
                             self.live.send("limit", json!({"ends_at": state.ends_at}));
                         }
                         Ok(json!({"ok": true, "t_ms": t_ms, "ends_at": state.ends_at}))
+                    }
+                    LiveControl::Reset => {
+                        reset = true;
+                        let run = line["run"].as_str().unwrap_or_default().to_string();
+                        state.run = run.clone();
+                        // The new board runs from the start.
+                        state.unpause();
+                        drop(state);
+                        self.renew();
+                        let data = json!({"run": run, "ends_at": self.live.ends_at()});
+                        self.live.send("reset", data.clone());
+                        let mut answer = data;
+                        answer["ok"] = json!(true);
+                        Ok(answer)
                     }
                 }
             }
@@ -740,6 +805,32 @@ impl Drive {
             )),
         };
         let _ = reply.send(answer);
+        reset
+    }
+
+    /// The run to post for a board started again: the one not posted yet,
+    /// whose window had not run, else the posted one's twin in a run
+    /// folder of its own. What the helper said so far stays with the run
+    /// it was said of.
+    fn renew(&mut self) {
+        let _ = std::fs::write(self.venue.run_dir.join(OUTPUT_LOG), &self.said);
+        self.said.clear();
+        if self.built.is_some() {
+            return;
+        }
+        let Some(mut built) = self.spare.take() else {
+            return;
+        };
+        match built.afresh() {
+            Ok(folder) => {
+                self.venue.run_dir = folder.to_path_buf();
+                self.built = Some(built);
+            }
+            Err(e) => eprintln!(
+                "The reset of live run {} will not be posted: {}",
+                self.live.id, e.message
+            ),
+        }
     }
 
     /// Judge the run from the recording the helper read back, and post
@@ -914,6 +1005,10 @@ fn print_event(event: &LiveEvent) {
             event.data["line"].as_str().unwrap_or("")
         ),
         "checks" => eprintln!("The check's time is up and the run is judged; the board runs on."),
+        "reset" => eprintln!(
+            "The board starts again from 0 (sim86 run {}).",
+            event.data["run"].as_str().unwrap_or("?")
+        ),
         "ended" => {
             let detail = event.data["detail"].as_str().unwrap_or("");
             let sep = if detail.is_empty() { "" } else { ": " };
@@ -943,7 +1038,7 @@ pub async fn run(args: RunArgs, limit_s: u64, json: bool) -> Result<(), CliError
             if !json {
                 eprintln!(
                     "Live on sim86 for {limit_s} s (sim86 run {}). Ctrl-C stops it.",
-                    live.sim86_run
+                    live.sim86_run()
                 );
             }
             loop {
@@ -1139,14 +1234,13 @@ mod tests {
         let (over_tx, over) = watch::channel(false);
         let live = Arc::new(Live {
             id: "l1".into(),
-            sim86_run: "r1".into(),
             started_at: unix_ms(),
             helper: sim86::Helper {
                 python: "python".into(),
                 script: "ter_sim86.py".into(),
                 key: None,
             },
-            state: Mutex::new(State::new(unix_ms() + 60_000)),
+            state: Mutex::new(State::new("r1".into(), unix_ms() + 60_000)),
             events,
             stop,
             control,
