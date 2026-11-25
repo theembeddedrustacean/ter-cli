@@ -26,7 +26,7 @@ ter-sdk.workspace = true
 ter-telemetry.workspace = true
 ter-flash.workspace = true
 ter-gen.workspace = true
-ter-remote = { path = "../ter-remote", version = "0.1.8" }
+ter-remote = { path = "../ter-remote", version = "0.1.9" }
 tokio = { workspace = true, features = ["io-util", "process", "signal", "time"] }
 toml.workspace = true
 webbrowser.workspace = true
