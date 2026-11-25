@@ -45,6 +45,8 @@ const START_BUDGET: Duration = Duration::from_secs(420);
 const STOP_PATIENCE: Duration = Duration::from_secs(30);
 /// How long a run goes on with nobody listening to its events.
 const UNWATCHED: Duration = Duration::from_secs(15);
+/// How long the site may take to take a run's checks.
+const POST_PATIENCE: Duration = Duration::from_secs(60);
 /// sim86's own wall-clock limit, past ter's cap: what ends a run whose
 /// ter and helper are both gone.
 const LAST_RESORT_MS: u64 = (LIVE_CAP_S + 60) * 1_000;
@@ -56,6 +58,15 @@ fn unwatched() -> Duration {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .map_or(UNWATCHED, Duration::from_secs)
+}
+
+/// A wait, or the environment's `name` in seconds when set (tests set
+/// them short).
+fn patience(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .map_or(default, Duration::from_secs)
 }
 
 fn unix_ms() -> u64 {
@@ -278,7 +289,7 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
         return posted(built, run::infra(&e)).await;
     }
     let program = venue.program.clone().unwrap_or(elf);
-    let request = recording.join(REQUEST_FILE);
+    let request = sim86::absolute(&recording.join(REQUEST_FILE));
     let asked =
         serde_json::to_string_pretty(&venue.live_request(&stimuli, &program, LAST_RESORT_MS))
             .expect("the request serialises");
@@ -319,7 +330,8 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
     let mut lines = BufReader::new(child.stdout.take().expect("piped")).lines();
 
     let mut said = String::new();
-    let began = tokio::time::timeout(START_BUDGET, async {
+    let start_budget = patience("TER_LIVE_START_SECS", START_BUDGET);
+    let began = tokio::time::timeout(start_budget, async {
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
@@ -346,20 +358,30 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
             kind: FailureKind::Helper,
             message: format!(
                 "sim86 did not start the run within {} s",
-                START_BUDGET.as_secs()
+                start_budget.as_secs()
             ),
         })
     });
     let sim86_run = match began {
         Ok(run) => run,
         Err(failure) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            // A closed pipe tells the helper to stop: a run it is still
+            // making is stopped as soon as it exists. Only a helper that
+            // does not answer to that is killed.
+            drop(stdin);
+            let stop_patience = patience("TER_LIVE_STOP_PATIENCE_SECS", STOP_PATIENCE);
+            if tokio::time::timeout(stop_patience, child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
             let _ = std::fs::write(recording.join(OUTPUT_LOG), &said);
             let _ = std::fs::remove_file(recording.join(FIRMWARE));
             if failure.kind == FailureKind::Busy {
                 return Err(CliError::new(
-                    "venue_unavailable",
+                    "no_capacity",
                     "sim86 has no free capacity right now. Try again in a minute.",
                 ));
             }
@@ -427,8 +449,46 @@ struct Drive {
     said: String,
 }
 
+/// Ends the run for whoever follows it, whatever happens to the task
+/// that drives it: a task that panics ends it as a sim86 error.
+struct Ending {
+    live: Arc<Live>,
+    over: Option<watch::Sender<bool>>,
+}
+
+impl Ending {
+    fn end(&mut self, reason: &str, detail: &str) {
+        let Some(over) = self.over.take() else {
+            return;
+        };
+        eprintln!("Live run {} ended: {reason}", self.live.id);
+        let data = json!({"reason": reason, "detail": detail});
+        {
+            let mut state = self.live.state();
+            state.ended = Some(data.clone());
+            self.live.send("ended", data);
+        }
+        let _ = over.send(true);
+    }
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        self.end("sim-error", "ter stopped following the run");
+    }
+}
+
 impl Drive {
     async fn run(mut self, over: watch::Sender<bool>) {
+        let mut ending = Ending {
+            live: self.live.clone(),
+            over: Some(over),
+        };
+        let stop_patience = patience("TER_LIVE_STOP_PATIENCE_SECS", STOP_PATIENCE);
+        let post_patience = patience("TER_LIVE_POST_SECS", POST_PATIENCE);
+        // The checks being posted: the site may be slow, and the run is
+        // still followed and stopped meanwhile.
+        let mut posting: Option<tokio::task::JoinHandle<Value>> = None;
         let began = Instant::now();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut program = ProgramLines::new(&self.venue.plan);
@@ -461,8 +521,7 @@ impl Drive {
                                 Some(LiveLine::Recording(answer)) => {
                                     if let Some(mut built) = self.built.take() {
                                         built.ran(began.elapsed(), "on sim86");
-                                        let checks = self.checks(built, &answer).await;
-                                        self.live.send("checks", checks);
+                                        posting = Some(self.checks(built, &answer, post_patience));
                                     }
                                 }
                                 Some(LiveLine::Ended { reason }) => sim_reason = Some(reason),
@@ -473,9 +532,14 @@ impl Drive {
                     }
                     None
                 }
+                checks = async { posting.as_mut().expect("posting").await }, if posting.is_some() => {
+                    posting = None;
+                    self.live.send("checks", checks.unwrap_or_else(|e| unposted(&e.to_string())));
+                    None
+                }
                 Some(reason) = self.stop_rx.recv() => Some(reason),
                 _ = tick.tick() => match asked {
-                    Some((_, at)) if at.elapsed() > STOP_PATIENCE => {
+                    Some((_, at)) if at.elapsed() > stop_patience => {
                         let _ = self.child.start_kill();
                         break;
                     }
@@ -494,8 +558,8 @@ impl Drive {
             };
             if let (Some(reason), None) = (stop, asked) {
                 asked = Some((reason, Instant::now()));
-                // The helper reads the run back if it still has to, and
-                // stops it; a closed pipe tells it the same.
+                // The helper stops the sim86 run at once; a closed pipe
+                // tells it the same.
                 if let Some(mut stdin) = self.stdin.take() {
                     let _ = stdin.write_all(b"stop\n").await;
                     let _ = stdin.flush().await;
@@ -506,23 +570,31 @@ impl Drive {
         let _ = std::fs::write(self.venue.run_dir.join(OUTPUT_LOG), &self.said);
         let _ = std::fs::remove_file(self.venue.run_dir.join(FIRMWARE));
 
+        // Checks still being posted come before the end; the post has a
+        // limit of its own.
+        if let Some(posting) = posting.take() {
+            let checks = posting.await;
+            self.live.send(
+                "checks",
+                checks.unwrap_or_else(|e| unposted(&e.to_string())),
+            );
+        }
         // A run that ended before the check's time was up is not an
         // attempt: it is dropped unposted.
         drop(self.built.take());
         let (reason, detail) = ended_as(asked.map(|(reason, _)| reason), failure, sim_reason);
-        eprintln!("Live run {} ended: {reason}", self.live.id);
-        let data = json!({"reason": reason, "detail": detail});
-        {
-            let mut state = self.live.state();
-            state.ended = Some(data.clone());
-            self.live.send("ended", data);
-        }
-        let _ = over.send(true);
+        ending.end(reason, &detail);
     }
 
-    /// Judge and post the run from the recording the helper read back:
-    /// the `checks` event, which is what `/run` answers for the same run.
-    async fn checks(&self, built: Built, answer: &Answer) -> Value {
+    /// Judge the run from the recording the helper read back, and post
+    /// it: the `checks` event, which is what `/run` answers for the same
+    /// run, once the site has it or has not answered within `patience`.
+    fn checks(
+        &self,
+        built: Built,
+        answer: &Answer,
+        patience: Duration,
+    ) -> tokio::task::JoinHandle<Value> {
         let _ = std::fs::write(self.venue.run_dir.join(OUTPUT_LOG), &self.said);
         let recorded = self
             .venue
@@ -531,27 +603,42 @@ impl Drive {
             Ok(rec) => run::judge(&rec, &self.text, &self.venue.run_dir),
             Err(failure) => Ok(run::infra(&self.venue.failure(&failure))),
         };
-        match outcome {
-            Ok(outcome) => self.posted(built.finish(outcome).await),
-            Err(e) => json!({"error": {"code": e.code, "message": e.message}}),
-        }
-    }
-
-    fn posted(&self, done: Result<Done, CliError>) -> Value {
-        match done {
-            Ok(done) => {
-                eprintln!(
-                    "Posted {}: build {}, check {}",
-                    done.answer["name"].as_str().unwrap_or("?"),
-                    done.answer["build_status"].as_str().unwrap_or("?"),
-                    done.answer["check_status"].as_str().unwrap_or("?")
-                );
-                let answer = done.answer.clone();
-                self.live.state().done = Some(Box::new(done));
-                answer
+        let live = self.live.clone();
+        tokio::spawn(async move {
+            match outcome {
+                Ok(outcome) => match tokio::time::timeout(patience, built.finish(outcome)).await {
+                    Ok(done) => checks_of(&live, done),
+                    Err(_) => json!({"error": {"code": "network_error", "message": format!(
+                        "The site did not answer within {} s, so the run may not be recorded there.",
+                        patience.as_secs()
+                    )}}),
+                },
+                Err(e) => json!({"error": {"code": e.code, "message": e.message}}),
             }
-            Err(e) => json!({"error": {"code": e.code, "message": e.message}}),
+        })
+    }
+}
+
+/// The `checks` event of a post that went wrong inside ter.
+fn unposted(why: &str) -> Value {
+    json!({"error": {"code": "internal", "message": format!("The run could not be posted: {why}")}})
+}
+
+/// The `checks` event of a posted run, which is kept for whoever reports it.
+fn checks_of(live: &Live, done: Result<Done, CliError>) -> Value {
+    match done {
+        Ok(done) => {
+            eprintln!(
+                "Posted {}: build {}, check {}",
+                done.answer["name"].as_str().unwrap_or("?"),
+                done.answer["build_status"].as_str().unwrap_or("?"),
+                done.answer["check_status"].as_str().unwrap_or("?")
+            );
+            let answer = done.answer.clone();
+            live.state().done = Some(Box::new(done));
+            answer
         }
+        Err(e) => json!({"error": {"code": e.code, "message": e.message}}),
     }
 }
 
@@ -572,6 +659,10 @@ fn ended_as(
         // Stopped from sim86's own page or tools.
         Some(reason) if reason == "user-stop" => ("user-stop", "stopped on sim86".into()),
         Some(reason) if reason.contains("exit") => ("firmware-exit", reason),
+        // The helper lost its connection to the run.
+        Some(reason) if reason == "disconnected" => {
+            ("sim-error", "the connection to sim86 was lost".into())
+        }
         Some(reason)
             if ["realtime", "duration", "limit"]
                 .iter()
@@ -715,5 +806,56 @@ mod tests {
             ("sim-error", "bad pin value".into())
         );
         assert_eq!(ended_as(None, None, None).0, "sim-error");
+        assert_eq!(
+            ended_as(None, None, Some("disconnected".into())),
+            ("sim-error", "the connection to sim86 was lost".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_task_panics_ends_as_a_sim86_error() {
+        let (events, _) = broadcast::channel(16);
+        let (stop, _stop_rx) = mpsc::unbounded_channel();
+        let (over_tx, over) = watch::channel(false);
+        let live = Arc::new(Live {
+            id: "l1".into(),
+            sim86_run: "r1".into(),
+            started_at: unix_ms(),
+            helper: sim86::Helper {
+                python: "python".into(),
+                script: "ter_sim86.py".into(),
+                key: None,
+            },
+            state: Mutex::new(State {
+                ends_at: unix_ms() + 60_000,
+                ended: None,
+                listeners: 0,
+                alone_since: Instant::now(),
+                done: None,
+            }),
+            events,
+            stop,
+            over,
+        });
+        let mut listening = live.listen().expect("a run that is on");
+        let ending = Ending {
+            live: live.clone(),
+            over: Some(over_tx),
+        };
+        let task = tokio::spawn(async move {
+            let _ending = ending;
+            panic!("the run's task fails");
+        });
+        assert!(task.await.is_err());
+        tokio::time::timeout(Duration::from_secs(5), live.over())
+            .await
+            .expect("the run is over");
+        assert_eq!(
+            live.ended_as(),
+            Some(("sim-error".into(), "ter stopped following the run".into()))
+        );
+        let event = listening.recv().await.expect("the ended event");
+        assert_eq!(event.name, "ended");
+        assert!(live.listen().is_none());
     }
 }

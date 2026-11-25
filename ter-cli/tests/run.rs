@@ -113,6 +113,7 @@ case "$2" in
     echo "{\"helper\": 4, \"ok\": true, \"python\": \"3.12.3\", \"sim86\": \"0.1.4\", \"key\": $key}" ;;
   balance) cat "$here/balance.json" ;;
   run)
+    [ -f "$3" ] || { echo "no request at $3" >&2; exit 2; }
     cp "$3" "$here/got-request.json"
     echo "$SIM86_TELEMETRY" > "$here/got-telemetry"
     echo "sim86: waiting" >&2
@@ -121,6 +122,7 @@ case "$2" in
     # The run starts, and a second later does what live.jsonl says. Then
     # it runs until ter says stop or goes away, unless live-ends has it
     # end by itself.
+    [ -f "$3" ] || { echo "no request at $3" >&2; exit 2; }
     cp "$3" "$here/got-live-request.json"
     if [ -f "$here/live-fails" ]; then cat "$here/live-fails"; exit 0; fi
     echo '{"ev": "started", "run": "sim86-run-1"}'
@@ -475,6 +477,24 @@ impl Machine {
         };
         std::fs::write(bin.join("run.json"), answer).unwrap();
         self.sim86 = true;
+        self
+    }
+
+    /// Have a real Python with a stand-in sim86 package
+    /// (tests/fixtures/sim86/package) run ter's own helper, in place of
+    /// the stand-in Python; files beside it in [`Self::sim86_bin`] steer
+    /// the package and say what it was asked.
+    #[cfg(unix)]
+    fn with_sim86_package(self) -> Self {
+        let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sim86/package");
+        std::fs::write(
+            self.sim86_bin().join("python"),
+            format!(
+                "#!/bin/sh\nFAKE_SIM86_DIR=\"$(dirname \"$0\")\" PYTHONPATH='{}' exec python3 \"$@\"\n",
+                package.display()
+            ),
+        )
+        .unwrap();
         self
     }
 
@@ -3039,7 +3059,7 @@ async fn a_live_run_that_ends_before_its_checks_is_not_posted_and_one_that_never
     let (status, _, v) = served.run(live_ask(60)).await;
     assert_eq!(
         (status, v["error"]["code"].as_str()),
-        (503, Some("venue_unavailable")),
+        (503, Some("no_capacity")),
         "{v}"
     );
     assert!(
@@ -3756,6 +3776,35 @@ async fn a_sim86_run_is_recorded_judged_and_posted() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn a_sim86_run_of_a_folder_named_from_elsewhere_finds_its_files() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]).on_sim86(
+        SIM86_HEARTBEAT_CHECK,
+        SIM86_UFERRIS,
+        SIM86_UFERRIS_PINS,
+        "blinky.json",
+    );
+    let course = m.exercise().parent().unwrap().to_path_buf();
+
+    // The helper runs in the run folder: every path it is given is whole.
+    let (ok, v) = m.json_in(
+        &server.uri(),
+        &["run", "--sim", "sim86", &format!("../{COURSE}/{EXERCISE}")],
+        &course,
+    );
+
+    assert!(ok, "{v}");
+    let p = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(p["check_status"], "passed", "{v}");
+    let request: Value = serde_json::from_str(&m.sim86_saw("got-request.json")).unwrap();
+    for path in [&request["board"], &request["firmware"]["mcu"]] {
+        let path = Path::new(path.as_str().unwrap());
+        assert!(path.is_absolute() && path.is_file(), "{path:?}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn sim86_is_the_simulator_of_an_exercise_with_no_wokwi_circuit() {
     let server = site("0.1.0", run_answer()).await;
     let m = Machine::with_exercise(GOOD, &["hardware", "simulation"]).on_sim86(
@@ -4054,4 +4103,207 @@ async fn a_press_on_sim86_is_planned_before_the_board_starts_and_checked_after()
     assert!(msg.contains("did not apply the setup's input"), "{msg}");
     let runs = posted(&server, "run").await;
     assert_eq!(runs[1]["payload"]["check_status"], "not_run");
+}
+
+/// A heartbeat check longer than the 10 s sim86 holds of a net.
+const SIM86_LONG_CHECK: &str = "\
+timeout_ms: 13500
+assert:
+  - id: boot
+    serial_contains: \"ESP-ROM:esp32c3\"
+    within_ms: 2000
+  - id: heartbeat-rate
+    pin: user_led
+    toggles_per_s: { min: 3.6, max: 4.4 }
+    window_ms: [900, 12900]
+  - id: flash-width
+    pin: user_led
+    pulse_width_ms: { min: 80, max: 120 }
+    window_ms: [900, 12900]
+";
+
+/// The heartbeat exercise with [`SIM86_LONG_CHECK`], run by ter's own
+/// helper on the stand-in sim86 package.
+#[cfg(unix)]
+fn long_sim86_machine() -> Machine {
+    let m = live_machine(GOOD, "").with_sim86_package();
+    std::fs::write(m.exercise().join("check.yaml"), SIM86_LONG_CHECK).unwrap();
+    m
+}
+
+/// `ter serve` with `envs` set.
+fn serve_with_env(m: &Machine, site: &str, envs: &[(&str, &str)]) -> Served {
+    let mut cmd = m.command(site, &["serve", "--port", "0"], m.courses.path());
+    cmd.envs(envs.iter().copied());
+    m.serve_from(cmd, site, &[])
+}
+
+/// Wait up to `secs` for `file` beside the stand-in for sim86 to hold
+/// `text`.
+async fn sim86_says(m: &Machine, file: &str, text: &str, secs: u64) -> bool {
+    let path = m.sim86_bin().join(file);
+    for _ in 0..secs * 10 {
+        if std::fs::read_to_string(&path).is_ok_and(|t| t.contains(text)) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// sim86 answers for 10 s windows and holds a net's last 10 s only: the
+/// helper runs the board a piece at a time and reads each piece while it
+/// is there.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sim86_run_longer_than_sim86_holds_is_read_in_pieces_and_judged() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = long_sim86_machine();
+
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+
+    assert!(ok, "{v}");
+    let p = &posted(&server, "run").await[0]["payload"];
+    assert_eq!(p["check_status"], "passed", "{v}");
+    let events = std::fs::read_to_string(m.exercise().join(".runs/1/events.jsonl")).unwrap();
+    for t_us in [143_000, 13_443_000] {
+        assert!(
+            events.contains(&format!(r#"{{"t_us":{t_us},"kind":"pin_edge""#)),
+            "{t_us}: {events}"
+        );
+    }
+    assert!(m.sim86_saw("stopped").contains("fake-run-1"));
+}
+
+/// A live run longer than sim86 holds is read as it goes, judged, and
+/// stopped on sim86 by the helper when the page says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_long_live_run_is_read_as_it_goes_and_stopped_on_sim86() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = long_sim86_machine();
+    std::fs::write(m.sim86_bin().join("speed"), "4").unwrap();
+    let served = m.serve(&server.uri());
+
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["sim86_run"], "fake-run-1", "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let mut events = LiveStream::open(&served, &id).await;
+    let (checks, before) = events.until("checks").await;
+    assert_eq!(checks["check_status"], "passed", "{checks}");
+    assert_eq!(checks["events_end_us"], 13_500_000);
+    assert!(
+        before.iter().filter(|e| *e == "pin").count() > 50,
+        "{before:?}"
+    );
+    assert!(before.contains(&"serial".to_string()), "{before:?}");
+
+    assert_eq!(
+        served.live_post(&id, "stop", json!({})).await,
+        (200, json!({"ok": true}))
+    );
+    let (ended, _) = events.until("ended").await;
+    assert_eq!(ended, json!({"reason": "user-stop", "detail": ""}));
+    assert!(m.sim86_saw("stopped").contains("fake-run-1"));
+}
+
+/// A helper stuck waiting on sim86 still stops the sim86 run the moment
+/// ter says stop, and ter kills it once it has waited long enough.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_helper_stuck_on_sim86_stops_the_run_at_once_and_is_killed() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = long_sim86_machine();
+    std::fs::write(m.sim86_bin().join("hang-observe"), "").unwrap();
+    let served = serve_with_env(&m, &server.uri(), &[("TER_LIVE_STOP_PATIENCE_SECS", "2")]);
+
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let mut events = LiveStream::open(&served, &id).await;
+    let asked = std::time::Instant::now();
+    served.live_post(&id, "stop", json!({})).await;
+    assert!(
+        sim86_says(&m, "stopped", "fake-run-1", 2).await,
+        "stopped on sim86 before ter gives up on the helper"
+    );
+    let (ended, _) = events.until("ended").await;
+    assert_eq!(ended, json!({"reason": "user-stop", "detail": ""}));
+    assert!(
+        asked.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        asked.elapsed()
+    );
+}
+
+/// ter gives up on a run sim86 is slow to make; the helper stops it as
+/// soon as it exists.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_sim86_is_slow_to_make_is_stopped_once_it_exists() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = long_sim86_machine();
+    std::fs::write(m.sim86_bin().join("slow-start"), "3").unwrap();
+    let served = serve_with_env(&m, &server.uri(), &[("TER_LIVE_START_SECS", "1")]);
+
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["check_status"], "not_run", "{v}");
+    assert!(v.get("live").is_none(), "{v}");
+    assert!(m.sim86_saw("runs").contains("fake-run-1"));
+    assert!(sim86_says(&m, "stopped", "fake-run-1", 5).await);
+}
+
+/// A site that does not answer holds up neither the run's stop nor its
+/// end: the checks say the site did not answer.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_site_that_does_not_answer_holds_up_no_live_run() {
+    let server = site("0.1.0", run_answer().set_delay(Duration::from_secs(10))).await;
+    let m = live_machine(GOOD, &live_blinky());
+    let served = serve_with_env(&m, &server.uri(), &[("TER_LIVE_POST_SECS", "2")]);
+
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let mut events = LiveStream::open(&served, &id).await;
+    events.until("serial").await;
+    // The recording follows the serial line; the post is then on its way.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    served.live_post(&id, "stop", json!({})).await;
+    assert!(
+        sim86_says(&m, "got-stop", "stop", 1).await,
+        "the helper is told at once"
+    );
+    let (checks, _) = events.until("checks").await;
+    assert_eq!(checks["error"]["code"], "network_error", "{checks}");
+    let (ended, _) = events.until("ended").await;
+    assert_eq!(ended["reason"], "user-stop");
+}
+
+/// Two runs asked for at once: the second stops the first, and no run is
+/// left going that nobody can stop.
+#[cfg(unix)]
+#[tokio::test]
+async fn two_live_runs_asked_for_at_once_leave_one_going() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = live_machine(GOOD, &live_blinky());
+    let served = m.serve(&server.uri());
+
+    let ((s1, _, a), (s2, _, b)) = tokio::join!(served.run(live_ask(60)), served.run(live_ask(60)));
+    assert_eq!((s1, s2), (200, 200), "{a} {b}");
+    let (a, b) = (a["live"].as_str().unwrap(), b["live"].as_str().unwrap());
+    assert_ne!(a, b);
+    assert!(
+        sim86_says(&m, "got-stop", "stop", 10).await,
+        "the first run is stopped"
+    );
+    let mut statuses = [served.live_status(a).await, served.live_status(b).await];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 404]);
+    for id in [a, b] {
+        served.live_post(id, "stop", json!({})).await;
+    }
+    assert!(sim86_says(&m, "got-stop", "stop\nstop", 10).await);
 }

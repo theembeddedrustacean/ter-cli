@@ -147,7 +147,9 @@ impl ServeError {
             "timeout" => StatusCode::GATEWAY_TIMEOUT,
             "busy" | "bench_busy" | "limit_cap" | "ended" => StatusCode::CONFLICT,
             "outdated" => StatusCode::UPGRADE_REQUIRED,
-            "venue_unavailable" | "bench_offline" => StatusCode::SERVICE_UNAVAILABLE,
+            "venue_unavailable" | "bench_offline" | "no_capacity" => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -436,8 +438,9 @@ async fn run(State(ctx): State<Ctx>, headers: HeaderMap, body: Bytes) -> Respons
 }
 
 /// How often a quiet event stream sends a comment line, so a page that
-/// went away is noticed.
-const KEEP_ALIVE: Duration = Duration::from_secs(5);
+/// went away is noticed: a write to a peer that is gone fails only a
+/// write or two after it went.
+const KEEP_ALIVE: Duration = Duration::from_secs(1);
 
 /// A live run's events as the body of an SSE response.
 struct EventStream {
@@ -1097,6 +1100,7 @@ mod tests {
         let status = |code: &str| ServeError::new(code, "m").status();
         assert_eq!(status("bench_busy"), StatusCode::CONFLICT);
         assert_eq!(status("bench_offline"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status("no_capacity"), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(status("wrong_board"), StatusCode::BAD_REQUEST);
         assert_eq!(status("unknown_bench"), StatusCode::NOT_FOUND);
         assert_eq!(status("not_observable"), StatusCode::BAD_REQUEST);

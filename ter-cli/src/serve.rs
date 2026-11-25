@@ -177,13 +177,15 @@ const REPLACE_PATIENCE: Duration = Duration::from_secs(20);
 const LIVE_START_ALLOWANCE: Duration = Duration::from_secs(480);
 
 async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFailure> {
+    let turn = inner.turn.clone().lock_owned().await;
     // One live run at a time, and none left running under another run.
+    // Taken with the turn, so two runs asked for at once cannot both find
+    // none to stop.
     let before = inner.live.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(before) = before.filter(|live| !live.ended()) {
         before.stop("replaced");
         let _ = tokio::time::timeout(REPLACE_PATIENCE, before.over()).await;
     }
-    let turn = inner.turn.clone().lock_owned().await;
     let session = Session::open()?;
     let user = session
         .client
@@ -263,7 +265,14 @@ async fn handle(inner: Arc<Inner>, request: RunRequest) -> Result<Value, ServeFa
                         // run stops by itself.
                         Started::Live(live, _events) => {
                             let answer = live.answer();
-                            *inner.live.lock().unwrap_or_else(|e| e.into_inner()) = Some(live);
+                            let before = inner
+                                .live
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .replace(live);
+                            if let Some(before) = before.filter(|live| !live.ended()) {
+                                before.stop("replaced");
+                            }
                             Err(answer)
                         }
                     }),
