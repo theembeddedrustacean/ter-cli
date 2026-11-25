@@ -25,6 +25,11 @@
 //! or a run sim86 did not start, answers as any `/run` does. There is one
 //! live run at a time: any new `/run` stops the one before.
 //!
+//! A page Run that would replace code edited in the folder since ter last
+//! wrote it backs that code up first, in `.ter/backup/<UTC stamp>/`, and
+//! the answer says where (`backup`). `/code` answers the folder's code and
+//! whether it was edited there ([`pagesync`]).
+//!
 //! One run at a time: a second request waits for the first, since both
 //! would build in the same course cache. A live run holds that turn only
 //! until its board runs.
@@ -54,6 +59,7 @@ use crate::config::Config;
 use crate::exercises;
 use crate::live::{self, Live, Started};
 use crate::output::CliError;
+use crate::pagesync;
 use crate::remote;
 use crate::run::{self, CHECK_YAML, RunArgs};
 use crate::session::Session;
@@ -185,6 +191,14 @@ impl Service for Serve {
         })
     }
 
+    fn code(&self, exercise_id: String, user: Option<String>) -> RunFuture {
+        Box::pin(async move {
+            code(exercise_id, user)
+                .await
+                .map_err(|e| ServeError::new(&e.code, e.message))
+        })
+    }
+
     fn run(&self, request: RunRequest) -> RunFuture {
         let inner = self.0.clone();
         let abort = Abort::default();
@@ -205,6 +219,38 @@ impl Service for Serve {
             answer
         })
     }
+}
+
+/// Refuse a page signed in as `page_user` when ter here is paired with
+/// another account, as `wrong_account`.
+async fn same_account(session: &Session, page_user: Option<&str>) -> Result<(), CliError> {
+    let user = session
+        .client
+        .ping()
+        .await
+        .map_err(|e| session.forget_dead_token(e.into()))?
+        .user
+        .clone();
+    if let Some(page_user) = page_user
+        && page_user != user
+    {
+        return Err(CliError::new(
+            "wrong_account",
+            format!(
+                "ter on this machine is paired with {user}, and the page is signed in as {page_user}. Sign in to the site as {user}, or pair ter with your own account (`ter login`)."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `/code`: the code in the folder `exercise_id` was fetched to, for the
+/// page of the account ter is paired with. Nothing is fetched or written.
+async fn code(exercise_id: String, user: Option<String>) -> Result<Value, CliError> {
+    let session = Session::open()?;
+    same_account(&session, user.as_deref()).await?;
+    let dir = exercises::fetched_dir(&exercise_id)?;
+    Ok(pagesync::code_answer(dir.as_deref()))
 }
 
 /// Stops a run's build if its request goes before the run is over.
@@ -242,24 +288,7 @@ async fn handle(
         let _ = tokio::time::timeout(REPLACE_PATIENCE, before.over()).await;
     }
     let session = Session::open()?;
-    let user = session
-        .client
-        .ping()
-        .await
-        .map_err(|e| session.forget_dead_token(e.into()))?
-        .user
-        .clone();
-    if let Some(page_user) = &request.user
-        && page_user != &user
-    {
-        return Err(CliError::new(
-            "wrong_account",
-            format!(
-                "ter on this machine is paired with {user}, and the page is signed in as {page_user}. Sign in to the site as {user}, or pair ter with your own account (`ter login`)."
-            ),
-        )
-        .into());
-    }
+    same_account(&session, request.user.as_deref()).await?;
 
     let dir = match exercises::fetched_dir(&request.exercise_id)? {
         Some(dir) => {
@@ -276,7 +305,9 @@ async fn handle(
                 .map_err(|e| session.forget_dead_token(e))?
         }
     };
+    let backup = backup_page_run(&dir, &request)?;
     let not_written = write_files(&dir, &request)?;
+    pagesync::wrote(&dir)?;
     let venue = request.venue.clone();
     let mode = mode_for(&dir, request.mode.as_deref());
     let limit = limit(&dir, mode, venue.as_deref());
@@ -373,6 +404,9 @@ async fn handle(
             if !not_written.is_empty() {
                 live["not_written"] = json!(not_written);
             }
+            if let Some(backup) = &backup {
+                live["backup"] = json!(backup);
+            }
             eprintln!(
                 "Live run {} started on sim86",
                 live["live"].as_str().unwrap_or("?")
@@ -384,6 +418,9 @@ async fn handle(
     if !not_written.is_empty() {
         answer["not_written"] = json!(not_written);
     }
+    if let Some(backup) = &backup {
+        answer["backup"] = json!(backup);
+    }
     eprintln!(
         "Posted {}: build {}, check {}",
         answer["name"].as_str().unwrap_or("?"),
@@ -391,6 +428,28 @@ async fn handle(
         answer["check_status"].as_str().unwrap_or("?")
     );
     Ok(answer)
+}
+
+/// Before the page's files replace code edited in `dir` since ter last
+/// wrote it, copy that code to a backup, and say where (as the learner
+/// reads a path).
+fn backup_page_run(dir: &Path, request: &RunRequest) -> Result<Option<String>, CliError> {
+    let incoming = request
+        .files
+        .iter()
+        .filter(|f| editable(&f.path))
+        .map(|f| (f.path.clone(), f.content.clone().into_bytes()))
+        .collect();
+    let Some(backup) = pagesync::backup_if_lost(dir, &incoming, std::time::SystemTime::now())?
+    else {
+        return Ok(None);
+    };
+    let shown = pagesync::display_path(&backup);
+    eprintln!(
+        "Your code in {} was edited here; it is backed up in {shown}",
+        dir.display()
+    );
+    Ok(Some(shown))
 }
 
 /// Write the page's `src/` files into `dir`, and return the other files

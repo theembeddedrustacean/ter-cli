@@ -1095,3 +1095,131 @@ async fn show_lists_sim86_only_for_a_board_that_shows_every_check() {
     let o = m.ter(&site.uri(), &["ex", "show", id]);
     assert!(!stdout(&o).contains("sim86"), "{}", stdout(&o));
 }
+
+const DRAFTS: &str = "/api/method/ter_courses.exercise_drafts";
+
+#[tokio::test]
+async fn a_new_folder_gets_the_lesson_pages_code_and_an_old_one_is_told() {
+    let site = mock_site().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{DRAFTS}.exercise_draft")))
+        .and(query_param("lesson", "0111 Exercise"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"message": {"draft": {
+            "at": 4_102_444_800_000u64, "starter": "3-0ld",
+            "files": {"src/bin/main.rs": "// page\n", "src/gone.rs": "x"}}}})),
+        )
+        .mount(&site)
+        .await;
+    let m = Machine::new();
+    let o = m.ter(&site.uri(), &["ex", "fetch", BLINKY]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        stdout(&o)
+            .contains("Your code from the lesson page (saved 2100-01-01 00:00 UTC) is in src/.\n"),
+        "{}",
+        stdout(&o)
+    );
+    let dir = m.exercise_dir("esp-gpio", BLINKY);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/bin/main.rs")).unwrap(),
+        "// page\n"
+    );
+    // A draft file the starter does not have stays out, as on the page.
+    assert!(!dir.join("src/gone.rs").exists());
+    let sync: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join(".ter/page-sync.json")).unwrap())
+            .unwrap();
+    assert_eq!(sync["lesson"], "0111 Exercise");
+    assert_eq!(sync["draft_starter"], "3-0ld");
+
+    // Fetched again: src/ stays, and the newer page code is named.
+    std::fs::write(dir.join("src/bin/main.rs"), "// mine\n").unwrap();
+    let o = m.ter(&site.uri(), &["ex", "fetch", BLINKY]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains(&format!(
+            "Your code on the lesson page (saved 2100-01-01 00:00 UTC) is newer than src/ here. `ter ex fetch {BLINKY} --page-code` puts it in src/"
+        )),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/bin/main.rs")).unwrap(),
+        "// mine\n"
+    );
+    let (ok, v) = m.json(&site.uri(), &["ex", "fetch", BLINKY]);
+    assert!(ok, "{v}");
+    assert_eq!(
+        v["page_code"],
+        json!({"saved_at_ms": 4_102_444_800_000u64, "written": [], "newer": true})
+    );
+
+    // --page-code takes it, after a backup of the code edited here.
+    let (ok, v) = m.json(&site.uri(), &["ex", "fetch", BLINKY, "--page-code"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["page_code"]["written"], json!(["src/bin/main.rs"]), "{v}");
+    let backup = PathBuf::from(v["page_code"]["backup"].as_str().unwrap());
+    assert!(backup.starts_with(dir.join(".ter/backup")), "{v}");
+    assert_eq!(
+        std::fs::read_to_string(backup.join("src/bin/main.rs")).unwrap(),
+        "// mine\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/bin/main.rs")).unwrap(),
+        "// page\n"
+    );
+    // Taken: nothing more to say, and nothing more to back up.
+    let o = m.ter(&site.uri(), &["ex", "fetch", BLINKY, "--page-code"]);
+    assert!(
+        stdout(&o).contains("src/ already holds your code from the lesson page"),
+        "{}",
+        stdout(&o)
+    );
+    let o = m.ter(&site.uri(), &["ex", "fetch", BLINKY]);
+    assert!(!stdout(&o).contains("lesson page"), "{}", stdout(&o));
+    assert_eq!(
+        std::fs::read_dir(dir.join(".ter/backup")).unwrap().count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_older_page_draft_is_not_offered_and_a_site_without_drafts_says_nothing() {
+    let site = mock_site().await;
+    let m = Machine::new();
+    // No draft endpoint at all: a plain fetch.
+    let o = m.ter(&site.uri(), &["ex", "fetch", BLINKY]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(!stdout(&o).contains("lesson page"), "{}", stdout(&o));
+    assert_eq!(stderr(&o), "");
+    let o = m.ter(&site.uri(), &["ex", "fetch", BLINKY, "--page-code"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("Your account has no code from the lesson page for this exercise."),
+        "{}",
+        stdout(&o)
+    );
+    // A draft older than src/ here.
+    Mock::given(method("GET"))
+        .and(path(format!("{DRAFTS}.exercise_draft")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"message": {"draft": {
+            "at": 1_000, "starter": "3-0ld", "files": {"src/bin/main.rs": "// old\n"}}}})),
+        )
+        .mount(&site)
+        .await;
+    let o = m.ter(&site.uri(), &["ex", "fetch", BLINKY]);
+    assert!(!stdout(&o).contains("lesson page"), "{}", stdout(&o));
+    let dir = m.exercise_dir("esp-gpio", BLINKY);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/bin/main.rs")).unwrap(),
+        "fn main() {}\n"
+    );
+    // Nothing edited here: --page-code takes it with no backup.
+    let (ok, v) = m.json(&site.uri(), &["ex", "fetch", BLINKY, "--page-code"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["page_code"]["written"], json!(["src/bin/main.rs"]), "{v}");
+    assert!(v["page_code"].get("backup").is_none(), "{v}");
+    assert!(!dir.join(".ter/backup").exists());
+}

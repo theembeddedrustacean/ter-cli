@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use reqwest::{Method, RequestBuilder};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -64,6 +66,14 @@ impl Lesson {
 }
 
 impl Enrollments {
+    /// The lesson an exercise is on, if it is in an enrolled course.
+    pub fn lesson_of(&self, exercise_id: &str) -> Option<&Lesson> {
+        self.courses
+            .iter()
+            .flat_map(|c| &c.lessons)
+            .find(|l| l.all_exercises().any(|e| e.exercise_id == exercise_id))
+    }
+
     /// The course an exercise belongs to, if it is in an enrolled course.
     pub fn course_of(&self, exercise_id: &str) -> Option<&Course> {
         self.courses.iter().find(|c| {
@@ -73,6 +83,34 @@ impl Enrollments {
                 .any(|e| e.exercise_id == exercise_id)
         })
     }
+}
+
+/// The lesson page's draft of a lesson: the learner's code as the page
+/// saved it to their account.
+pub const DRAFT_READ: &str = "ter_courses.exercise_drafts.exercise_draft";
+/// Where a draft is saved.
+pub const DRAFT_SAVE: &str = "ter_courses.exercise_drafts.save_exercise_draft";
+
+/// A learner's code for a lesson as kept on their account: the files that
+/// differ from the starter (none after Reset to starter), the stamp of the
+/// starter they were written over, and when, in ms since the epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Draft {
+    #[serde(default)]
+    pub at: u64,
+    #[serde(default)]
+    pub starter: Option<String>,
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
+}
+
+/// The site's answer to a draft save: `saved` false when the account
+/// already holds a newer one (from `at`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DraftSaved {
+    pub saved: bool,
+    #[serde(default)]
+    pub at: u64,
 }
 
 /// A client for the TER API on one site, as one CLI version, with one
@@ -251,6 +289,39 @@ impl Client {
             .await
     }
 
+    /// This account's draft of `lesson` as the lesson page saved it, or
+    /// `None` when it has none.
+    pub async fn exercise_draft(&self, lesson: &str) -> Result<Option<Draft>, Error> {
+        #[derive(Deserialize)]
+        struct Answer {
+            #[serde(default)]
+            draft: Option<Draft>,
+        }
+        let req = self
+            .authed_url(Method::GET, self.method_url(DRAFT_READ))?
+            .query(&[("lesson", lesson)]);
+        let a: Answer = self.send(DRAFT_READ, req).await?;
+        Ok(a.draft)
+    }
+
+    /// Save `files` as this account's draft of `lesson`, the way the lesson
+    /// page does: the files that differ from the starter, the starter's
+    /// stamp, and the time of the edit in ms. The site keeps the newer.
+    pub async fn save_exercise_draft(
+        &self,
+        lesson: &str,
+        files: &BTreeMap<String, String>,
+        starter: &str,
+        at: u64,
+    ) -> Result<DraftSaved, Error> {
+        let body =
+            serde_json::json!({"lesson": lesson, "files": files, "starter": starter, "at": at});
+        let req = self
+            .authed_url(Method::POST, self.method_url(DRAFT_SAVE))?
+            .json(&body);
+        self.send(DRAFT_SAVE, req).await
+    }
+
     /// Ask for a pairing code. Needs no token.
     pub async fn pair_start(&self) -> Result<PairStart, Error> {
         let req = self
@@ -314,12 +385,19 @@ impl Client {
         format!("{}/api/method/ter_courses.api.{function}", self.site_url)
     }
 
+    /// A whitelisted method of the site outside the TER API, by its full
+    /// dotted name.
+    fn method_url(&self, method: &str) -> String {
+        format!("{}/api/method/{method}", self.site_url)
+    }
+
     fn authed(&self, method: Method, function: &str) -> Result<RequestBuilder, Error> {
+        self.authed_url(method, self.endpoint(function))
+    }
+
+    fn authed_url(&self, method: Method, url: String) -> Result<RequestBuilder, Error> {
         let token = self.token.as_deref().ok_or(Error::NoToken)?;
-        Ok(self
-            .http
-            .request(method, self.endpoint(function))
-            .bearer_auth(token))
+        Ok(self.http.request(method, url).bearer_auth(token))
     }
 
     async fn send<T: DeserializeOwned>(

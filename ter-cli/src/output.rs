@@ -57,3 +57,11 @@ pub fn print_json<T: Serialize>(value: &T) {
         serde_json::to_string_pretty(value).expect("output serialises")
     );
 }
+
+/// A line for whoever is looking into what `ter` did, on stderr when
+/// `TER_DEBUG` is set; nothing otherwise.
+pub fn debug(message: impl AsRef<str>) {
+    if std::env::var_os("TER_DEBUG").is_some_and(|v| !v.is_empty()) {
+        eprintln!("debug: {}", message.as_ref());
+    }
+}

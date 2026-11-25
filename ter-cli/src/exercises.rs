@@ -10,6 +10,7 @@ use ter_telemetry::sim86;
 
 use crate::config::Config;
 use crate::output::{CliError, print_json};
+use crate::pagesync;
 use crate::session::Session;
 
 /// Where exercises go when the account can fetch one that is not in any of
@@ -154,25 +155,48 @@ struct FetchedOut<'a> {
     /// the site no longer sends them.
     #[serde(skip_serializing_if = "Option::is_none")]
     removed: Option<&'a [PathBuf]>,
+    /// The account's code from the lesson page, when it has some and the
+    /// fetch put it in `src/` or found it newer than `src/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_code: Option<PageCodeOut>,
 }
 
-/// From the site, or with `dev` from a curriculum checkout.
+#[derive(Serialize)]
+struct PageCodeOut {
+    /// When the lesson page saved it, in ms since the epoch.
+    saved_at_ms: u64,
+    /// The files of `src/` it rewrote.
+    written: Vec<String>,
+    /// Where the code it replaced went, when it replaced code edited here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<PathBuf>,
+    /// Left out of `src/` because the folder was fetched before: newer
+    /// than `src/`, and `--page-code` puts it there.
+    newer: bool,
+}
+
+/// From the site, or with `dev` from a curriculum checkout. A new folder
+/// gets the account's code from the lesson page over the starter; a folder
+/// fetched before keeps its `src/`, unless `page_code` asks for the
+/// account's code.
 pub async fn fetch(
     id: &str,
     dir: Option<PathBuf>,
     dev: Option<&Path>,
+    page_code: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let (exercise, course, modes) = match dev {
+    let (session, (exercise, course, modes, lesson)) = match dev {
         Some(checkout) => {
             let d = dev::load(checkout, id)?;
-            (d.exercise, d.course, d.modes)
+            (None, (d.exercise, d.course, d.modes, None))
         }
         None => {
             let session = Session::open()?;
-            fetch_from_site(&session, id)
+            let fetched = fetch_from_site(&session, id)
                 .await
-                .map_err(|e| session.forget_dead_token(e))?
+                .map_err(|e| session.forget_dead_token(e))?;
+            (Some(session), fetched)
         }
     };
     let mut scaffold = Scaffold::check(&exercise)?;
@@ -190,6 +214,13 @@ pub async fn fetch(
         }
         _ => (scaffold.write(&dest, &course, modes)?, None),
     };
+    pagesync::note_starter(&dir, &exercise, lesson.as_deref(), refreshed.is_none())?;
+    let from_page = match &session {
+        Some(session) => {
+            take_page_code(session, &dir, &exercise, refreshed.is_none(), page_code).await?
+        }
+        None => None,
+    };
 
     if json {
         print_json(&FetchedOut {
@@ -205,6 +236,7 @@ pub async fn fetch(
             dev: dev.is_some(),
             updated: refreshed.as_ref().map(|r| r.updated.as_slice()),
             removed: refreshed.as_ref().map(|r| r.removed.as_slice()),
+            page_code: from_page,
         });
         return Ok(());
     }
@@ -219,6 +251,27 @@ pub async fn fetch(
             println!("  {}", updated_line(refreshed));
         }
     }
+    if let Some(code) = &from_page {
+        let when = pagesync::when(code.saved_at_ms);
+        if code.newer {
+            println!(
+                "Your code on the lesson page (saved {when}) is newer than src/ here. `ter ex fetch {} --page-code` puts it in src/, after a backup of yours.",
+                ter.exercise
+            );
+        } else if code.written.is_empty() {
+            println!("src/ already holds your code from the lesson page (saved {when}).");
+        } else {
+            println!("Your code from the lesson page (saved {when}) is in src/.");
+            if let Some(backup) = &code.backup {
+                println!(
+                    "  Your code before it is in {}.",
+                    pagesync::display_path(backup)
+                );
+            }
+        }
+    } else if page_code && refreshed.is_some() {
+        println!("Your account has no code from the lesson page for this exercise.");
+    }
     println!("  course  {}", ter.course);
     println!("  target  {}", ter.target);
     println!("  mode    {} (allowed: {})", ter.mode, ter.modes.join(", "));
@@ -232,10 +285,54 @@ pub async fn fetch(
 /// Fetch `id` from the site into its course folder, as `ter ex fetch <id>`
 /// does, and return the folder.
 pub async fn fetch_into_courses(session: &Session, id: &str) -> Result<PathBuf, CliError> {
-    let (exercise, course, modes) = fetch_from_site(session, id).await?;
+    let (exercise, course, modes, lesson) = fetch_from_site(session, id).await?;
     let scaffold = Scaffold::check(&exercise)?;
     let dest = layout()?.exercise_dir(&course, &exercise.exercise_id);
-    Ok(scaffold.write(&dest, &course, modes)?.dir)
+    let dir = scaffold.write(&dest, &course, modes)?.dir;
+    pagesync::note_starter(&dir, &exercise, lesson.as_deref(), true)?;
+    Ok(dir)
+}
+
+/// The account's code from the lesson page for the folder `dir`. A new
+/// folder (`fresh`) gets it over the starter; a folder fetched before gets
+/// it with `take` (after a backup of code edited here), and otherwise is
+/// only told when it is newer than `src/` and differs. `None` when the
+/// account has none, or none that `src/` lacks.
+async fn take_page_code(
+    session: &Session,
+    dir: &Path,
+    exercise: &Exercise,
+    fresh: bool,
+    take: bool,
+) -> Result<Option<PageCodeOut>, CliError> {
+    let Some(draft) = pagesync::account_draft(&session.client, dir).await else {
+        return Ok(None);
+    };
+    let code = pagesync::with_draft(&pagesync::starter_set(exercise), &draft);
+    let differs = pagesync::differs(dir, &code);
+    let mut out = PageCodeOut {
+        saved_at_ms: draft.at,
+        written: Vec::new(),
+        backup: None,
+        newer: false,
+    };
+    if fresh || take {
+        if differs {
+            if !fresh {
+                out.backup = pagesync::backup_if_lost(dir, &code, std::time::SystemTime::now())?;
+            }
+            out.written = pagesync::put_draft(dir, &code, &draft)?;
+        } else if fresh {
+            return Ok(None);
+        }
+        return Ok(Some(out));
+    }
+    let paths: Vec<String> = code.keys().cloned().collect();
+    if differs && draft.at > pagesync::changed_at_ms(dir, &paths) {
+        out.newer = true;
+        return Ok(Some(out));
+    }
+    Ok(None)
 }
 
 /// Rewrite the site's files in the exercise folder `dir` from what the
@@ -259,11 +356,13 @@ pub async fn refresh(session: &Session, dir: &Path) -> Result<Refreshed, CliErro
         return Ok(Refreshed::default());
     };
     let modes = exercise.modes.clone().unwrap_or_else(default_modes);
-    match scaffold.refresh(dir, modes) {
-        Err(e) if e.code == "bad_scaffold" => Ok(Refreshed::default()),
-        Err(e) => Err(e.into()),
-        Ok(refreshed) => Ok(refreshed),
-    }
+    let refreshed = match scaffold.refresh(dir, modes) {
+        Err(e) if e.code == "bad_scaffold" => return Ok(Refreshed::default()),
+        Err(e) => return Err(e.into()),
+        Ok(refreshed) => refreshed,
+    };
+    pagesync::note_starter(dir, &exercise, None, false)?;
+    Ok(refreshed)
 }
 
 /// The one line that says which of the site's files changed and which it
@@ -296,10 +395,11 @@ pub fn fetched_dir(id: &str) -> Result<Option<PathBuf>, CliError> {
         .map(|f| f.dir))
 }
 
+/// The exercise, its course, the modes it allows and the lesson it is on.
 async fn fetch_from_site(
     session: &Session,
     id: &str,
-) -> Result<(Exercise, String, Vec<String>), CliError> {
+) -> Result<(Exercise, String, Vec<String>, Option<String>), CliError> {
     // The site decides whether this account may have it (`not_enrolled`,
     // `locked`), so ask for the exercise before anything else.
     let exercise = session.client.exercise(id).await?;
@@ -311,7 +411,10 @@ async fn fetch_from_site(
     // A site that does not say which modes an exercise allows: allow both
     // and let the site's `mode_not_allowed` on `run` be the check.
     let modes = exercise.modes.clone().unwrap_or_else(default_modes);
-    Ok((exercise, course, modes))
+    let lesson = enrollments
+        .lesson_of(&exercise.exercise_id)
+        .map(|l| l.lesson_id.clone());
+    Ok((exercise, course, modes, lesson))
 }
 
 /// What to clean: one exercise, one course, or everything.

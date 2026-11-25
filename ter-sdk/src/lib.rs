@@ -15,7 +15,7 @@ pub mod project;
 pub mod run;
 pub mod version;
 
-pub use client::{Client, Course, Enrollments, Lesson, Ping};
+pub use client::{Client, Course, Draft, DraftSaved, Enrollments, Lesson, Ping};
 pub use envelope::parse_response;
 pub use error::Error;
 pub use exercise::{Exercise, ExerciseFile, ExerciseRef};

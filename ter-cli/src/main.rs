@@ -17,6 +17,7 @@ mod llm;
 mod login;
 mod new;
 mod output;
+mod pagesync;
 mod record;
 mod remote;
 mod run;
@@ -362,6 +363,11 @@ enum ExCommand {
     /// leaves your code and your own files alone. Every `ter run` does the
     /// same.
     ///
+    /// A new folder gets the code your account saved from the lesson page,
+    /// over the starter. In a folder fetched before, src/ stays as it is,
+    /// and ter says when the lesson page's code is newer; `--page-code`
+    /// puts it in src/, after a backup of yours in .ter/backup/.
+    ///
     /// The other commands look for fetched exercises under the same root,
     /// so set it once in the environment or the config rather than passing
     /// --root each time.
@@ -373,6 +379,10 @@ enum ExCommand {
         /// Read it from a local curriculum checkout instead of the site.
         #[arg(long, value_name = "CURRICULUM_PATH")]
         dev: Option<PathBuf>,
+        /// Put your code from the lesson page in src/ of a folder fetched
+        /// before.
+        #[arg(long, conflicts_with = "dev")]
+        page_code: bool,
     },
     /// What an exercise checks and which run can pass it: on your board
     /// (`ter run --hw`), in simulation (`ter run --sim`), or both.
@@ -467,12 +477,16 @@ async fn run(command: Command, json: bool) -> Result<(), CliError> {
                 abort: None,
             };
             run::refresh(&args, json).await?;
-            if live {
+            // The lesson page picks up the code from the account's draft.
+            let save = pagesync::save_in_background(args.dir.clone());
+            let ran = if live {
                 let limit = limit.unwrap_or(ter_remote::serve::LIVE_LIMIT_S);
                 live::run(args, limit, json).await
             } else {
                 run::run(args, json).await
-            }
+            };
+            pagesync::finish(save).await;
+            ran
         }
         Command::Status { disk: true } => status::disk(json),
         Command::Status { disk: false } => status::status(json).await,
@@ -626,7 +640,12 @@ async fn ex(command: ExCommand, json: bool) -> Result<(), CliError> {
                 .await
                 .map_err(|e| session.forget_dead_token(e))
         }
-        ExCommand::Fetch { id, dir, dev } => exercises::fetch(&id, dir, dev.as_deref(), json).await,
+        ExCommand::Fetch {
+            id,
+            dir,
+            dev,
+            page_code,
+        } => exercises::fetch(&id, dir, dev.as_deref(), page_code, json).await,
         ExCommand::Clean { id, course, all } => {
             let scope = match (id, course, all) {
                 (Some(id), _, _) => CleanScope::Exercise(id),
