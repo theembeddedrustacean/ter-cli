@@ -17,6 +17,10 @@
 //! and ends it with `/live/<id>/stop`. `/health` says `"live": true` when the service does
 //! this.
 //!
+//! `GET /code?exercise_id=<id>&user=<email>` answers the code in the
+//! folder the exercise was fetched to, and whether it was edited there
+//! since ter last wrote it, so the page can offer to take it.
+//!
 //! Only the lesson page's origin gets an answer a browser will read (and
 //! the fork's dev server, when `ter serve --dev` asks for it), and any
 //! other origin is refused before anything runs. The lesson page's origin
@@ -39,7 +43,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -227,6 +231,27 @@ pub trait Service: Send + Sync + 'static {
     fn live_view(&self, id: &str) -> Result<String, ServeError> {
         Err(no_live(id))
     }
+    /// `/code`'s answer: the code of the folder exercise `exercise_id` was
+    /// fetched to, for the page's signed-in `user` (when it sends one):
+    /// `{"folder", "exists", "files", "changed_at_ms", "local_edit"}`.
+    fn code(&self, _exercise_id: String, _user: Option<String>) -> RunFuture {
+        Box::pin(async { Err(ServeError::new("not_found", "This ter serve has no /code.")) })
+    }
+}
+
+/// `/code`'s query: `exercise_id`, and `user` when the page sends it.
+pub fn code_query(query: Option<&str>) -> Result<(String, Option<String>), ServeError> {
+    let url = reqwest::Url::parse(&format!("http://ter/?{}", query.unwrap_or("")))
+        .map_err(|e| ServeError::bad_request(format!("The query does not read: {e}")))?;
+    let field = |name: &str| {
+        url.query_pairs()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let exercise_id =
+        field("exercise_id").ok_or_else(|| ServeError::bad_request("exercise_id is required."))?;
+    Ok((exercise_id, field("user")))
 }
 
 /// The answer for a live run this service does not have.
@@ -427,6 +452,7 @@ pub fn router(service: Arc<dyn Service>, port: u16, site_origin: &str, dev: bool
         .route("/", get(health))
         .route("/run", post(run))
         .route("/run/", post(run))
+        .route("/code", get(code))
         .route("/live/{id}/events", get(live_events))
         .route("/live/{id}/extend", post(live_extend))
         .route("/live/{id}/stop", post(live_stop))
@@ -469,6 +495,17 @@ async fn run(State(ctx): State<Ctx>, headers: HeaderMap, body: Bytes) -> Respons
         Err(e) => return e.into_response(),
     };
     match ctx.service.run(request).await {
+        Ok(answer) => axum::Json(answer).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn code(State(ctx): State<Ctx>, uri: Uri) -> Response {
+    let (exercise_id, user) = match code_query(uri.query()) {
+        Ok(q) => q,
+        Err(e) => return e.into_response(),
+    };
+    match ctx.service.code(exercise_id, user).await {
         Ok(answer) => axum::Json(answer).into_response(),
         Err(e) => e.into_response(),
     }
@@ -645,7 +682,7 @@ fn is_view(method: &Method, path: &str) -> bool {
 async fn not_found() -> Response {
     ServeError::new(
         "not_found",
-        "ter serve answers /health, /run and /live/<id>/events, /extend, /pause, /resume, /reset, /input, /action, /stop and /view.",
+        "ter serve answers /health, /run, /code and /live/<id>/events, /extend, /pause, /resume, /reset, /input, /action, /stop and /view.",
     )
     .into_response()
 }
@@ -693,7 +730,7 @@ async fn guard(State(ctx): State<Ctx>, request: Request, next: Next) -> Response
         )
         .into_response()
     } else if origin.is_none()
-        && (matches!(path.as_str(), "/run" | "/run/") || path.starts_with("/live/"))
+        && (matches!(path.as_str(), "/run" | "/run/" | "/code") || path.starts_with("/live/"))
         && !is_view(&method, &path)
     {
         ServeError::new(
@@ -771,6 +808,7 @@ mod tests {
     /// Records what it was asked and answers with `answer`.
     struct Fake {
         asked: Mutex<Vec<RunRequest>>,
+        code_asked: Mutex<Vec<(String, Option<String>)>>,
         answer: Result<Value, ServeError>,
     }
 
@@ -780,6 +818,11 @@ mod tests {
         }
         fn run(&self, request: RunRequest) -> RunFuture {
             self.asked.lock().unwrap().push(request);
+            let answer = self.answer.clone();
+            Box::pin(async move { answer })
+        }
+        fn code(&self, exercise_id: String, user: Option<String>) -> RunFuture {
+            self.code_asked.lock().unwrap().push((exercise_id, user));
             let answer = self.answer.clone();
             Box::pin(async move { answer })
         }
@@ -804,6 +847,7 @@ mod tests {
     ) -> (Router, Arc<Fake>) {
         let fake = Arc::new(Fake {
             asked: Mutex::new(Vec::new()),
+            code_asked: Mutex::new(Vec::new()),
             answer,
         });
         (router(fake.clone(), PORT, site_origin, dev), fake)
@@ -1007,6 +1051,43 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(v["service"], "ter");
         }
+    }
+
+    #[tokio::test]
+    async fn code_answers_the_page_with_the_query_it_sent() {
+        let answer = json!({"folder": "~/ter/x", "exists": true, "files": {},
+                            "changed_at_ms": 1, "local_edit": true});
+        let (app, fake) = app(Ok(answer.clone()));
+        let path = "/code?exercise_id=gpio-blinky--xiao&user=a%2Bb%40example.com";
+        let (status, h, v) = send(&app, req("GET", path, Some(SITE), "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v, answer);
+        assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], SITE);
+        assert_eq!(
+            *fake.code_asked.lock().unwrap(),
+            [(
+                "gpio-blinky--xiao".to_string(),
+                Some("a+b@example.com".to_string())
+            )]
+        );
+        let (status, _, v) = send(&app, req("GET", "/code?exercise_id=x", Some(SITE), "")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(fake.code_asked.lock().unwrap()[1], ("x".to_string(), None));
+    }
+
+    #[tokio::test]
+    async fn code_needs_an_exercise_and_the_pages_origin() {
+        let (app, fake) = app(Ok(json!({})));
+        let (status, _, v) = send(&app, req("GET", "/code?user=a", Some(SITE), "")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"]["code"], "bad_request");
+        for origin in [None, Some("https://evil.example")] {
+            let (status, h, v) = send(&app, req("GET", "/code?exercise_id=x", origin, "")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{origin:?}");
+            assert_eq!(v["error"]["code"], "origin_refused");
+            assert!(h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        }
+        assert!(fake.code_asked.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
