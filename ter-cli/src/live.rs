@@ -19,6 +19,13 @@
 //! from a run folder of its own once its window has run, while the old
 //! one's checks, if they were still being posted, are no longer sent.
 //!
+//! Each part of the board with inputs (what a sensor senses) or events
+//! (a button's press) is sent to the page as `controls`, from sim86's
+//! catalog, with the value each input starts at: the board file's
+//! `config.inputs`, else the catalog's default. The page sets an input or
+//! sends an event while the board runs or is paused; ter checks it against
+//! the controls first, and says on the stream what was done.
+//!
 //! The checks are not judged from the stream. Once the check's window has
 //! run, its recording is read back in full, written to the run folder,
 //! judged and posted, exactly as `ter run --sim sim86` does; the board
@@ -121,12 +128,15 @@ struct State {
     paused: Option<(Instant, Value)>,
     /// How long the board was paused before, in all, in ms.
     paused_ms: u64,
+    /// The parts the page can change, each input at its value now.
+    controls: Vec<Value>,
 }
 
 impl State {
-    fn new(run: String, ends_at: u64) -> Self {
+    fn new(run: String, ends_at: u64, controls: Vec<Value>) -> Self {
         Self {
             run,
+            controls,
             ends_at,
             ended: None,
             listeners: 0,
@@ -236,6 +246,10 @@ impl Live {
         }
         state.listeners += 1;
         let mut from = self.events.subscribe();
+        let _ = tx.try_send(LiveEvent {
+            name: "controls",
+            data: json!({"parts": state.controls}),
+        });
         if let Some((_, paused)) = &state.paused {
             let _ = tx.try_send(LiveEvent {
                 name: "paused",
@@ -305,6 +319,9 @@ impl Live {
         let over = || CliError::new("ended", "This live run is over.");
         if self.ended() {
             return Err(over());
+        }
+        if let Some(why) = refused(&self.state().controls, &control) {
+            return Err(CliError::new("bad_request", why));
         }
         // A reset makes a new sim86 run, which may wait for a simulator.
         let patience = match control {
@@ -441,7 +458,11 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
                     said.push_str(&line);
                     said.push('\n');
                     match sim86::live_line(&line) {
-                        Some(LiveLine::Started { run, signals }) => break Ok((run, signals)),
+                        Some(LiveLine::Started {
+                            run,
+                            signals,
+                            controls,
+                        }) => break Ok((run, signals, controls)),
                         Some(LiveLine::Done(Err(failure))) => break Err(failure),
                         _ => {}
                     }
@@ -465,7 +486,7 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
             ),
         })
     });
-    let (sim86_run, signals) = match began {
+    let (sim86_run, signals, controls) = match began {
         Ok(began) => began,
         Err(failure) => {
             // A closed pipe tells the helper to stop: a run it is still
@@ -506,6 +527,7 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
         state: Mutex::new(State::new(
             sim86_run,
             started_at + limit_s.min(LIVE_CAP_S) * 1_000,
+            controls.clone(),
         )),
         events,
         stop,
@@ -519,6 +541,7 @@ pub async fn start(mut built: Built, limit_s: u64) -> Result<Started, CliError> 
             built: Some(built),
             spare: None,
             firmware: recording.join(FIRMWARE),
+            controls,
             venue,
             child,
             stdin,
@@ -547,6 +570,8 @@ struct Drive {
     /// The program sim86 was given, in the first run folder: the helper
     /// uploads it again on a reset.
     firmware: std::path::PathBuf,
+    /// The parts the page can change, as the board starts.
+    controls: Vec<Value>,
     venue: Sim86,
     child: Child,
     stdin: Option<ChildStdin>,
@@ -681,6 +706,12 @@ impl Drive {
                                 LiveControl::Pause => json!({"do": "pause"}),
                                 LiveControl::Resume => json!({"do": "resume"}),
                                 LiveControl::Reset => json!({"do": "reset"}),
+                                LiveControl::Input { part, name, value } => {
+                                    json!({"do": "input", "part": part, "name": name, "value": value})
+                                }
+                                LiveControl::Action { part, action } => {
+                                    json!({"do": "action", "part": part, "action": action})
+                                }
                             };
                             let mut line = what;
                             line["id"] = json!(next_id);
@@ -787,12 +818,40 @@ impl Drive {
                         reset = true;
                         let run = line["run"].as_str().unwrap_or_default().to_string();
                         state.run = run.clone();
-                        // The new board runs from the start.
+                        // The new board runs from the start, its parts as
+                        // they start.
                         state.unpause();
+                        state.controls = self.controls.clone();
                         drop(state);
                         self.renew();
                         let data = json!({"run": run, "ends_at": self.live.ends_at()});
                         self.live.send("reset", data.clone());
+                        self.live.send("controls", json!({"parts": self.controls}));
+                        let mut answer = data;
+                        answer["ok"] = json!(true);
+                        Ok(answer)
+                    }
+                    LiveControl::Input { part, name, value } => {
+                        let set = state
+                            .controls
+                            .iter_mut()
+                            .filter(|p| p["id"] == part.as_str())
+                            .filter_map(|p| p["controls"].as_array_mut())
+                            .flatten()
+                            .find(|c| c["kind"] == "input" && c["name"] == name.as_str());
+                        if let Some(control) = set {
+                            control["value"] = value.clone();
+                        }
+                        let data =
+                            json!({"part": part, "name": name, "value": value, "t_ms": t_ms});
+                        self.live.send("input", data.clone());
+                        let mut answer = data;
+                        answer["ok"] = json!(true);
+                        Ok(answer)
+                    }
+                    LiveControl::Action { part, action } => {
+                        let data = json!({"part": part, "action": action, "t_ms": t_ms});
+                        self.live.send("action", data.clone());
                         let mut answer = data;
                         answer["ok"] = json!(true);
                         Ok(answer)
@@ -924,6 +983,94 @@ fn page_names(
         nets.insert(net.clone(), (on, signal));
     }
     nets
+}
+
+/// Why the page may not ask `control` of a board whose parts are
+/// `parts`, as the `controls` event gives them; `None` when it may.
+fn refused(parts: &[Value], control: &LiveControl) -> Option<String> {
+    let (part, kind, what) = match control {
+        LiveControl::Input { part, .. } => (part, "input", "an input"),
+        LiveControl::Action { part, .. } => (part, "action", "events"),
+        _ => return None,
+    };
+    let of = |p: &Value| -> Vec<Value> {
+        p["controls"]
+            .as_array()
+            .map(|c| c.iter().filter(|c| c["kind"] == kind).cloned().collect())
+            .unwrap_or_default()
+    };
+    let named = |v: &[Value], key: &str| -> String {
+        v.iter()
+            .filter_map(|c| c[key].as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let takes: Vec<Value> = parts
+        .iter()
+        .filter(|p| !of(p).is_empty())
+        .cloned()
+        .collect();
+    let Some(found) = takes.iter().find(|p| p["id"] == part.as_str()) else {
+        return Some(if takes.is_empty() {
+            format!("No part of this board takes {what}.")
+        } else {
+            format!(
+                "No part {part:?} of this board takes {what}; these do: {}.",
+                named(&takes, "id")
+            )
+        });
+    };
+    let controls = of(found);
+    match control {
+        LiveControl::Input { name, value, .. } => {
+            let Some(spec) = controls.iter().find(|c| c["name"] == name.as_str()) else {
+                return Some(format!(
+                    "{part} has no input {name:?}; it has {}.",
+                    named(&controls, "name")
+                ));
+            };
+            let axes = spec["axes"]
+                .as_array()
+                .map(Vec::len)
+                .or_else(|| spec["axes"].as_u64().and_then(|n| usize::try_from(n).ok()));
+            let values: Vec<f64> = match (value, axes) {
+                (Value::Array(list), Some(n)) if list.len() == n => {
+                    list.iter().filter_map(Value::as_f64).collect()
+                }
+                (Value::Number(n), None) => n.as_f64().into_iter().collect(),
+                (_, Some(n)) => return Some(format!("{name} is a list of {n} numbers.")),
+                _ => return Some(format!("{name} is one number.")),
+            };
+            let unit = spec["unit"].as_str().filter(|u| !u.is_empty());
+            let unit = unit.map(|u| format!(" {u}")).unwrap_or_default();
+            let (min, max) = (spec["min"].as_f64(), spec["max"].as_f64());
+            let out = |v: &f64| min.is_some_and(|m| *v < m) || max.is_some_and(|m| *v > m);
+            if values.iter().any(out) {
+                let bound = |b: Option<f64>| b.map_or("any".to_string(), |b| b.to_string());
+                return Some(format!(
+                    "{name} is from {} to {}{unit}.",
+                    bound(min),
+                    bound(max)
+                ));
+            }
+            None
+        }
+        LiveControl::Action { action, .. } => {
+            let actions: Vec<&str> = controls
+                .iter()
+                .filter_map(|c| c["actions"].as_array())
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            (!actions.contains(&action.as_str())).then(|| {
+                format!(
+                    "{part} takes the events {}; not {action:?}.",
+                    actions.join(", ")
+                )
+            })
+        }
+        _ => None,
+    }
 }
 
 /// The `checks` event of a post that went wrong inside ter.
@@ -1226,6 +1373,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_input_or_an_event_is_checked_against_the_boards_controls() {
+        let parts = vec![
+            json!({"id": "ldr1", "label": "Photoresistor (LDR)", "type": "Ldr", "controls": [
+                {"kind": "input", "name": "lux", "unit": "lux", "min": 0.1, "max": 10000.0, "value": 100.0}]}),
+            json!({"id": "imu", "label": "IMU", "type": "Imu", "controls": [
+                {"kind": "input", "name": "acceleration", "axes": ["x", "y", "z"], "value": [0, 0, 9.8]}]}),
+            json!({"id": "btn1", "label": "Button", "type": "Btn", "controls": [
+                {"kind": "action", "name": "events", "actions": ["pressed", "released"]}]}),
+        ];
+        let input = |part: &str, name: &str, value: Value| LiveControl::Input {
+            part: part.into(),
+            name: name.into(),
+            value,
+        };
+        let action = |part: &str, action: &str| LiveControl::Action {
+            part: part.into(),
+            action: action.into(),
+        };
+        for ok in [
+            input("ldr1", "lux", json!(500)),
+            input("ldr1", "lux", json!(0.1)),
+            input("imu", "acceleration", json!([0, 9.8, 0])),
+            action("btn1", "released"),
+            LiveControl::Pause,
+        ] {
+            assert_eq!(refused(&parts, &ok), None, "{ok:?}");
+        }
+        for (bad, said) in [
+            (
+                input("pot1", "position", json!(1)),
+                "No part \"pot1\" of this board takes an input; these do: ldr1, imu.",
+            ),
+            (
+                input("btn1", "lux", json!(1)),
+                "No part \"btn1\" of this board takes an input; these do: ldr1, imu.",
+            ),
+            (
+                input("ldr1", "light", json!(1)),
+                "ldr1 has no input \"light\"; it has lux.",
+            ),
+            (
+                input("ldr1", "lux", json!(20000)),
+                "lux is from 0.1 to 10000 lux.",
+            ),
+            (input("ldr1", "lux", json!([1])), "lux is one number."),
+            (
+                input("imu", "acceleration", json!(1)),
+                "acceleration is a list of 3 numbers.",
+            ),
+            (
+                action("ldr1", "pressed"),
+                "No part \"ldr1\" of this board takes events; these do: btn1.",
+            ),
+            (
+                action("btn1", "click"),
+                "btn1 takes the events pressed, released; not \"click\".",
+            ),
+        ] {
+            assert_eq!(refused(&parts, &bad).as_deref(), Some(said), "{bad:?}");
+        }
+        assert_eq!(
+            refused(&[], &action("btn1", "pressed")).as_deref(),
+            Some("No part of this board takes events.")
+        );
+    }
+
     #[tokio::test]
     async fn a_run_whose_task_panics_ends_as_a_sim86_error() {
         let (events, _) = broadcast::channel(16);
@@ -1240,7 +1454,7 @@ mod tests {
                 script: "ter_sim86.py".into(),
                 key: None,
             },
-            state: Mutex::new(State::new("r1".into(), unix_ms() + 60_000)),
+            state: Mutex::new(State::new("r1".into(), unix_ms() + 60_000, Vec::new())),
             events,
             stop,
             control,
@@ -1263,6 +1477,8 @@ mod tests {
             live.ended_as(),
             Some(("sim-error".into(), "ter stopped following the run".into()))
         );
+        let event = listening.recv().await.expect("the controls event");
+        assert_eq!(event.name, "controls");
         let event = listening.recv().await.expect("the ended event");
         assert_eq!(event.name, "ended");
         assert!(live.listen().is_none());

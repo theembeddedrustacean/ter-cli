@@ -12,7 +12,9 @@
 //! run, and the page follows it on `/live/<id>/events` (Server-Sent
 //! Events), lengthens it with `/live/<id>/extend`, pauses and resumes it
 //! with `/live/<id>/pause` and `/live/<id>/resume`, starts it again from
-//! its time 0 with `/live/<id>/reset`, and ends it with `/live/<id>/stop`. `/health` says `"live": true` when the service does
+//! its time 0 with `/live/<id>/reset`, sets what a part senses with
+//! `/live/<id>/input` and sends a part an event with `/live/<id>/action`,
+//! and ends it with `/live/<id>/stop`. `/health` says `"live": true` when the service does
 //! this.
 //!
 //! Only the lesson page's origin gets an answer a browser will read (and
@@ -102,8 +104,9 @@ pub const LIVE_LIMIT_S: u64 = 60;
 pub const LIVE_CAP_S: u64 = 600;
 
 /// One event of a live run, as `/live/<id>/events` sends it: `name` is
-/// the SSE event's name (`pin`, `serial`, `checks`, `limit`, `paused`,
-/// `resumed`, `reset`, `ended`) and `data` its one JSON object.
+/// the SSE event's name (`controls`, `pin`, `serial`, `checks`, `limit`,
+/// `paused`, `resumed`, `reset`, `input`, `action`, `ended`) and `data` its
+/// one JSON object.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveEvent {
     pub name: &'static str,
@@ -123,6 +126,15 @@ pub enum LiveControl {
     Resume,
     /// Start the board again from its time 0, with the same program.
     Reset,
+    /// Set what a part senses: its input `name` to `value`, a number or a
+    /// list of them (one per axis).
+    Input {
+        part: String,
+        name: String,
+        value: Value,
+    },
+    /// Send a part one of the events it takes (a button's `pressed`).
+    Action { part: String, action: String },
 }
 
 /// A failure `ter serve` answers with, as `{"error": {code, message}}`.
@@ -420,6 +432,8 @@ pub fn router(service: Arc<dyn Service>, port: u16, site_origin: &str, dev: bool
         .route("/live/{id}/pause", post(live_pause))
         .route("/live/{id}/resume", post(live_resume))
         .route("/live/{id}/reset", post(live_reset))
+        .route("/live/{id}/input", post(live_input))
+        .route("/live/{id}/action", post(live_action))
         .route("/live/{id}/view", get(live_view))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(ctx.clone(), guard))
@@ -547,6 +561,45 @@ async fn live_reset(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response 
     live_control(&ctx, &id, LiveControl::Reset).await
 }
 
+/// A string field of a JSON body, when it is one and not empty.
+fn body_text(body: &Value, key: &str) -> Option<String> {
+    body.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+async fn live_input(State(ctx): State<Ctx>, Path(id): Path<String>, body: Bytes) -> Response {
+    let body = serde_json::from_slice::<Value>(&body).unwrap_or_default();
+    let number = |v: &Value| v.is_number();
+    let value = body.get("value").filter(|v| {
+        number(v)
+            || v.as_array()
+                .is_some_and(|a| !a.is_empty() && a.iter().all(number))
+    });
+    let (Some(part), Some(name), Some(value)) =
+        (body_text(&body, "part"), body_text(&body, "name"), value)
+    else {
+        return ServeError::bad_request(
+            "Send {\"part\": \"ldr1\", \"name\": \"lux\", \"value\": 500}: the part's id, its input's name, and a number (or a list of numbers, one per axis).",
+        )
+        .into_response();
+    };
+    let value = value.clone();
+    live_control(&ctx, &id, LiveControl::Input { part, name, value }).await
+}
+
+async fn live_action(State(ctx): State<Ctx>, Path(id): Path<String>, body: Bytes) -> Response {
+    let body = serde_json::from_slice::<Value>(&body).unwrap_or_default();
+    let (Some(part), Some(action)) = (body_text(&body, "part"), body_text(&body, "action")) else {
+        return ServeError::bad_request(
+            "Send {\"part\": \"btn1\", \"action\": \"pressed\"}: the part's id and one of the events it takes.",
+        )
+        .into_response();
+    };
+    live_control(&ctx, &id, LiveControl::Action { part, action }).await
+}
+
 /// The lesson page frames this address; the browser goes on to the
 /// simulator's own page for the run. The frame's request names no origin,
 /// so what guards it is the run's id, which only the page that started
@@ -589,7 +642,7 @@ fn is_view(method: &Method, path: &str) -> bool {
 async fn not_found() -> Response {
     ServeError::new(
         "not_found",
-        "ter serve answers /health, /run and /live/<id>/events, /extend, /pause, /resume, /reset, /stop and /view.",
+        "ter serve answers /health, /run and /live/<id>/events, /extend, /pause, /resume, /reset, /input, /action, /stop and /view.",
     )
     .into_response()
 }
@@ -1241,6 +1294,13 @@ mod tests {
                 ("l1", LiveControl::Pause) => Ok(json!({"ok": true, "t_ms": 1.5})),
                 ("l1", LiveControl::Resume) => Ok(json!({"ok": true, "t_ms": 1.5, "ends_at": 9})),
                 ("l1", LiveControl::Reset) => Ok(json!({"ok": true, "run": "r2"})),
+                ("l1", LiveControl::Input { part, name, value }) if part == "ldr1" => {
+                    Ok(json!({"ok": true, "part": part, "name": name, "value": value}))
+                }
+                ("l1", LiveControl::Action { part, action }) if part == "btn1" => {
+                    Ok(json!({"ok": true, "part": part, "action": action}))
+                }
+                ("l1", _) => Err(ServeError::bad_request("No such part on this board.")),
                 (id, _) => Err(no_live(id)),
             };
             Box::pin(async move { answer })
@@ -1306,6 +1366,74 @@ mod tests {
             (StatusCode::OK, json!({"ok": true, "run": "r2"}))
         );
 
+        // What a part senses and the events it takes, checked by the
+        // service; a body that names nothing is refused before it.
+        for (body, value) in [
+            (
+                r#"{"part": "ldr1", "name": "lux", "value": 500}"#,
+                json!(500),
+            ),
+            (
+                r#"{"part": "ldr1", "name": "xyz", "value": [0, 0.5, 9.8]}"#,
+                json!([0, 0.5, 9.8]),
+            ),
+        ] {
+            let (status, _, v) = send(&app, req("POST", "/live/l1/input", Some(SITE), body)).await;
+            assert_eq!(status, StatusCode::OK, "{body}: {v}");
+            assert_eq!(v["value"], value);
+        }
+        let (status, _, v) = send(
+            &app,
+            req(
+                "POST",
+                "/live/l1/action",
+                Some(SITE),
+                r#"{"part": "btn1", "action": "pressed"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, v),
+            (
+                StatusCode::OK,
+                json!({"ok": true, "part": "btn1", "action": "pressed"})
+            )
+        );
+        for (path, body) in [
+            ("/live/l1/input", ""),
+            ("/live/l1/input", r#"{"part": "ldr1", "name": "lux"}"#),
+            (
+                "/live/l1/input",
+                r#"{"part": "ldr1", "name": "lux", "value": "bright"}"#,
+            ),
+            (
+                "/live/l1/input",
+                r#"{"part": "ldr1", "name": "lux", "value": []}"#,
+            ),
+            (
+                "/live/l1/input",
+                r#"{"part": "", "name": "lux", "value": 1}"#,
+            ),
+            (
+                "/live/l1/input",
+                r#"{"part": "pot1", "name": "position", "value": 1}"#,
+            ),
+            ("/live/l1/action", r#"{"part": "btn1"}"#),
+            (
+                "/live/l1/action",
+                r#"{"part": "pot1", "action": "pressed"}"#,
+            ),
+        ] {
+            let (status, _, v) = send(&app, req("POST", path, Some(SITE), body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}: {v}");
+            assert_eq!(v["error"]["code"], "bad_request");
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| !m.is_empty())
+            );
+        }
+
         // No such run, and a service with no live runs at all.
         for path in [
             "/live/l2/events",
@@ -1314,13 +1442,17 @@ mod tests {
             "/live/l2/pause",
             "/live/l2/resume",
             "/live/l2/reset",
+            "/live/l2/input",
+            "/live/l2/action",
         ] {
             let method = if path.ends_with("events") {
                 "GET"
             } else {
                 "POST"
             };
-            let (status, _, v) = send(&app, req(method, path, Some(SITE), r#"{"add_s": 1}"#)).await;
+            let body =
+                r#"{"add_s": 1, "part": "ldr1", "name": "lux", "value": 1, "action": "pressed"}"#;
+            let (status, _, v) = send(&app, req(method, path, Some(SITE), body)).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {v}");
             assert_eq!(v["error"]["code"], "not_found");
         }
@@ -1333,6 +1465,8 @@ mod tests {
             "/live/l1/pause",
             "/live/l1/resume",
             "/live/l1/reset",
+            "/live/l1/input",
+            "/live/l1/action",
         ] {
             let mut r = req("OPTIONS", path, Some(SITE), "");
             r.headers_mut().insert(
@@ -1381,6 +1515,8 @@ mod tests {
                 ("POST", "/live/l1/pause"),
                 ("POST", "/live/l1/resume"),
                 ("POST", "/live/l1/reset"),
+                ("POST", "/live/l1/input"),
+                ("POST", "/live/l1/action"),
             ] {
                 let (status, _, v) = send(&app, req(method, path, origin, "")).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{origin:?} {path}");

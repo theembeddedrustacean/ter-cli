@@ -2886,6 +2886,11 @@ async fn serve_shows_the_boards_other_wired_pins_live() {
     let id = v["live"].as_str().unwrap().to_string();
 
     let mut events = LiveStream::open(&served, &id).await;
+    // No part of this board is one the page can change.
+    assert_eq!(
+        events.next().await.unwrap(),
+        ("controls".to_string(), json!({"parts": []}))
+    );
     assert_eq!(
         events.next().await.unwrap(),
         (
@@ -2949,6 +2954,7 @@ async fn serve_shows_a_sim86_run_live_and_stops_it_when_told() {
     assert_eq!(id.len(), 32, "an id nobody can guess: {id}");
 
     let mut events = LiveStream::open(&served, &id).await;
+    assert_eq!(events.next().await.unwrap().0, "controls");
     let (name, first) = events.next().await.unwrap();
     assert_eq!(name, "pin");
     assert_eq!(
@@ -3213,7 +3219,7 @@ async fn a_live_run_that_ends_before_its_checks_is_not_posted_and_one_that_never
     let id = v["live"].as_str().unwrap().to_string();
     let mut events = LiveStream::open(&served, &id).await;
     let (_, before) = events.until("pin").await;
-    assert!(before.is_empty());
+    assert_eq!(before, ["controls"]);
     assert_eq!(served.live_post(&id, "stop", json!({})).await.0, 200);
     let (ended, before) = events.until("ended").await;
     assert_eq!(ended, json!({"reason": "user-stop", "detail": ""}));
@@ -4563,6 +4569,218 @@ async fn a_reset_live_run_starts_a_new_sim86_run_from_zero_and_is_judged_again()
     let runs = m.sim86_saw("runs");
     assert_eq!(runs.lines().count(), 3, "{runs}");
     assert!(!m.exercise().join(".runs/1/firmware.bin").exists());
+}
+
+/// A board with an LDR, a potentiometer and a button: the LDR starts at
+/// 250 lux by its `config.inputs`, which sim86 is not sent.
+const SIM86_CONTROLS_BOARD: &str = r#"{"name": "ter-uferris-c3-basic",
+ "parts": [{"id": "mcu", "type": "XiaoESP32C3", "firmware": "fw.bin"},
+           {"id": "led1", "type": "Led", "config": {"color": "red"}},
+           {"id": "btn1", "type": "Btn", "label": "S1"},
+           {"id": "ldr1", "type": "Ldr", "config": {"inputs": {"lux": 250}, "pull": 1}},
+           {"id": "pot1", "type": "Potentiometer"}],
+ "wires": [["mcu.D1", "led1.+"], ["led1.-", "mcu.GND"], ["btn1.L1", "mcu.D3"], ["btn1.L2", "mcu.GND"]]}
+"#;
+
+/// sim86's catalog for those parts, as it gives them.
+const SIM86_CONTROLS_CATALOG: &str = r#"{
+ "XiaoESP32C3": {"name": "Seeed XIAO ESP32-C3", "inputs": [{"default": 0.0, "label": "BOOT button (GPIO9)", "max": 1.0, "min": 0.0, "name": "boot", "step": 1.0, "unit": "", "widget": "button"}]},
+ "Btn": {"name": "Button", "description": "4-leg push button. Events: 'pressed', 'released'."},
+ "Ldr": {"name": "Photoresistor (LDR)", "description": "R = 15 k (lux/10)^-0.7.", "inputs": [{"default": 100.0, "label": "Light", "max": 10000.0, "min": 0.1, "name": "lux", "step": 0.1, "unit": "lux"}]},
+ "Potentiometer": {"name": "Potentiometer", "inputs": [{"default": 0.5, "label": "Position", "max": 1.0, "min": 0.0, "name": "position", "step": 0.01, "unit": ""}]}
+}"#;
+
+fn controls_machine(board: &str) -> Machine {
+    let m = live_machine(GOOD, "").with_sim86_package();
+    std::fs::write(m.exercise().join("sim86/board.json"), board).unwrap();
+    std::fs::write(m.sim86_bin().join("parts"), SIM86_CONTROLS_CATALOG).unwrap();
+    m
+}
+
+/// What the stand-in sim86 was sent, a line each.
+fn sim86_events(m: &Machine) -> Vec<Value> {
+    std::fs::read_to_string(m.sim86_bin().join("events"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// The page is sent the parts it can change, from sim86's catalog, sets
+/// an input and presses a button, running or paused; ter refuses what no
+/// part takes, and a reset starts the parts again as the board file says.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_page_sets_a_parts_input_and_sends_it_events_as_the_catalog_says() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = controls_machine(SIM86_CONTROLS_BOARD);
+    let served = m.serve(&server.uri());
+
+    let (status, _, v) = served.run(live_ask(60)).await;
+    assert_eq!(status, 200, "{v}");
+    let id = v["live"].as_str().unwrap().to_string();
+    let mut events = LiveStream::open(&served, &id).await;
+    let (name, controls) = events.next().await.unwrap();
+    assert_eq!(name, "controls");
+    let ldr = |lux: i64| {
+        json!({"id": "ldr1", "label": "Photoresistor (LDR)", "type": "Ldr", "controls": [
+            {"kind": "input", "name": "lux", "label": "Light", "unit": "lux",
+             "min": 0.1, "max": 10000.0, "step": 0.1, "value": lux}]})
+    };
+    let parts = json!({"parts": [
+        {"id": "mcu", "label": "Seeed XIAO ESP32-C3", "type": "XiaoESP32C3", "controls": [
+            {"kind": "input", "name": "boot", "label": "BOOT button (GPIO9)", "unit": "",
+             "min": 0.0, "max": 1.0, "step": 1.0, "widget": "button", "value": 0.0}]},
+        {"id": "btn1", "label": "S1", "type": "Btn", "controls": [
+            {"kind": "action", "name": "events", "actions": ["pressed", "released"]}]},
+        ldr(250),
+        {"id": "pot1", "label": "Potentiometer", "type": "Potentiometer", "controls": [
+            {"kind": "input", "name": "position", "label": "Position", "unit": "",
+             "min": 0.0, "max": 1.0, "step": 0.01, "value": 0.5}]},
+    ]});
+    assert_eq!(controls, parts);
+    // The LDR's start is set at 0, before the board runs, and is not part
+    // of the config sim86 is sent.
+    assert_eq!(
+        sim86_events(&m),
+        [json!({"run": "fake-run-1", "part": "ldr1", "action": "input:lux=250", "t_ns": 0})]
+    );
+    let configs: Value =
+        serde_json::from_str(m.sim86_saw("configs").lines().next().unwrap()).unwrap();
+    assert_eq!(configs["ldr1"], json!({"pull": 1}));
+    events.until("pin").await;
+
+    let (status, set) = served
+        .live_post(
+            &id,
+            "input",
+            json!({"part": "ldr1", "name": "lux", "value": 500}),
+        )
+        .await;
+    assert_eq!(status, 200, "{set}");
+    let t_ms = set["t_ms"].as_f64().unwrap();
+    assert!(t_ms > 0.0, "{set}");
+    assert_eq!(
+        set,
+        json!({"ok": true, "part": "ldr1", "name": "lux", "value": 500, "t_ms": t_ms})
+    );
+    let (event, _) = events.until("input").await;
+    assert_eq!(
+        event,
+        json!({"part": "ldr1", "name": "lux", "value": 500, "t_ms": t_ms})
+    );
+
+    // Paused, the button is pressed at the very time the board holds.
+    let (_, paused) = served.live_post(&id, "pause", json!({})).await;
+    let (status, pressed) = served
+        .live_post(&id, "action", json!({"part": "btn1", "action": "pressed"}))
+        .await;
+    assert_eq!(status, 200, "{pressed}");
+    assert_eq!(
+        pressed,
+        json!({"ok": true, "part": "btn1", "action": "pressed", "t_ms": paused["t_ms"]})
+    );
+    let (event, _) = events.until("action").await;
+    assert_eq!(
+        event,
+        json!({"part": "btn1", "action": "pressed", "t_ms": paused["t_ms"]})
+    );
+    let sent = sim86_events(&m);
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(sent[1]["action"], "input:lux=500");
+    assert_eq!(
+        (&sent[2]["part"], &sent[2]["action"]),
+        (&json!("btn1"), &json!("pressed"))
+    );
+    served.live_post(&id, "resume", json!({})).await;
+
+    // What no part takes is refused, and nothing is sent.
+    for (what, body, said) in [
+        (
+            "input",
+            json!({"part": "ldr1", "name": "lux", "value": 20000}),
+            "lux is from 0.1 to 10000 lux.",
+        ),
+        (
+            "input",
+            json!({"part": "ldr1", "name": "light", "value": 1}),
+            "ldr1 has no input \"light\"; it has lux.",
+        ),
+        (
+            "input",
+            json!({"part": "led1", "name": "lux", "value": 1}),
+            "No part \"led1\" of this board takes an input; these do: mcu, ldr1, pot1.",
+        ),
+        (
+            "action",
+            json!({"part": "btn1", "action": "click"}),
+            "btn1 takes the events pressed, released; not \"click\".",
+        ),
+    ] {
+        let (status, v) = served.live_post(&id, what, body).await;
+        assert_eq!(
+            (
+                status,
+                v["error"]["code"].as_str(),
+                v["error"]["message"].as_str()
+            ),
+            (400, Some("bad_request"), Some(said)),
+            "{v}"
+        );
+    }
+    assert_eq!(sim86_events(&m).len(), 3);
+
+    // A page that starts to listen now sees the LDR as it was set.
+    let mut late = LiveStream::open(&served, &id).await;
+    let (name, now) = late.next().await.unwrap();
+    assert_eq!((name.as_str(), &now["parts"][2]), ("controls", &ldr(500)));
+    drop(late);
+
+    // A reset starts the LDR again at 250, on the new board at 0.
+    let (status, reset) = served.live_post(&id, "reset", json!({})).await;
+    assert_eq!(status, 200, "{reset}");
+    events.until("reset").await;
+    let (name, again) = events.next().await.unwrap();
+    assert_eq!((name.as_str(), &again), ("controls", &parts));
+    assert_eq!(
+        sim86_events(&m)[3],
+        json!({"run": "fake-run-2", "part": "ldr1", "action": "input:lux=250", "t_ns": 0})
+    );
+
+    served.live_post(&id, "stop", json!({})).await;
+    events.until("ended").await;
+    assert!(sim86_says(&m, "stopped", "fake-run-2", 10).await);
+    // The catalog was asked once a part type: the helper keeps it.
+    let looked = m.sim86_saw("looked-up");
+    assert_eq!(
+        looked.lines().filter(|l| *l == "Ldr").count(),
+        1,
+        "{looked}"
+    );
+}
+
+/// A recorded run sets the parts' starting inputs too, and a board whose
+/// starting input the catalog does not allow does not run.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_recorded_sim86_run_starts_its_parts_inputs_and_refuses_a_wrong_one() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = controls_machine(SIM86_CONTROLS_BOARD);
+    let (ok, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+    assert!(ok, "{v}");
+    assert_eq!(
+        sim86_events(&m),
+        [json!({"run": "fake-run-1", "part": "ldr1", "action": "input:lux=250", "t_ns": 0})]
+    );
+
+    let m = controls_machine(&SIM86_CONTROLS_BOARD.replace(r#"{"lux": 250}"#, r#"{"lux": -5}"#));
+    let (_, v) = m.json(&server.uri(), &["run", "--sim", "sim86"]);
+    assert!(
+        v.to_string()
+            .contains("ldr1 config.inputs: lux is from 0.1 to 10000.0"),
+        "{v}"
+    );
+    assert!(!m.sim86_bin().join("runs").exists());
 }
 
 /// ter's own helper streams the board's other wired pins by the chip's

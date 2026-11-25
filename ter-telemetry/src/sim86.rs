@@ -701,10 +701,13 @@ pub fn events(
 pub enum LiveLine {
     /// The run exists and the board now runs from 0. `signals`: the
     /// programmed part's pins and the chip signal each is (`D12` is
-    /// `PA6`), from sim86's catalog, when it answered.
+    /// `PA6`), from sim86's catalog, when it answered. `controls`: each
+    /// part with inputs or events, as the page is sent it
+    /// (`{id, label, type, controls}`).
     Started {
         run: String,
         signals: BTreeMap<String, String>,
+        controls: Vec<Value>,
     },
     /// A net's level at `t_ns` of simulated time.
     Pin { t_ns: u64, net: String, level: u8 },
@@ -744,6 +747,17 @@ pub fn live_line(line: &str) -> Option<LiveLine> {
                         .filter_map(|(pin, signal)| {
                             Some((pin.clone(), signal.as_str()?.to_string()))
                         })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            controls: v
+                .get("controls")
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter(|p| p["id"].is_string() && p["controls"].is_array())
+                        .cloned()
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -1574,14 +1588,28 @@ mod tests {
             live_line(r#"{"ev": "started", "run": "r1"}"#),
             Some(LiveLine::Started {
                 run: "r1".into(),
-                signals: BTreeMap::new()
+                signals: BTreeMap::new(),
+                controls: Vec::new()
+            })
+        );
+        let ldr = json!({"id": "ldr1", "label": "Photoresistor (LDR)", "type": "Ldr", "controls": [
+            {"kind": "input", "name": "lux", "unit": "lux", "min": 0.1, "max": 10000.0, "value": 100.0}]});
+        assert_eq!(
+            live_line(
+                &json!({"ev": "started", "run": "r1", "controls": [ldr, {"id": 3}]}).to_string()
+            ),
+            Some(LiveLine::Started {
+                run: "r1".into(),
+                signals: BTreeMap::new(),
+                controls: vec![ldr.clone()]
             })
         );
         assert_eq!(
             live_line(r#"{"ev": "started", "run": "r1", "signals": {"D12": "PA6", "GND": null}}"#),
             Some(LiveLine::Started {
                 run: "r1".into(),
-                signals: BTreeMap::from([("D12".into(), "PA6".into())])
+                signals: BTreeMap::from([("D12".into(), "PA6".into())]),
+                controls: Vec::new()
             })
         );
         assert_eq!(

@@ -16,7 +16,8 @@ way: ter reads the object, never the exit code or any text.
 
 `live` prints one JSON object a line before that one, each with an "ev":
 "started" (the run exists, paused at 0, and now runs; with the programmed
-part's chip signal names when sim86's catalog gives them), "pin" and
+part's chip signal names when sim86's catalog gives them, and the
+"controls" of every part with inputs or events), "pin" and
 "serial" as they happen (pins of the request's "watch" and "show" nets),
 "recording" once the check's time is up (its window in full, in the shape
 `run` answers with; a run that ends sooner has none) and "ended". It runs with no simulated-time limit and stops the run when it
@@ -27,16 +28,24 @@ While a live run goes on, ter may also write a JSON object a line, each
 with an "id" and what to "do": "pause" or "resume". The helper does it to
 the run and answers with a line holding the same "id": "paused" or
 "resumed" with the board's simulated time ("t_ns"), or "refused" with
-sim86's "message". "reset" stops the run and starts a new one from the
+sim86's "message". "input" sets a part's input ("part", "name", "value")
+and "action" sends a part an event ("part", "action"); each answers
+with its own name and the time it was done at. "reset" stops the run and starts a new one from the
 same request, paused at 0 and then running, as at the start: the answer
 is "reset" with the new run's id ("run"), and every line after it is the
 new run's. A reset that cannot start the new run answers "refused" and
 ends as any failed start does.
 
+A part's "config" in the board file may carry "inputs", {name: value}:
+what the part senses from time 0, set while the board is paused there.
+It is ter's, checked against sim86's catalog and not sent to sim86.
+
 Written by `ter install sim86` next to the Python environment that holds
 the sim86 package, and rewritten by ter when it changes. Do not edit it.
 """
 import json
+import os
+import re
 import sys
 import threading
 import time
@@ -67,6 +76,9 @@ READ_AHEAD_NS = 2_000_000_000
 POLL_S = 0.1
 OVERLAP_NS = 300_000_000
 TAIL_NS = 300_000_000
+
+# How long what sim86's catalog says of a part is kept beside the helper.
+CATALOG_S = 24 * 3600
 
 LOW, HIGH = 1, 2
 
@@ -249,7 +261,8 @@ class Reader:
 
 
 def opened(request):
-    """The request's board with the program in it, and the client."""
+    """The request's board with the program in it, the client, and the
+    inputs the board's parts start with."""
     from sim86 import Client, check_board, load_board
 
     try:
@@ -257,11 +270,131 @@ def opened(request):
     except Exception as e:  # noqa: BLE001 - a board file sim86 cannot read
         raise Failed("board", str(e))
     client = Client()
+    starts = starting(board, client)
     problems = check_board(board, client)
     if problems:
         text = "; ".join(str(p) for p in problems)
         raise Failed("image" if "not a format" in text or "firmware" in text.lower() else "board", text)
-    return board, client
+    return board, client, starts
+
+
+def catalog(client, kind):
+    """What sim86's catalog says of a part type: its name, inputs,
+    description and pins. Kept a day beside the helper; a failed look is
+    not kept."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog-cache.json")
+    key = f"{getattr(client, 'api_url', '')}|{kind}"
+    try:
+        with open(path, encoding="utf-8") as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+    hit = cache.get(key)
+    if isinstance(hit, dict) and isinstance(hit.get("entry"), dict):
+        if 0 <= time.time() - float(hit.get("at") or 0) < CATALOG_S:
+            return hit["entry"]
+    full = client.component(kind)
+    entry = {k: full[k] for k in ("name", "inputs", "description") if k in full}
+    entry["pins"] = [
+        {"name": p.get("name"), "signal": p.get("signal")} for p in full.get("pins") or [] if isinstance(p, dict)
+    ]
+    cache[key] = {"at": time.time(), "entry": entry}
+    try:
+        kept = f"{path}.{os.getpid()}"
+        with open(kept, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(kept, path)
+    except OSError:
+        pass
+    return entry
+
+
+def actions_of(text):
+    """The events a part takes, from its catalog description ("Events:
+    'pressed', 'released'."): the catalog names them nowhere else."""
+    found = re.search(r"\bEvents?:\s*(.*?)(?:\.\s|\.$|$)", text or "", re.S)
+    if not found:
+        return []
+    return list(dict.fromkeys(re.findall(r"'([A-Za-z_][A-Za-z0-9_]*)'", found.group(1))))
+
+
+def wrong_input(specs, name, value):
+    """What is wrong with setting input `name` to `value`, by the catalog's
+    inputs of the part (`specs`, by name); None when nothing is."""
+    spec = specs.get(name)
+    if spec is None:
+        return f"there is no input {name!r}; it has {', '.join(sorted(specs)) or 'none'}"
+    values = value if isinstance(value, list) else [value]
+    if not values or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+        return f"{name} is a number"
+    lo, hi = spec.get("min"), spec.get("max")
+    if any((lo is not None and v < lo) or (hi is not None and v > hi) for v in values):
+        return f"{name} is from {lo} to {hi}"
+    return None
+
+
+def starting(board, client):
+    """The inputs each part starts with, {part: {name: value}}: its
+    config.inputs, taken out of the config sim86 is sent and checked
+    against the catalog when the catalog answers."""
+    starts = {}
+    for part in board.parts:
+        config = part.config if isinstance(part.config, dict) else {}
+        inputs = config.pop("inputs", None)
+        if inputs is None:
+            continue
+        if not isinstance(inputs, dict):
+            raise Failed("board", f"{part.id} config.inputs: write it as {{\"name\": value}}")
+        try:
+            entry = catalog(client, part.type)
+        except Exception:  # noqa: BLE001 - unchecked then, as sim86 takes it
+            entry = None
+        specs = {str(s.get("name")): s for s in (entry or {}).get("inputs") or [] if isinstance(s, dict)}
+        for name, value in inputs.items():
+            problem = wrong_input(specs, str(name), value) if entry is not None else None
+            if problem:
+                raise Failed("board", f"{part.id} config.inputs: {problem}")
+            starts.setdefault(part.id, {})[str(name)] = value
+    return starts
+
+
+def start_inputs(run, starts):
+    """Set the inputs the parts start with, on a board paused at 0."""
+    for part, inputs in starts.items():
+        for name, value in inputs.items():
+            run[part].set_input(name, value)
+
+
+def part_controls(board, client, starts):
+    """Each part the page can change while the board runs: its inputs,
+    with the catalog's ranges and the value each starts at, and the
+    events it takes. A part the catalog does not answer for has none."""
+    parts = []
+    for part in board.parts:
+        try:
+            entry = catalog(client, part.type)
+        except Exception:  # noqa: BLE001 - controls are a nicety
+            continue
+        controls = []
+        for spec in entry.get("inputs") or []:
+            if not isinstance(spec, dict) or not spec.get("name"):
+                continue
+            name = str(spec["name"])
+            control = {"kind": "input", "name": name}
+            for key in ("label", "unit", "min", "max", "step", "widget", "axes", "advanced"):
+                if spec.get(key) is not None:
+                    control[key] = spec[key]
+            control["value"] = (starts.get(part.id) or {}).get(name, spec.get("default"))
+            controls.append(control)
+        actions = actions_of(entry.get("description"))
+        if actions:
+            controls.append({"kind": "action", "name": "events", "actions": actions})
+        if controls:
+            label = getattr(part, "label", None) or entry.get("name") or part.id
+            parts.append({"id": part.id, "label": str(label), "type": part.type, "controls": controls})
+    return parts
 
 
 def observe(run, pins):
@@ -278,7 +411,7 @@ def record(request):
     timeout_ms = int(request["timeout_ms"])
     end_ns = timeout_ms * 1_000_000
     watch = list(request.get("watch") or [])
-    board, client = opened(request)
+    board, client, starts = opened(request)
 
     started = time.monotonic()
     with warnings.catch_warnings():
@@ -296,6 +429,7 @@ def record(request):
         if not halt.paused or halt.time_ns != 0:
             # Nothing before this moment was recorded: not a run to judge.
             return answer
+        start_inputs(run, starts)
         if watch:
             observe(run, watch)
         readers = {pin: Reader(run, pin, end_ns) for pin in watch}
@@ -415,6 +549,12 @@ def do(run, asked):
         return {"ev": "paused", "t_ns": run.pause().time_ns}
     if what == "resume":
         return {"ev": "resumed", "t_ns": run.resume().time_ns}
+    if what == "input":
+        run[str(asked["part"])].set_input(str(asked["name"]), asked["value"])
+        return {"ev": "input", "t_ns": run.status().time_ns}
+    if what == "action":
+        run.event(str(asked["part"]), str(asked["action"]))
+        return {"ev": "action", "t_ns": run.status().time_ns}
     raise Failed("internal", f"the helper cannot {what!r}")
 
 
@@ -485,7 +625,7 @@ def signals(request, client):
         mcu = next(iter(request.get("firmware") or {}))
         parts = board.get("parts") or board.get("components") or []
         kind = next(p["type"] for p in parts if p.get("id") == mcu)
-        pins = client.component(kind).get("pins") or []
+        pins = catalog(client, kind).get("pins") or []
         return {str(p["name"]): str(p["signal"]) for p in pins if p.get("name") and p.get("signal")}
     except Exception:  # noqa: BLE001 - names are a nicety, never a failure
         return {}
@@ -502,11 +642,12 @@ def live(request):
     # ter can say stop while the run is still being made.
     told = Told()
     told.start()
-    board, client = opened(request)
+    board, client, starts = opened(request)
     # A board file may carry limits of its own, meant for sim86's command.
     # ter holds a live run's limit: no simulated-time limit at all.
     board.limits = {}
     names = signals(request, client) if shown else {}
+    controls = part_controls(board, client, starts)
     if told.stop.is_set():
         raise Failed("stopped", "ter stopped the run before it started")
 
@@ -527,6 +668,7 @@ def live(request):
             halt = new.status()
             if not halt.paused or halt.time_ns != 0:
                 raise Failed("not_paused", f"the recording starts {halt.time_ns / 1e6:.3f} ms in")
+            start_inputs(new, starts)
             if watch:
                 observe(new, watch)
             if shown:
@@ -545,7 +687,7 @@ def live(request):
     run, shown = begin(shown)
     try:
         observed = watch + shown
-        say({"ev": "started", "run": run.id, "signals": names})
+        say({"ev": "started", "run": run.id, "signals": names, "controls": controls})
         run.resume()
 
         def fresh():

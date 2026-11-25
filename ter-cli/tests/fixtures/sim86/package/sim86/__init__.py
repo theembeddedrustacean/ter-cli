@@ -12,9 +12,13 @@ change what it does:
     speed         how fast a running board goes against the wall clock (1)
     hang-observe  a look at a running board never answers
     slow-start    how many seconds a run takes to be made
+    catalog       the pins of every part type, as the catalog gives them
+    parts         catalog entries by part type, {"Ldr": {...}}
 
-and where it writes `runs` (a line per run made) and `stopped` (a line per
-run stopped through the account, as `stop_run` does).
+and where it writes `runs` (a line per run made), `stopped` (a line per
+run stopped through the account, as `stop_run` does), `events` (a line
+per event sent to a part, with the board's time) and `configs` (each
+run's parts' configs, as they would be sent).
 """
 import json
 import os
@@ -86,6 +90,10 @@ class Client:
         return {"getSubscriptionDetails": {"creditBalanceCents": 20184, "plan": "free", "isActive": True}}
 
     def component(self, type_name):
+        _note("looked-up", type_name)
+        parts = json.loads(_setting("parts") or "{}")
+        if type_name in parts:
+            return {"type": type_name, **parts[type_name]}
         catalog = _setting("catalog")
         if catalog is None:
             raise ApiError(f"no part {type_name}", status=404)
@@ -98,10 +106,24 @@ class Client:
             run._end("stopped")
 
 
+class Part:
+    def __init__(self, entry):
+        self.id, self.type = str(entry["id"]), str(entry["type"])
+        self.config = dict(entry.get("config") or {})
+        self.label = entry.get("label")
+
+
 class Board:
     def __init__(self, data):
         self.name = data.get("name", "")
         self.limits = data.get("limits") or {}
+        self.parts = [Part(p) for p in data.get("parts") or []]
+
+    def part(self, part_id):
+        for p in self.parts:
+            if p.id == part_id:
+                return p
+        raise Sim86Error(f"no part {part_id!r} on {self.name}")
 
 
 def load_board(path, firmware_overrides=None):
@@ -165,8 +187,18 @@ def _edges(a, b):
     return out
 
 
+class PartHandle:
+    def __init__(self, run, part_id):
+        self._run, self.id = run, part_id
+
+    def set_input(self, name, value):
+        values = value if isinstance(value, list) else [value]
+        self._run.event(self.id, f"input:{name}=" + ",".join(str(v) for v in values))
+
+
 class Run:
-    def __init__(self, client, run_id, paused):
+    def __init__(self, client, run_id, paused, board=None):
+        self.board = board
         self.client, self.id = client, run_id
         self._base_ns = 0
         self._paused = paused
@@ -184,9 +216,10 @@ class Run:
             time.sleep(float(slow))
         with _lock:
             run_id = f"fake-run-{len(_runs) + 1}"
-        run = cls(client or Client(), run_id, paused)
+        run = cls(client or Client(), run_id, paused, board)
         _runs[run_id] = run
         _note("runs", json.dumps({"id": run_id, "duration": duration, "realtime": realtime, "paused": paused}))
+        _note("configs", json.dumps({p.id: p.config for p in getattr(board, "parts", [])}))
         return run
 
     def _now(self):
@@ -216,6 +249,15 @@ class Run:
     def status(self):
         self._alive()
         return Halt(self._paused, self._now())
+
+    def __getitem__(self, part_id):
+        if self.board is not None:
+            self.board.part(part_id)
+        return PartHandle(self, part_id)
+
+    def event(self, part, action, at=None):
+        self._alive()
+        _note("events", json.dumps({"run": self.id, "part": part, "action": action, "t_ns": self._now()}))
 
     def pause(self):
         self._alive()
