@@ -359,14 +359,16 @@ fn live_fetched_c3_scaffold_has_its_runner_and_builds() {
 /// The reference solution's `src/`, emitted from a curriculum checkout,
 /// over a fetched Heartbeat scaffold.
 fn lay_solution_over(curriculum: &str, dir: &std::path::Path) {
+    lay_solution_of(curriculum, LIVE_OPEN, dir);
+}
+
+/// The reference solution of `exercise` (`<name>--<target>`) over the
+/// fetched folder's `src/`.
+fn lay_solution_of(curriculum: &str, exercise: &str, dir: &std::path::Path) {
+    let name = exercise.split("--").next().unwrap();
     let emitted = tempfile::tempdir().unwrap();
     let emit = Command::new("python3")
-        .args([
-            "tools/exercise_sync.py",
-            "--exercise",
-            "gpio-blinky",
-            "--emit",
-        ])
+        .args(["tools/exercise_sync.py", "--exercise", name, "--emit"])
         .arg(emitted.path())
         .arg("--solution")
         .current_dir(curriculum)
@@ -377,10 +379,7 @@ fn lay_solution_over(curriculum: &str, dir: &std::path::Path) {
         "{}",
         String::from_utf8_lossy(&emit.stderr)
     );
-    copy_tree(
-        &emitted.path().join(LIVE_OPEN).join("src"),
-        &dir.join("src"),
-    );
+    copy_tree(&emitted.path().join(exercise).join("src"), &dir.join("src"));
 }
 
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
@@ -2626,4 +2625,579 @@ fn live_sim86_records_from_the_first_edge_and_judges_the_pilot_boards() {
         "in time order, each a change"
     );
     eprintln!("pwm: {verdicts:?}");
+}
+
+/// The runs a test started, stopped if the test ends early: sim86 charges
+/// for every minute one runs. Never any other run on the account.
+struct OwnRuns {
+    python: std::path::PathBuf,
+    ids: Vec<String>,
+}
+
+impl OwnRuns {
+    /// sim86's word for each of the test's runs, from the account's list,
+    /// `live <status>` for one with no end yet.
+    fn statuses(&self) -> Vec<(String, String)> {
+        let o = Command::new(&self.python)
+            .args([
+                "-I",
+                "-c",
+                "import json, sim86; print(json.dumps(sim86.Client().runs()))",
+            ])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let runs: Vec<Value> = serde_json::from_slice(&o.stdout).unwrap();
+        self.ids
+            .iter()
+            .map(|id| {
+                let status = runs
+                    .iter()
+                    .find(|r| r["id"] == id.as_str())
+                    .map(|r| {
+                        let status = r["status"].as_str().unwrap_or("").to_string();
+                        if r["endedAt"].is_null() {
+                            format!("live {status}")
+                        } else {
+                            status
+                        }
+                    })
+                    .unwrap_or_else(|| "not listed".into());
+                (id.clone(), status)
+            })
+            .collect()
+    }
+
+    /// The test's runs, once sim86 has had a few seconds to say each is
+    /// over.
+    fn none_left(&self) -> Vec<(String, String)> {
+        let mut statuses = self.statuses();
+        for _ in 0..10 {
+            if statuses.iter().all(|(_, s)| !s.starts_with("live")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            statuses = self.statuses();
+        }
+        statuses
+    }
+}
+
+impl Drop for OwnRuns {
+    fn drop(&mut self) {
+        let ids = serde_json::to_string(&self.ids).unwrap();
+        let _ = Command::new(&self.python)
+            .args([
+                "-I",
+                "-c",
+                "import json, sys, sim86\nc = sim86.Client()\nfor r in c.runs():\n    if r['id'] in json.loads(sys.argv[1]) and r['endedAt'] is None:\n        c.stop_run(r['id'])",
+            ])
+            .arg(ids)
+            .output();
+    }
+}
+
+/// A part's input set while the board runs changes what the program reads:
+/// ter's helper in `live` mode runs the Nucleo light sensor assignment
+/// with an LDR from 3V3 to A0 and 10 kOhm to GND, the LDR starting dark by
+/// the board file's `config.inputs`, and sets it to daylight. (sim86's
+/// ESP32-C3 has no ADC.) Needs `TER_CURRICULUM` (the Nucleo board) and the
+/// solution built into the pilot's `elf/`; a few seconds of sim86 time.
+#[test]
+#[ignore = "live sim86"]
+fn live_sim86_input_changes_what_the_light_sensor_reads() {
+    use std::io::{BufRead, Write};
+    use ter_telemetry::Venue;
+    use ter_telemetry::sim86::{self, Helper, Image, LiveLine, Sim86};
+
+    let Some(pilot) = sim86_ready() else {
+        return;
+    };
+    let Ok(curriculum) = std::env::var("TER_CURRICULUM") else {
+        eprintln!("skipped: set TER_CURRICULUM");
+        return;
+    };
+    let elf =
+        pilot.join("elf/solution--stm32-adc-asg-light-sensor--nucleo-f401re-nostd--debug.elf");
+    let tools = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["install", "sim86", "--json"])
+        .env("TER_TOOLS_DIR", tools.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let home = tools.path().join("sim86");
+    let helper = Helper {
+        python: home.join("venv/bin/python"),
+        script: home.join(sim86::HELPER_FILE),
+        key: None,
+    };
+
+    let nucleo = std::path::Path::new(&curriculum).join("sim86/nucleo-f401re");
+    let mut board: Value =
+        serde_json::from_str(&std::fs::read_to_string(nucleo.join("board.json")).unwrap()).unwrap();
+    board["parts"].as_array_mut().unwrap().extend([
+        serde_json::json!({"id": "ldr1", "type": "Ldr", "config": {"inputs": {"lux": 0.5}}}),
+        serde_json::json!({"id": "r_ldr", "type": "Resistor", "config": {"ohms": 10000}}),
+    ]);
+    board["wires"].as_array_mut().unwrap().extend([
+        serde_json::json!(["mcu.3V3", "ldr1.1"]),
+        serde_json::json!(["ldr1.2", "mcu.A0"]),
+        serde_json::json!(["mcu.A0", "r_ldr.1"]),
+        serde_json::json!(["r_ldr.2", "mcu.GND"]),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let board_file = dir.path().join("board.json");
+    std::fs::write(&board_file, board.to_string()).unwrap();
+    let plan = sim86::plan(
+        &board.to_string(),
+        &std::fs::read_to_string(nucleo.join("pins.json")).unwrap(),
+        &["user_led".to_string()],
+        &[],
+    )
+    .unwrap();
+    let mut venue = Sim86 {
+        helper: helper.clone(),
+        board: board_file,
+        run_dir: dir.path().join("run"),
+        plan,
+        image: Image::Elf,
+        timeout_ms: 60_000,
+        capture: ter_telemetry::Capture::default(),
+        program: None,
+    };
+    std::fs::create_dir_all(&venue.run_dir).unwrap();
+    venue.prepare(&elf).unwrap();
+    let program = venue.program.clone().unwrap_or(elf);
+    // sim86 stops it after 90 s of its own clock whatever happens here.
+    let request = venue.run_dir.join("request.json");
+    std::fs::write(
+        &request,
+        venue.live_request(&[], &program, 90_000, &[]).to_string(),
+    )
+    .unwrap();
+    let mut child = helper
+        .command(&["live".into(), request.into()], Some(&venue.run_dir))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut runs = OwnRuns {
+        python: helper.python.clone(),
+        ids: Vec::new(),
+    };
+    let mut ask = child.stdin.take().unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut next = || -> LiveLine {
+        loop {
+            let line = lines.next().expect("the helper goes on").unwrap();
+            if let Some(line) = sim86::live_line(&line) {
+                return line;
+            }
+        }
+    };
+    // `Light 12 %  (345 mV)`: the millivolts.
+    let reading = |line: &str| -> Option<u32> {
+        line.strip_prefix("Light ")?
+            .split('(')
+            .nth(1)?
+            .split(' ')
+            .next()?
+            .parse()
+            .ok()
+    };
+
+    let LiveLine::Started { run, controls, .. } = next() else {
+        panic!("the run starts first")
+    };
+    runs.ids.push(run.clone());
+    let ldr = controls
+        .iter()
+        .find(|p| p["id"] == "ldr1")
+        .expect("the LDR is a part the page can change");
+    assert_eq!(ldr["type"], "Ldr");
+    let lux = &ldr["controls"][0];
+    assert_eq!(
+        (&lux["kind"], &lux["name"], &lux["value"]),
+        (
+            &serde_json::json!("input"),
+            &serde_json::json!("lux"),
+            &serde_json::json!(0.5)
+        ),
+        "{ldr}"
+    );
+    assert!(lux["max"].as_f64().unwrap() >= 5000.0, "{ldr}");
+    assert!(
+        controls.iter().any(|p| p["id"] == "btn1"
+            && p["controls"][0]["actions"]
+                .as_array()
+                .is_some_and(|a| a.contains(&serde_json::json!("pressed")))),
+        "{controls:?}"
+    );
+
+    let readings = |count: usize, next: &mut dyn FnMut() -> LiveLine| -> Vec<(f64, u32)> {
+        let mut seen = Vec::new();
+        while seen.len() < count {
+            match next() {
+                LiveLine::Serial { t_ms, line, .. } => {
+                    if let Some(r) = reading(&line) {
+                        seen.push((t_ms, r));
+                    }
+                }
+                LiveLine::Ended { reason } => panic!("ended: {reason}"),
+                LiveLine::Done(done) => panic!("done: {done:?}"),
+                _ => {}
+            }
+        }
+        seen
+    };
+    let dark = readings(2, &mut next);
+    writeln!(
+        ask,
+        "{}",
+        serde_json::json!({"id": 1, "do": "input", "part": "ldr1", "name": "lux", "value": 5000})
+    )
+    .unwrap();
+    ask.flush().unwrap();
+    let mut set_at = None;
+    let mut after: Vec<(f64, u32)> = Vec::new();
+    let low = dark.iter().map(|r| r.1).max().unwrap();
+    // Until the reading changes, or for 3 s of the board's time.
+    while !after
+        .last()
+        .is_some_and(|&(t, r)| r > low + 500 || t > set_at.unwrap_or(0.0) + 3000.0)
+    {
+        match next() {
+            LiveLine::Reply { id: 1, answer } => {
+                let answer = answer.unwrap_or_else(|e| panic!("refused: {e}"));
+                assert_eq!(answer["ev"], "input", "{answer}");
+                set_at = Some(answer["t_ns"].as_u64().unwrap() as f64 / 1e6);
+            }
+            LiveLine::Serial { t_ms, line, .. } => {
+                if let (Some(at), Some(r)) = (set_at, reading(&line))
+                    && t_ms > at
+                {
+                    after.push((t_ms, r));
+                }
+            }
+            LiveLine::Ended { reason } => panic!("ended: {reason}"),
+            _ => {}
+        }
+    }
+    writeln!(ask, "stop").unwrap();
+    ask.flush().unwrap();
+    let mut ended = String::new();
+    loop {
+        match next() {
+            LiveLine::Ended { reason } => ended = reason,
+            LiveLine::Done(_) => break,
+            _ => {}
+        }
+    }
+    drop(ask);
+    let _ = child.wait();
+
+    let statuses = runs.none_left();
+    eprintln!(
+        "light sensor: dark {:?}, set at {set_at:?}, then {:?} after {} lines; ended {ended}; {statuses:?}",
+        dark,
+        after.last(),
+        after.len()
+    );
+    assert_eq!(ended, "stopped");
+    assert!(
+        statuses.iter().all(|(_, s)| !s.starts_with("live")),
+        "{statuses:?}"
+    );
+    let high = after.last().unwrap().1;
+    assert!(
+        high > low + 500,
+        "more light, more millivolts: {dark:?} then {after:?}"
+    );
+}
+
+/// Toggle on Press, which the test account can fetch once Heartbeat passed.
+const LIVE_BUTTON: &str = "gpio-button-blink--xiao-esp32c3-nostd";
+
+/// The lesson page's controls on a real sim86 run through `ter serve`:
+/// Toggle on Press on the pilot's uFerris board. After its checks the page
+/// pauses the board (it holds its time while paused, and the limit moves
+/// on by the pause), resumes it, presses and releases the button twice
+/// (the LED toggles on each press), starts it again from 0 on a new sim86
+/// run, and stops it. Needs `TER_CURRICULUM`; about 20 s of sim86 time,
+/// and two attempts posted.
+#[test]
+#[ignore = "live site and sim86"]
+fn live_serve_pauses_presses_and_resets_a_run_on_sim86() {
+    use std::io::BufRead;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    let Some(pilot) = sim86_ready() else {
+        return;
+    };
+    let Ok(curriculum) = std::env::var("TER_CURRICULUM") else {
+        eprintln!("skipped: set TER_CURRICULUM");
+        return;
+    };
+    let m = LiveMachine::new();
+    let (ok, v) = m.json(&["ex", "fetch", LIVE_BUTTON], m.courses.path());
+    assert!(ok, "{v}");
+    let dir = std::path::PathBuf::from(v["path"].as_str().unwrap());
+    lay_solution_of(&curriculum, LIVE_BUTTON, &dir);
+    std::fs::create_dir_all(dir.join("sim86")).unwrap();
+    for (from, to) in [
+        ("uferris-c3.json", "sim86/board.json"),
+        ("uferris-c3.pins.json", "sim86/pins.json"),
+    ] {
+        std::fs::copy(pilot.join("boards").join(from), dir.join(to)).unwrap();
+    }
+    let tools = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["install", "sim86", "--json"])
+        .env("TER_TOOLS_DIR", tools.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let mut runs = OwnRuns {
+        python: tools.path().join("sim86/venv/bin/python"),
+        ids: Vec::new(),
+    };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ter"))
+        .args(["serve", "--port", "0", "--dev"])
+        .env("TER_CONFIG_DIR", m.config.path())
+        .env("TER_TOKEN", &m.token)
+        .env("TER_KEYCHAIN", "off")
+        .env("TER_TOOLS_DIR", tools.path())
+        .live_site()
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    stdout.read_line(&mut line).unwrap();
+    let url = line
+        .strip_prefix("ter serve on ")
+        .and_then(|l| l.split(',').next())
+        .unwrap()
+        .to_string();
+
+    const PAGE: &str = "http://localhost:8080";
+    type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+    let seen: Seen = Arc::default();
+    let result = {
+        let _turn = take_turn();
+        let seen = seen.clone();
+        let runs = &mut runs;
+        block_on(async move {
+            let page = reqwest::Client::new();
+            let r = page
+                .post(format!("{url}/run"))
+                .header("origin", PAGE)
+                .json(&serde_json::json!({
+                    "exercise_id": LIVE_BUTTON, "mode": "simulation", "venue": "sim86",
+                    "live": {"limit_s": 60}
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            let live: Value = r.json().await.unwrap();
+            let id = live["live"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{live}"))
+                .to_string();
+            runs.ids
+                .push(live["sim86_run"].as_str().unwrap().to_string());
+
+            let mut stream = page
+                .get(format!("{url}/live/{id}/events"))
+                .header("origin", PAGE)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(stream.status(), 200);
+            let into = seen.clone();
+            tokio::spawn(async move {
+                let mut text = String::new();
+                while let Ok(Some(chunk)) = stream.chunk().await {
+                    text.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(end) = text.find("\n\n") {
+                        let block: String = text.drain(..end + 2).collect();
+                        let field = |name: &str| {
+                            block
+                                .lines()
+                                .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+                        };
+                        if let (Some(name), Some(data)) = (field("event:"), field("data:")) {
+                            into.lock()
+                                .unwrap()
+                                .push((name, serde_json::from_str(&data).unwrap()));
+                        }
+                    }
+                }
+            });
+            // How many events so far, and waiting for one that is not
+            // among the first `from`.
+            let count = || seen.lock().unwrap().len();
+            let wait = |name: &'static str, from: usize, secs: u64| {
+                let seen = seen.clone();
+                async move {
+                    for _ in 0..secs * 10 {
+                        if let Some(found) =
+                            seen.lock().unwrap()[from..].iter().find(|(n, _)| n == name)
+                        {
+                            return found.1.clone();
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    panic!(
+                        "no {name} event within {secs} s: {:?}",
+                        seen.lock().unwrap()
+                    );
+                }
+            };
+            let post = |what: &'static str, body: Value| {
+                let request = page
+                    .post(format!("{url}/live/{id}/{what}"))
+                    .header("origin", PAGE)
+                    .json(&body);
+                async move {
+                    let r = request.send().await.unwrap();
+                    (r.status().as_u16(), r.json::<Value>().await.unwrap())
+                }
+            };
+            // The LED's levels shown after a board time, in order.
+            let led_after = |t_ms: f64| -> Vec<u64> {
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(n, d)| {
+                        n == "pin" && d["net"] == "mcu.D1" && d["t_ms"].as_f64().unwrap() >= t_ms
+                    })
+                    .map(|(_, d)| d["level"].as_u64().unwrap())
+                    .collect()
+            };
+
+            let controls = wait("controls", 0, 90).await;
+            let checks = wait("checks", 0, 120).await;
+
+            // Paused: the board holds its time, and the limit moves on.
+            let (status, paused) = post("pause", serde_json::json!({})).await;
+            assert_eq!(status, 200, "{paused}");
+            let from = count();
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let (status, resumed) = post("resume", serde_json::json!({})).await;
+            assert_eq!(status, 200, "{resumed}");
+            let held_ms = resumed["t_ms"].as_f64().unwrap() - paused["t_ms"].as_f64().unwrap();
+            let moved_ms = resumed["ends_at"].as_u64().unwrap() as i64
+                - live["ends_at"].as_u64().unwrap() as i64;
+            let resumed_event = wait("resumed", from, 10).await;
+
+            // Two presses, each its own toggle.
+            let mut pressed = Vec::new();
+            for _ in 0..2 {
+                let (status, down) = post(
+                    "action",
+                    serde_json::json!({"part": "btn1", "action": "pressed"}),
+                )
+                .await;
+                assert_eq!(status, 200, "{down}");
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let (status, up) = post(
+                    "action",
+                    serde_json::json!({"part": "btn1", "action": "released"}),
+                )
+                .await;
+                assert_eq!(status, 200, "{up}");
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                pressed.push(down["t_ms"].as_f64().unwrap());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let leds = led_after(pressed[0] - 1.0);
+            let refused = post(
+                "action",
+                serde_json::json!({"part": "btn1", "action": "click"}),
+            )
+            .await;
+
+            // Again from 0 on a new sim86 run, judged again.
+            let from = count();
+            let (status, reset) = post("reset", serde_json::json!({})).await;
+            assert_eq!(status, 200, "{reset}");
+            runs.ids.push(reset["run"].as_str().unwrap().to_string());
+            let reset_event = wait("reset", from, 10).await;
+            let controls_again = wait("controls", from, 10).await;
+            let first_pin = wait("pin", from, 30).await;
+            let checks_again = wait("checks", from, 120).await;
+
+            let (status, stopped) = post("stop", serde_json::json!({})).await;
+            assert_eq!(status, 200, "{stopped}");
+            let ended = wait("ended", from, 30).await;
+            serde_json::json!({
+                "live": live, "controls": controls, "checks": checks, "paused": paused,
+                "resumed": resumed, "held_ms": held_ms, "moved_ms": moved_ms,
+                "resumed_event": resumed_event, "pressed": pressed, "leds": leds,
+                "refused": [refused.0, refused.1], "reset": reset, "reset_event": reset_event,
+                "controls_again": controls_again, "first_pin": first_pin,
+                "checks_again": checks_again, "ended": ended,
+            })
+        })
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let statuses = runs.none_left();
+    let v = result;
+    let key = std::env::var("SIM86_API_KEY").unwrap();
+    assert!(!v.to_string().contains(&key));
+    eprintln!(
+        "held {} ms over a 4 s pause, limit moved {} ms; presses at {}, LED {}; \
+         runs {statuses:?}; attempts {} and {}",
+        v["held_ms"],
+        v["moved_ms"],
+        v["pressed"],
+        v["leds"],
+        v["checks"]["site"]["attempt"],
+        v["checks_again"]["site"]["attempt"]
+    );
+    assert!(
+        statuses.iter().all(|(_, s)| !s.starts_with("live")),
+        "{statuses:?}"
+    );
+
+    let button = v["controls"]["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "btn1")
+        .cloned()
+        .unwrap_or_else(|| panic!("{}", v["controls"]));
+    assert_eq!(
+        button["controls"],
+        serde_json::json!([{"kind": "action", "name": "events", "actions": ["pressed", "released"]}])
+    );
+    assert_eq!(v["checks"]["check_status"], "passed", "{}", v["checks"]);
+    assert!(v["held_ms"].as_f64().unwrap() < 500.0, "{v}");
+    assert!(v["moved_ms"].as_i64().unwrap() >= 4_000, "{v}");
+    assert_eq!(v["resumed_event"]["ends_at"], v["resumed"]["ends_at"]);
+    // Each press flips the LED; a release leaves it.
+    let leds: Vec<u64> = serde_json::from_value(v["leds"].clone()).unwrap();
+    assert_eq!(leds.len(), 2, "{leds:?}");
+    assert_ne!(leds[0], leds[1], "{leds:?}");
+    assert_eq!(v["refused"][0], 400, "{v}");
+    assert_eq!(
+        v["refused"][1]["error"]["message"],
+        "btn1 takes the events pressed, released; not \"click\"."
+    );
+    let first_run = v["live"]["sim86_run"].as_str().unwrap();
+    let new_run = v["reset"]["run"].as_str().unwrap();
+    assert_ne!(new_run, first_run);
+    assert_eq!(v["reset_event"]["run"], new_run);
+    assert_eq!(v["controls_again"], v["controls"]);
+    assert!(v["first_pin"]["t_ms"].as_f64().unwrap() < 1000.0, "{v}");
+    assert_eq!(v["checks_again"]["check_status"], "passed");
+    assert_ne!(
+        v["checks_again"]["site"]["attempt"],
+        v["checks"]["site"]["attempt"]
+    );
+    assert_eq!(v["ended"]["reason"], "user-stop", "{v}");
 }

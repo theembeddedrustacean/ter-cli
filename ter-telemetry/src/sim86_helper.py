@@ -549,12 +549,17 @@ def do(run, asked):
         return {"ev": "paused", "t_ns": run.pause().time_ns}
     if what == "resume":
         return {"ev": "resumed", "t_ns": run.resume().time_ns}
+    # An input or an event takes hold at once, at a board time a little
+    # after the one read just before it is sent: what it brings about is
+    # never before that time.
     if what == "input":
+        t_ns = run.status().time_ns
         run[str(asked["part"])].set_input(str(asked["name"]), asked["value"])
-        return {"ev": "input", "t_ns": run.status().time_ns}
+        return {"ev": "input", "t_ns": t_ns}
     if what == "action":
+        t_ns = run.status().time_ns
         run.event(str(asked["part"]), str(asked["action"]))
-        return {"ev": "action", "t_ns": run.status().time_ns}
+        return {"ev": "action", "t_ns": t_ns}
     raise Failed("internal", f"the helper cannot {what!r}")
 
 

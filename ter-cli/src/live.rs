@@ -24,7 +24,9 @@
 //! catalog, with the value each input starts at: the board file's
 //! `config.inputs`, else the catalog's default. The page sets an input or
 //! sends an event while the board runs or is paused; ter checks it against
-//! the controls first, and says on the stream what was done.
+//! the controls first, and says on the stream what was done, with the
+//! board's time just before it was sent: what it brings about comes at or
+//! after that time.
 //!
 //! The checks are not judged from the stream. Once the check's window has
 //! run, its recording is read back in full, written to the run folder,
