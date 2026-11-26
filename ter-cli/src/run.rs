@@ -16,7 +16,7 @@ use ter_telemetry::sim86::Sim86;
 use ter_telemetry::wokwi::Wokwi;
 use ter_telemetry::{Capture, Recording, Venue, rfc3339_utc};
 
-use crate::build::{Abort, cargo_build};
+use crate::build::{Abort, PROGRAM_DIR, cargo_build};
 use crate::config::Config;
 use crate::output::{CliError, print_json};
 use crate::record::{Infra, Outcome, RunContext, assemble, file_sha256};
@@ -305,7 +305,14 @@ pub async fn build(args: RunArgs, quiet: bool) -> Result<Built, CliError> {
     if stopped(&abort) {
         return Err(replaced());
     }
-    let build = cargo_build(&dir, layout.cargo_env(&ter, &dir), !json, abort.as_ref())?;
+    let build = cargo_build(
+        &dir,
+        layout.cargo_env(&ter, &dir),
+        &layout.course_target_dir(&ter.course),
+        &recording.join(PROGRAM_DIR),
+        !json,
+        abort.as_ref(),
+    )?;
     let log_path = recording.join("build.log");
     write(&log_path, build.log.as_bytes())?;
     if stopped(&abort) {

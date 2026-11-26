@@ -796,6 +796,65 @@ async fn a_build_only_run_posts_not_run_with_the_programs_hash() {
     assert_eq!(v["recording"], json!(m.exercise().join(".runs/1")));
 }
 
+/// Every exercise of a course is a package named `exercise` building into
+/// the course's shared cache. A run of one built before another, and not
+/// edited since, still runs its own program.
+#[tokio::test]
+async fn a_run_after_another_exercise_built_runs_its_own_program() {
+    let server = site("0.1.0", run_answer()).await;
+    let m = Machine::with_exercise(
+        "fn main() {\n    println!(\"Threshold LED\");\n}\n",
+        &["hardware", "simulation"],
+    );
+    let a = m.exercise();
+    let b = m.courses.path().join(COURSE).join("other");
+    std::fs::create_dir_all(b.join("src")).unwrap();
+    std::fs::copy(a.join("Cargo.toml"), b.join("Cargo.toml")).unwrap();
+    std::fs::write(
+        b.join("src/main.rs"),
+        "fn main() {\n    println!(\"Ranger Timeout\");\n}\n",
+    )
+    .unwrap();
+    let sha = ter_sdk::project::source_sha256(&b).unwrap();
+    std::fs::write(
+        b.join("ter.toml"),
+        format!(
+            "exercise = \"ranger-timeout--xiao-esp32c3-nostd\"\ncourse = {COURSE:?}\n\
+             target = \"xiao-esp32c3-nostd\"\nmodes = [\"hardware\", \"simulation\"]\n\
+             mode = \"hardware\"\nfetched_sha256 = {sha:?}\n"
+        ),
+    )
+    .unwrap();
+    let run = |dir: &Path| {
+        let (ok, v) = m.json_in(&server.uri(), &["run", "--no-check", "--sim"], dir);
+        assert!(ok, "{v}");
+        v
+    };
+    let prints = |program: &Path| {
+        let out = Command::new(program).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+
+    run(&a);
+    run(&b);
+    let again = run(&a);
+
+    let posted = posted(&server, "run").await;
+    let elf_sha = |i: usize| posted[i]["payload"]["elf_sha256"].clone();
+    assert_ne!(elf_sha(2), elf_sha(1), "the other exercise's program");
+    let recording = PathBuf::from(again["recording"].as_str().unwrap());
+    let program = recording.join("program/exercise");
+    assert_eq!(prints(&program), "Threshold LED");
+    assert_eq!(
+        elf_sha(2),
+        json!(sha256_hex(&std::fs::read(&program).unwrap()))
+    );
+    assert_eq!(
+        prints(&b.join(".runs/1/program/exercise")),
+        "Ranger Timeout"
+    );
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     sha2::Sha256::digest(bytes)

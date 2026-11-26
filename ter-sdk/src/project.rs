@@ -176,6 +176,12 @@ impl Layout {
         self.root.join(course)
     }
 
+    /// The course's shared build output, cargo's target dir for every
+    /// exercise in it.
+    pub fn course_target_dir(&self, course: &str) -> PathBuf {
+        self.course_dir(course).join(COURSE_TARGET_DIR)
+    }
+
     pub fn exercise_dir(&self, course: &str, exercise: &str) -> PathBuf {
         self.course_dir(course).join(exercise)
     }
